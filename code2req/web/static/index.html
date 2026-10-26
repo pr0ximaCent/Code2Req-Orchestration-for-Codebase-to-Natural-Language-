@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code2req</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: requirements review workstation. Toolbar, status line, then a
+   master table (left) and the selected requirement with its cited code (right). */
+/* Palette: strictly neutral greys, ink black as the only "accent" (primary
+   action, selection). Colour appears only where it carries meaning: review
+   verdicts and the highlighted lines of cited code. */
+:root {
+  --bg: #f4f4f5;        /* app ground */
+  --surface: #ffffff;   /* panes */
+  --surface-2: #ededef; /* table header, hover */
+  --line: #dddde1;
+  --line-strong: #c3c3c9;
+  --fg: #18181b;
+  --fg-2: #52525a;
+  --fg-3: #7f7f88;
+  --accent: #18181b;    /* ink: selection bar, primary button */
+  --accent-weak: #e9e9ec;
+  --ok: #1b7a43; --ok-weak: #e3f2e8;
+  --bad: #b42f27; --bad-weak: #f8e4e2;
+  --warn: #8f5d00; --warn-weak: #f5ecd8;
+  --code-bg: #fafafa;
+  --hl: #fdf0bf; --hl-edge: #c99a00;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --cond: "IBM Plex Sans Condensed", "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", "Cascadia Mono", Consolas, "SF Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e0e0f; --surface: #161617; --surface-2: #1f1f21; --line: #2b2b2e; --line-strong: #3e3e43;
+    --fg: #ececee; --fg-2: #a7a7af; --fg-3: #77777f;
+    --accent: #f1f1f3; --accent-weak: #29292c;
+    --ok: #5cbf86; --ok-weak: #15301f; --bad: #ee837a; --bad-weak: #371d1b; --warn: #dcae57; --warn-weak: #33270f;
+    --code-bg: #111112; --hl: #36301a; --hl-edge: #b8902c;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e0e0f; --surface: #161617; --surface-2: #1f1f21; --line: #2b2b2e; --line-strong: #3e3e43;
+  --fg: #ececee; --fg-2: #a7a7af; --fg-3: #77777f;
+  --accent: #f1f1f3; --accent-weak: #29292c;
+  --ok: #5cbf86; --ok-weak: #15301f; --bad: #ee837a; --bad-weak: #371d1b; --warn: #dcae57; --warn-weak: #33270f;
+  --code-bg: #111112; --hl: #36301a; --hl-edge: #b8902c;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 13.5px/1.5 var(--sans);
+  display: grid; grid-template-rows: auto auto auto 1fr; }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+kbd { font: 11px var(--mono); color: var(--fg-3); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 3px; padding: 0 4px; background: var(--surface); }
+
+/* toolbar */
+.bar { display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: var(--surface);
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.brand { font: 600 15px var(--cond); letter-spacing: .2px; margin-right: 8px; }
+.brand span { color: var(--fg-3); font-weight: 500; }
+#runForm { display: flex; gap: 6px; flex: 1 1 420px; min-width: 0; }
+.field { height: 30px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 3px;
+  background: var(--surface); min-width: 0; }
+#target { flex: 1; font-family: var(--mono); font-size: 12.5px; }
+.btn { height: 30px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 3px;
+  background: var(--surface); color: var(--fg); cursor: pointer; display: inline-flex; align-items: center;
+  gap: 6px; text-decoration: none; white-space: nowrap; }
+.btn:hover { background: var(--surface-2); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); font-weight: 600; }
+.btn.primary:hover { background: var(--fg-2); border-color: var(--fg-2); }
+.btn[aria-disabled="true"], .btn:disabled { opacity: .45; pointer-events: none; }
+.btn.danger { border-color: var(--bad); color: var(--bad); background: var(--bad-weak); font-weight: 600; }
+#runSelect { max-width: 340px; }
+.options { display: flex; gap: 16px; padding: 10px 16px; background: var(--surface-2);
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; align-items: end; }
+.options label { display: grid; gap: 3px; font-size: 12px; color: var(--fg-2); }
+.options .field { width: 100%; }
+.options .grow { flex: 1 1 280px; }
+.options .hint { font-size: 12px; color: var(--fg-3); flex-basis: 100%; }
+
+/* status line */
+.status { display: flex; justify-content: space-between; gap: 16px; padding: 7px 16px; font-size: 12.5px;
+  color: var(--fg-2); border-bottom: 1px solid var(--line); background: var(--bg); flex-wrap: wrap; }
+.status .src { font-family: var(--mono); color: var(--fg); word-break: break-all; }
+.status .nums { font-variant-numeric: tabular-nums; }
+.status .nums b { color: var(--fg); font-weight: 600; }
+.status .err { color: var(--bad); }
+.state { font-weight: 600; }
+.state.done { color: var(--ok); } .state.failed { color: var(--bad); } .state.running, .state.queued { color: var(--warn); }
+
+/* workspace */
+.ws { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); min-height: 0; }
+.pane { min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
+.pane.list { border-right: 1px solid var(--line); }
+.views { display: flex; gap: 0; border-bottom: 1px solid var(--line); padding: 0 12px; overflow-x: auto; }
+.views button { border: 0; background: none; padding: 9px 10px 8px; cursor: pointer; color: var(--fg-2);
+  border-bottom: 2px solid transparent; white-space: nowrap; }
+.views button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+.views .n { font-variant-numeric: tabular-nums; color: var(--fg-3); margin-left: 4px; font-weight: 400; }
+.filters { display: grid; grid-template-columns: minmax(0, 2fr) repeat(4, minmax(0, 1fr)); gap: 6px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.filters .field { height: 28px; font-size: 12.5px; }
+.tablewrap { overflow: auto; flex: 1; min-height: 0; }
+table { border-collapse: collapse; width: 100%; }
+thead th { position: sticky; top: 0; background: var(--surface-2); text-align: left; font: 600 11.5px var(--cond);
+  letter-spacing: .4px; text-transform: uppercase; color: var(--fg-2); padding: 6px 10px;
+  border-bottom: 1px solid var(--line); z-index: 1; }
+tbody td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tbody tr { cursor: pointer; }
+tbody tr:hover td { background: var(--surface-2); }
+tbody tr[aria-selected="true"] td { background: var(--accent-weak); }
+tbody tr[aria-selected="true"] td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+td.id { font: 500 12px var(--mono); white-space: nowrap; color: var(--fg-2); }
+td.txt { color: var(--fg); }
+td.txt div { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+td.small { font-size: 12px; color: var(--fg-2); white-space: nowrap; }
+.v-accepted { color: var(--ok); } .v-wrong { color: var(--bad); } .v-unsure { color: var(--warn); }
+.v-none { color: var(--fg-3); }
+.listfoot { display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px; font-size: 12px;
+  color: var(--fg-3); border-top: 1px solid var(--line); flex-wrap: wrap; }
+.none { padding: 28px 16px; color: var(--fg-3); }
+
+/* detail */
+.pane.detail { overflow: auto; }
+.d { padding: 18px 22px 28px; display: grid; gap: 16px; align-content: start; }
+.d-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.d-id { font: 500 13px var(--mono); color: var(--fg-2); }
+.tag { font-size: 12px; padding: 1px 7px; border-radius: 2px; border: 1px solid currentColor; }
+.tag.confirmed { color: var(--ok); } .tag.inferred { color: var(--fg-2); } .tag.gap { color: var(--warn); }
+.tag.rejected { color: var(--bad); }
+.d-text { font-size: 16px; line-height: 1.55; margin: 0; max-width: 68ch; text-wrap: pretty; }
+dl.meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 18px; margin: 0; font-size: 12.5px; }
+dl.meta dt { color: var(--fg-3); }
+dl.meta dd { margin: 0; color: var(--fg); overflow-wrap: anywhere; }
+dl.meta dd.mono { font-family: var(--mono); font-size: 12px; }
+h3 { font: 600 11.5px var(--cond); letter-spacing: .5px; text-transform: uppercase; color: var(--fg-2); margin: 0; }
+.attrs { font-size: 12.5px; }
+.attrs td, .attrs th { padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); text-align: left; }
+.attrs th { font-weight: 500; color: var(--fg-3); }
+.attrs td { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.cites { display: grid; gap: 12px; }
+.cite { margin: 0; border: 1px solid var(--line); background: var(--code-bg); min-width: 0; }
+.cite figcaption { display: flex; justify-content: space-between; gap: 10px; padding: 5px 10px;
+  border-bottom: 1px solid var(--line); font: 12px var(--mono); color: var(--fg-2); background: var(--surface); flex-wrap: wrap; }
+.cite figcaption .why { color: var(--bad); font-family: var(--sans); }
+.code { overflow-x: auto; font: 12px/1.6 var(--mono); padding: 4px 0; max-height: 360px; overflow-y: auto; }
+.code .ln { display: flex; white-space: pre; }
+.code .ln .n { flex: none; width: 52px; padding-right: 12px; text-align: right; color: var(--fg-3); user-select: none; }
+.code .ln.hl { background: var(--hl); box-shadow: inset 3px 0 0 var(--hl-edge); }
+.review { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 8px; }
+.seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 3px; overflow: hidden; width: max-content; max-width: 100%; }
+.seg button { border: 0; border-right: 1px solid var(--line-strong); background: var(--surface); padding: 5px 12px;
+  cursor: pointer; display: inline-flex; gap: 8px; align-items: center; }
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--surface-2); }
+.seg button[aria-pressed="true"][data-v="accepted"] { background: var(--ok-weak); color: var(--ok); font-weight: 600; }
+.seg button[aria-pressed="true"][data-v="wrong"] { background: var(--bad-weak); color: var(--bad); font-weight: 600; }
+.seg button[aria-pressed="true"][data-v="unsure"] { background: var(--warn-weak); color: var(--warn); font-weight: 600; }
+textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: vertical; width: 100%; max-width: 68ch; }
+.saved { font-size: 12px; color: var(--fg-3); min-height: 18px; }
+
+/* progress */
+.run { padding: 22px; display: grid; gap: 18px; align-content: start; background: var(--surface); overflow: auto; min-height: 0; }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-width: 560px; }
+.steps li { display: grid; grid-template-columns: 22px 1fr auto; gap: 8px; padding: 5px 0; color: var(--fg-3); }
+.steps li .k { font: 12px var(--mono); }
+.steps li.now { color: var(--fg); font-weight: 600; }
+.steps li.past { color: var(--fg-2); }
+.steps li.past .k::after { content: " ✓"; color: var(--ok); }
+.meter { height: 4px; background: var(--surface-2); max-width: 560px; }
+.meter div { height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+.log { font: 11.5px/1.55 var(--mono); background: var(--code-bg); border: 1px solid var(--line);
+  padding: 8px 10px; max-height: 46vh; overflow: auto; white-space: pre-wrap; color: var(--fg-2); }
+.failbox { border: 1px solid var(--bad); background: var(--bad-weak); color: var(--fg); padding: 10px 12px; max-width: 760px; white-space: pre-wrap; }
+.welcome { padding: 32px 22px; max-width: 640px; display: grid; gap: 10px; color: var(--fg-2); }
+.welcome h2 { font: 600 18px var(--cond); color: var(--fg); margin: 0; }
+
+@media (max-width: 900px) {
+  body { display: block; height: auto; }
+  .ws { grid-template-columns: 1fr; }
+  .pane.list { border-right: 0; border-bottom: 1px solid var(--line); }
+  .tablewrap { max-height: 55vh; }
+  .filters { grid-template-columns: 1fr 1fr; }
+  .filters #fQ { grid-column: 1 / -1; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">code2req <span>requirements from code</span></div>
+  <button class="btn" type="button" id="newBtn" title="Clear the screen and start a new analysis">New analysis</button>
+  <form id="runForm" autocomplete="off">
+    <label class="sr" for="target">Source folder or git URL</label>
+    <input class="field" id="target" placeholder="Folder path or git URL, e.g. d:\work\shop-api" required>
+    <button class="btn" type="button" id="optBtn" aria-expanded="false" aria-controls="options">Options</button>
+    <button class="btn primary" type="submit" id="runBtn">Analyze</button>
+  </form>
+  <label class="sr" for="runSelect">Open run</label>
+  <select class="field" id="runSelect"></select>
+  <button class="btn" type="button" id="deleteBtn" disabled>Delete run</button>
+  <a class="btn" id="exportBtn" aria-disabled="true">Export JSON</a>
+</header>
+<div class="options" id="options" hidden>
+  <label class="grow" for="exclude">Exclude files (comma-separated globs)
+    <input class="field" id="exclude" placeholder="*_test.go, migrations/*"></label>
+  <label for="workers">Parallel modules
+    <input class="field" id="workers" type="number" value="4" min="1" max="16"></label>
+  <label for="chars">Module size (characters)
+    <input class="field" id="chars" type="number" value="40000" min="5000" step="5000"></label>
+  <div class="hint">Git URLs are cloned with your own git login, so private repositories work.</div>
+</div>
+<div class="status" id="status"><span>No run selected.</span></div>
+<main id="body" style="min-height:0; display:grid;"></main>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path, opts = {}) {
+  const r = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts});
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const d = body.detail;
+    throw new Error(typeof d === "string" ? d : d ? d.map(x => x.msg).join("; ") : r.statusText);
+  }
+  return body;
+}
+
+const CONF = { confirmed: "Confirmed by test", inferred: "Read from code", gap: "Not implemented" };
+const CONF_SHORT = { confirmed: "Confirmed", inferred: "Inferred", gap: "Gap" };
+const VERDICT = { accepted: "Correct", wrong: "Wrong", unsure: "Unsure" };
+const STEPS = [
+  ["resolving", "Get the source"],
+  ["surfaces", "Find routes, commands, settings and limits"],
+  ["structure", "Parse the code and group it into modules"],
+  ["modules", "Write requirements for each module"],
+  ["verify", "Check every citation against the code"],
+  ["followup", "Cover functions no requirement cites yet"],
+  ["done", "Save results"],
+];
+const VIEWS = [["requirements", "Requirements"], ["gaps", "Gaps"], ["rejected", "Rejected"], ["surfaces", "Surfaces"]];
+
+const S = { runs: [], runId: null, run: null, result: null, reviews: {}, view: "requirements",
+  f: { q: "", type: "", conf: "", section: "", review: "" }, sel: null, log: [], logNext: 0, poll: null, src: new Map() };
+
+/* ---------- runs ---------- */
+const shortTarget = t => { const p = String(t).replace(/[\\/]+$/, "").split(/[\\/]/); return p.slice(-2).join("/"); };
+const when = iso => iso ? new Date(iso).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}) : "";
+
+async function loadRuns() {
+  S.runs = await api("/api/runs");
+  const sel = $("#runSelect");
+  sel.innerHTML = `<option value="">${S.runs.length ? "Open a previous run…" : "No runs yet"}</option>` +
+    S.runs.map(r => `<option value="${esc(r.id)}">${esc(shortTarget(r.target))} · ${esc(when(r.started_at))}${r.status !== "done" ? " · " + esc(r.status) : ""}</option>`).join("");
+  sel.value = S.runId || "";
+}
+
+function welcome() {
+  $("#body").innerHTML = `<section class="welcome"><h2>Analyze a codebase</h2>
+    <p>Enter a folder path or a git URL above and press Analyze. code2req reads the code, writes requirements, and cites the lines each one comes from.</p>
+    <p>Large repositories take one model call per 40,000 characters of code. Start with one package or service folder, and use Options to exclude tests or generated files.</p>
+    ${S.runs.length ? "<p>Earlier runs stay available in the run list at the top right.</p>" : ""}</section>`;
+}
+
+function newAnalysis() {
+  clearInterval(S.poll);
+  Object.assign(S, { runId: null, run: null, result: null, reviews: {}, sel: null, log: [], logNext: 0, src: new Map() });
+  history.replaceState(null, "", location.pathname);
+  $("#runSelect").value = "";
+  $("#target").value = "";
+  render();
+  welcome();
+  $("#target").focus();
+}
+$("#newBtn").onclick = newAnalysis;
+
+let deleteArmed = null;
+$("#deleteBtn").onclick = async () => {
+  const b = $("#deleteBtn");
+  if (!S.runId) return;
+  if (deleteArmed !== S.runId) {  // first click arms, second click deletes
+    deleteArmed = S.runId;
+    b.textContent = "Confirm delete";
+    b.classList.add("danger");
+    setTimeout(() => { if (deleteArmed) { deleteArmed = null; b.textContent = "Delete run"; b.classList.remove("danger"); } }, 4000);
+    return;
+  }
+  deleteArmed = null;
+  b.textContent = "Delete run";
+  b.classList.remove("danger");
+  try {
+    await api(`/api/runs/${S.runId}`, {method: "DELETE"});
+    await loadRuns();
+    newAnalysis();
+    $("#status").innerHTML = "<span>Run deleted.</span>";
+  } catch (err) { $("#status").innerHTML = `<span class="err">Could not delete the run: ${esc(err.message)}</span>`; }
+};
+$("#runSelect").onchange = e => e.target.value ? openRun(e.target.value) : newAnalysis();
+
+$("#optBtn").onclick = () => {
+  const o = $("#options"); o.hidden = !o.hidden;
+  $("#optBtn").setAttribute("aria-expanded", String(!o.hidden));
+};
+
+$("#runForm").onsubmit = async e => {
+  e.preventDefault();
+  const body = {
+    target: $("#target").value.trim(),
+    exclude: $("#exclude").value.split(",").map(s => s.trim()).filter(Boolean),
+    workers: +$("#workers").value || 4,
+    max_module_chars: +$("#chars").value || 40000,
+  };
+  $("#runBtn").disabled = true;
+  try {
+    const meta = await api("/api/runs", {method: "POST", body: JSON.stringify(body)});
+    S.runId = meta.id;
+    await loadRuns();
+    openRun(meta.id);
+  } catch (err) {
+    $("#status").innerHTML = `<span class="err">Could not start the analysis: ${esc(err.message)}</span>`;
+  } finally { $("#runBtn").disabled = false; }
+};
+
+async function openRun(id) {
+  clearInterval(S.poll);
+  Object.assign(S, { runId: id, run: null, result: null, reviews: {}, sel: null, log: [], logNext: 0, src: new Map() });
+  $("#runSelect").value = id;
+  await refresh();
+  if (S.run && ["queued", "running"].includes(S.run.status)) S.poll = setInterval(refresh, 1500);
+}
+
+async function refresh() {
+  const id = S.runId;
+  try {
+    S.run = await api(`/api/runs/${id}`);
+    const lg = await api(`/api/runs/${id}/log?since=${S.logNext}`);
+    S.log.push(...lg.lines); S.logNext = lg.next;
+  } catch (err) { $("#status").innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  if (S.run.status === "done") {
+    clearInterval(S.poll);
+    if (!S.result) {
+      [S.result, S.reviews] = await Promise.all([api(`/api/runs/${id}/result`), api(`/api/runs/${id}/reviews`)]);
+      S.result.rejected.forEach((r, i) => { r.id = r.id || `REJ-${i + 1}`; });  // rejected claims get no ID from the pipeline
+      loadRuns();
+    }
+  } else if (S.run.status === "failed") { clearInterval(S.poll); loadRuns(); }
+  render();
+}
+
+/* ---------- top-level render ---------- */
+function render() {
+  renderStatus();
+  const exp = $("#exportBtn");
+  if (S.run?.status === "done") { exp.href = `/api/runs/${S.runId}/export`; exp.setAttribute("aria-disabled", "false"); }
+  else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
+  $("#deleteBtn").disabled = !S.run || ["queued", "running"].includes(S.run.status);
+  if (!S.run) return;
+  if (S.run.status === "done" && S.result) renderWorkspace();
+  else renderRun();
+}
+
+function renderStatus() {
+  const r = S.run; const el = $("#status");
+  if (!r) { el.innerHTML = "<span>New analysis: enter a folder path or git URL, then press Analyze.</span>"; return; }
+  const left = `<span><span class="state ${esc(r.status)}">${esc(cap(r.status))}</span> · <span class="src">${esc(r.target)}</span>${r.model ? " · " + esc(r.model) : ""}</span>`;
+  let right = "";
+  if (S.result) {
+    const st = S.result.stats || {}, cov = st.surface_coverage || {}, fc = st.function_coverage;
+    const rv = Object.values(S.reviews), wrong = rv.filter(v => v.verdict === "wrong").length;
+    const funcs = fc && fc.total ? ` · functions cited <b>${fc.cited}/${fc.total}</b>${fc.internal_helpers ? ` (+${fc.internal_helpers} internal)` : ""}` : "";
+    const c = st.cost;
+    const credits = c && c.credits != null ? ` · <b title="SysModeler formula: $${c.cost_usd.toFixed(4)} × 10,000. Including ${c.thinking_tokens.toLocaleString()} thinking tokens: ${c.provider_credits.toLocaleString()} credits ($${c.provider_cost_usd.toFixed(4)})">${c.credits.toLocaleString()}</b> credits` : "";
+    right = `<span class="nums"><b>${S.result.requirements.length}</b> requirements · <b>${st.confidence?.confirmed ?? 0}</b> confirmed by tests · <b>${S.result.gaps.length}</b> gaps · <b>${S.result.rejected.length}</b> rejected${funcs}${cov.total ? ` · surfaces <b>${cov.covered}/${cov.total}</b>` : ""}${credits} · reviewed <b>${rv.length}</b>${wrong ? `, ${wrong} wrong` : ""}</span>`;
+  } else if (r.status === "failed") {
+    right = `<span class="err">Failed ${esc(when(r.finished_at))}</span>`;
+  }
+  el.innerHTML = left + right;
+}
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : "";
+
+/* ---------- running / failed ---------- */
+function renderRun() {
+  const r = S.run, p = r.progress || {};
+  const idx = STEPS.findIndex(([k]) => k === p.stage);
+  let pct = idx < 0 ? 0 : Math.round((idx / (STEPS.length - 1)) * 100);
+  if (p.stage === "modules" && p.total) pct = Math.round(((3 + p.done / p.total) / (STEPS.length - 1)) * 100);
+  const steps = STEPS.map(([k, label], i) => {
+    const cls = r.status === "failed" ? (i < idx ? "past" : i === idx ? "now" : "") : i < idx ? "past" : i === idx ? "now" : "";
+    const extra = k === p.stage && ["modules", "followup"].includes(k) && p.total ? `${p.done} of ${p.total}` : "";
+    return `<li class="${cls}"><span class="k">${i + 1}</span><span>${esc(label)}</span><span>${esc(extra)}</span></li>`;
+  }).join("");
+  const fail = r.status === "failed" ? `<div class="failbox"><b>The analysis stopped.</b> ${esc(r.error)}</div>` : "";
+  $("#body").innerHTML = `<section class="run">
+    ${fail}
+    <ol class="steps">${steps}</ol>
+    ${r.status !== "failed" ? `<div class="meter"><div style="width:${pct}%"></div></div>` : ""}
+    <div><h3>Log</h3></div>
+    <div class="log" id="log">${esc(S.log.slice(-500).join("\n")) || "Waiting for output…"}</div>
+  </section>`;
+  const lg = $("#log"); lg.scrollTop = lg.scrollHeight;
+}
+
+/* ---------- workspace ---------- */
+function items() {
+  if (S.view === "surfaces") {
+    const cov = S.result.stats.surface_coverage || {};
+    const uncovered = new Set(cov.uncovered || []);
+    return (S.result.surfaces || []).filter(s => s.kind !== "test").map(s => ({
+      _surface: true, id: `${s.file}:${s.line}`, kind: s.kind, name: s.name, file: s.file, line: s.line,
+      end_line: s.end_line, detail: s.detail,
+      covered: !uncovered.has(`[${s.kind}] ${s.name} - ${s.file}:${s.line}`) }));
+  }
+  return S.result[S.view] || [];
+}
+
+function filtered() {
+  const f = S.f, list = items();
+  if (S.view === "surfaces") {
+    return list.filter(s => (!f.q || `${s.name} ${s.file}`.toLowerCase().includes(f.q.toLowerCase())) && (!f.type || s.kind === f.type)
+      && (!f.conf || (f.conf === "covered") === s.covered));
+  }
+  return list.filter(r => {
+    const v = S.reviews[r.id]?.verdict || "none";
+    const hay = `${r.id} ${r.text} ${r.evidence.map(e => e.file).join(" ")}`.toLowerCase();
+    return (!f.q || hay.includes(f.q.toLowerCase())) && (!f.type || r.type === f.type) && (!f.conf || r.confidence === f.conf)
+      && (!f.section || r.section === f.section) && (!f.review || v === f.review);
+  });
+}
+
+function renderWorkspace() {
+  let ws = $("#body .ws");
+  if (!ws) {
+    $("#body").innerHTML = `<div class="ws">
+      <section class="pane list" aria-label="Requirements list">
+        <div class="views" role="tablist" id="views"></div>
+        <div class="filters" id="filters"></div>
+        <div class="tablewrap" id="tablewrap"></div>
+        <div class="listfoot"><span id="count"></span><span><kbd>J</kbd> <kbd>K</kbd> move · <kbd>A</kbd> correct · <kbd>W</kbd> wrong · <kbd>U</kbd> unsure · <kbd>N</kbd> note · <kbd>/</kbd> search</span></div>
+      </section>
+      <section class="pane detail" id="detail" aria-label="Selected item"></section>
+    </div>`;
+  }
+  renderViews(); renderFilters(); renderTable(); renderDetail();
+}
+
+function renderViews() {
+  $("#views").innerHTML = VIEWS.map(([k, label]) => {
+    const n = k === "surfaces" ? (S.result.surfaces || []).filter(s => s.kind !== "test").length : (S.result[k] || []).length;
+    return `<button role="tab" data-view="${k}" aria-selected="${S.view === k}">${esc(label)}<span class="n">${n}</span></button>`;
+  }).join("");
+  $("#views").querySelectorAll("button").forEach(b => b.onclick = () => {
+    S.view = b.dataset.view; S.sel = null; S.f = { q: S.f.q, type: "", conf: "", section: "", review: "" }; renderWorkspace();
+  });
+}
+
+function opts(values, current, any, labels = {}) {
+  return `<option value="">${esc(any)}</option>` + values.map(v =>
+    `<option value="${esc(v)}" ${v === current ? "selected" : ""}>${esc(labels[v] || v)}</option>`).join("");
+}
+
+function renderFilters() {
+  const list = items(), f = S.f;
+  let html = `<label class="sr" for="fQ">Search</label><input class="field" id="fQ" placeholder="Search text, ID or file" value="${esc(f.q)}">`;
+  if (S.view === "surfaces") {
+    html += `<select class="field" id="fType" aria-label="Kind">${opts([...new Set(list.map(s => s.kind))].sort(), f.type, "Any kind")}</select>
+      <select class="field" id="fConf" aria-label="Coverage">${opts(["covered", "uncovered"], f.conf, "Covered or not", {covered: "Covered", uncovered: "Not covered"})}</select>`;
+  } else {
+    html += `<select class="field" id="fType" aria-label="Type">${opts([...new Set(list.map(r => r.type))].sort(), f.type, "Any type")}</select>
+      <select class="field" id="fConf" aria-label="Evidence">${opts(["confirmed", "inferred", "gap"], f.conf, "Any evidence", CONF)}</select>
+      <select class="field" id="fSec" aria-label="Section">${opts([...new Set(list.map(r => r.section))].sort(), f.section, "Any section")}</select>
+      <select class="field" id="fRev" aria-label="Review">${opts(["none", "accepted", "wrong", "unsure"], f.review, "Any review", {none: "Not reviewed", ...VERDICT})}</select>`;
+  }
+  $("#filters").innerHTML = html;
+  const on = (id, key, ev = "change") => { const el = $(id); if (el) el.addEventListener(ev, () => { S.f[key] = el.value; renderTable(); renderDetail(); }); };
+  on("#fQ", "q", "input"); on("#fType", "type"); on("#fConf", "conf"); on("#fSec", "section"); on("#fRev", "review");
+}
+
+function renderTable() {
+  const rows = filtered(), total = items().length;
+  if (S.sel == null || !rows.some(r => r.id === S.sel)) S.sel = rows[0]?.id ?? null;
+  $("#count").textContent = `${rows.length} of ${total} shown`;
+  if (!rows.length) { $("#tablewrap").innerHTML = `<div class="none">${total ? "Nothing matches these filters." : emptyText()}</div>`; return; }
+  let head, body;
+  if (S.view === "surfaces") {
+    head = `<tr><th>Kind</th><th>Name</th><th>Location</th><th>Covered</th></tr>`;
+    body = rows.map(s => `<tr data-id="${esc(s.id)}" aria-selected="${s.id === S.sel}">
+      <td class="small">${esc(s.kind.replace("_", " "))}</td><td class="txt"><div>${esc(s.name)}</div></td>
+      <td class="id">${esc(s.file)}:${s.line}</td><td class="small ${s.covered ? "v-accepted" : "v-wrong"}">${s.covered ? "Yes" : "No"}</td></tr>`).join("");
+  } else {
+    const rej = S.view === "rejected";
+    head = `<tr><th>ID</th><th>Requirement</th><th>Type</th><th>Evidence</th>${rej ? "" : "<th>Review</th>"}</tr>`;
+    body = rows.map(r => {
+      const v = S.reviews[r.id]?.verdict;
+      return `<tr data-id="${esc(r.id)}" aria-selected="${r.id === S.sel}">
+        <td class="id">${esc(r.id)}</td><td class="txt"><div>${esc(r.text)}</div></td>
+        <td class="small">${esc(r.type)}</td><td class="small">${rej ? '<span class="v-wrong">Failed</span>' : esc(CONF_SHORT[r.confidence])}</td>
+        ${rej ? "" : `<td class="small ${v ? "v-" + v : "v-none"}">${v ? esc(VERDICT[v]) : "–"}</td>`}</tr>`;
+    }).join("");
+  }
+  $("#tablewrap").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  $("#tablewrap").querySelectorAll("tbody tr").forEach(tr => tr.onclick = () => select(tr.dataset.id));
+}
+
+function emptyText() {
+  return { requirements: "No requirements were produced.", gaps: "No unimplemented behaviour was found.",
+    rejected: "Every claim passed the citation check.", surfaces: "No routes, commands, settings or constants were detected. Detection currently covers Python." }[S.view];
+}
+
+function select(id, scroll = false) {
+  S.sel = id;
+  $("#tablewrap").querySelectorAll("tbody tr").forEach(tr => tr.setAttribute("aria-selected", String(tr.dataset.id === id)));
+  if (scroll) $(`#tablewrap tr[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({block: "nearest"});
+  renderDetail();
+}
+
+/* ---------- detail ---------- */
+function renderDetail() {
+  const d = $("#detail"); if (!d) return;
+  const item = filtered().find(r => r.id === S.sel);
+  if (!item) { d.innerHTML = `<div class="none">Select a row to see its details and the cited code.</div>`; return; }
+  if (item._surface) { d.innerHTML = surfaceDetail(item); loadCites(); return; }
+  const rej = S.view === "rejected";
+  const rv = S.reviews[item.id] || {};
+  const tagCls = rej ? "rejected" : item.confidence;
+  const tagText = rej ? "Rejected by the citation check" : CONF[item.confidence];
+  const meta = [
+    ["Type", esc(item.type)],
+    ["Section", esc(item.section)],
+    item.canonical_name && ["Topic", esc(item.canonical_name)],
+    item.subject_name && ["Subject", `<span class="mono">${esc(item.subject_name)}</span>`],
+    item.claim_attribute && ["Claim key", `<span class="mono">${esc(item.claim_attribute)} = ${esc(item.claim_value)}</span>`],
+    item.actors?.length && ["Actors", esc(item.actors.map(a => a.name).join(", "))],
+  ].filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  const attrs = item.attributes?.length ? `<div><h3>Limits</h3><table class="attrs"><thead><tr><th>Name</th><th>Rule</th><th>Unit</th><th>Value type</th></tr></thead><tbody>${
+    item.attributes.map(a => `<tr><td>${esc(a.name)}</td><td>${esc(a.operator)} ${esc(a.value)}</td><td>${esc(a.unit_literal) || "–"}</td><td>${esc(a.isq_type)}</td></tr>`).join("")}</tbody></table></div>` : "";
+  const cites = item.evidence.map((e, i) => `<figure class="cite">
+      <figcaption><span>${esc(e.file)} · lines ${e.start_line}–${e.end_line}${e.symbol ? " · " + esc(e.symbol) : ""}</span>${e.ok === false ? `<span class="why">${esc(e.note)}</span>` : ""}</figcaption>
+      <div class="code" data-file="${esc(e.file)}" data-s="${e.start_line}" data-e="${e.end_line}">Loading…</div></figure>`).join("");
+  const review = rej ? "" : `<div class="review">
+      <h3>Your review</h3>
+      <div class="seg" role="group" aria-label="Verdict">
+        ${["accepted", "wrong", "unsure"].map(v => `<button type="button" data-v="${v}" aria-pressed="${rv.verdict === v}">${VERDICT[v]} <kbd>${{accepted: "A", wrong: "W", unsure: "U"}[v]}</kbd></button>`).join("")}
+      </div>
+      <label class="sr" for="note">Note</label>
+      <textarea class="field" id="note" placeholder="What is wrong or missing? Saved with the verdict.">${esc(rv.note || "")}</textarea>
+      <div class="saved" id="saved">${rv.at ? `Saved ${esc(when(rv.at))}` : "Not reviewed yet."}</div>
+    </div>`;
+  d.innerHTML = `<article class="d">
+    <div class="d-head"><span class="d-id">${esc(item.id)}</span><span class="tag ${tagCls}">${esc(tagText)}</span></div>
+    <p class="d-text">${esc(item.text)}</p>
+    <dl class="meta">${meta}</dl>
+    ${attrs}
+    <div class="cites"><h3>Cited code</h3>${cites || '<div class="none">No citations.</div>'}</div>
+    ${review}</article>`;
+  loadCites();
+  if (!rej) {
+    d.querySelectorAll(".seg button").forEach(b => b.onclick = () => setVerdict(b.dataset.v));
+    $("#note").addEventListener("change", () => { const cur = S.reviews[item.id]; if (cur) setVerdict(cur.verdict, true); else $("#saved").textContent = "Choose a verdict to save the note."; });
+  }
+}
+
+function surfaceDetail(s) {
+  return `<article class="d">
+    <div class="d-head"><span class="d-id">${esc(s.kind.replace("_", " "))}</span><span class="tag ${s.covered ? "confirmed" : "rejected"}">${s.covered ? "Covered by a requirement" : "No requirement covers this"}</span></div>
+    <p class="d-text">${esc(s.name)}</p>
+    <dl class="meta"><dt>Location</dt><dd class="mono">${esc(s.file)}:${s.line}</dd>${s.detail ? `<dt>Detail</dt><dd class="mono">${esc(s.detail)}</dd>` : ""}</dl>
+    <div class="cites"><h3>Code</h3><figure class="cite"><figcaption><span>${esc(s.file)} · lines ${s.line}–${s.end_line}</span></figcaption>
+    <div class="code" data-file="${esc(s.file)}" data-s="${s.line}" data-e="${s.end_line}">Loading…</div></figure></div></article>`;
+}
+
+function loadCites() {
+  document.querySelectorAll("#detail .code").forEach(async el => {
+    const key = `${el.dataset.file}:${el.dataset.s}:${el.dataset.e}`;
+    if (!S.src.has(key)) S.src.set(key, api(`/api/runs/${S.runId}/source?file=${encodeURIComponent(el.dataset.file)}&start=${el.dataset.s}&end=${el.dataset.e}`));
+    try {
+      const src = await S.src.get(key), s = +el.dataset.s, e = +el.dataset.e;
+      el.innerHTML = src.lines.map((l, i) => { const n = src.first_line + i;
+        return `<div class="ln ${n >= s && n <= e ? "hl" : ""}"><span class="n">${n}</span><span>${esc(l) || " "}</span></div>`; }).join("");
+      const first = el.querySelector(".hl"); if (first) el.scrollTop = Math.max(0, first.offsetTop - 40);
+    } catch (err) { el.textContent = `Could not load this file: ${err.message}`; }
+  });
+}
+
+async function setVerdict(v, keepIfSame = false) {
+  const id = S.sel; if (!id || S.view === "rejected" || S.view === "surfaces") return;
+  const cur = S.reviews[id]?.verdict;
+  const verdict = !keepIfSame && cur === v ? "clear" : v;  // pressing the active verdict again clears it
+  try {
+    S.reviews = await api(`/api/runs/${S.runId}/reviews`, {method: "POST",
+      body: JSON.stringify({req_id: id, verdict, note: $("#note")?.value || ""})});
+  } catch (err) { const s = $("#saved"); if (s) s.textContent = `Not saved: ${err.message}`; return; }
+  renderStatus();
+  const row = $(`#tablewrap tr[data-id="${CSS.escape(id)}"]`);
+  const nv = S.reviews[id]?.verdict;
+  if (row) { const c = row.lastElementChild; c.className = `small ${nv ? "v-" + nv : "v-none"}`; c.textContent = nv ? VERDICT[nv] : "–"; }
+  if (S.f.review) renderTable();
+  renderDetail();
+}
+
+/* ---------- keyboard ---------- */
+document.addEventListener("keydown", e => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName);
+  if (e.key === "Escape" && typing) { document.activeElement.blur(); return; }
+  if (typing || e.ctrlKey || e.metaKey || e.altKey || !S.result) return;
+  const rows = filtered(), i = rows.findIndex(r => r.id === S.sel);
+  const k = e.key.toLowerCase();
+  if (k === "j" || e.key === "ArrowDown") { if (rows[i + 1]) select(rows[i + 1].id, true); e.preventDefault(); }
+  else if (k === "k" || e.key === "ArrowUp") { if (i > 0) select(rows[i - 1].id, true); e.preventDefault(); }
+  else if (k === "a") setVerdict("accepted");
+  else if (k === "w") setVerdict("wrong");
+  else if (k === "u") setVerdict("unsure");
+  else if (k === "n") { $("#note")?.focus(); e.preventDefault(); }
+  else if (e.key === "/") { $("#fQ")?.focus(); e.preventDefault(); }
+});
+
+/* ---------- start ---------- */
+(async () => {
+  try { await loadRuns(); } catch (err) { $("#status").innerHTML = `<span class="err">The code2req server is not reachable: ${esc(err.message)}</span>`; return; }
+  const running = S.runs.find(r => ["queued", "running"].includes(r.status));
+  if (running) openRun(running.id);  // a run in progress is always shown
+  else if (S.runs[0]) openRun(S.runs[0].id);
+  else newAnalysis();
+})();
+</script>
+</body>
+</html>
