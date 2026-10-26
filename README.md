@@ -36,23 +36,26 @@ The output uses the same JSON shape as SysModeler's docreq document pipeline, so
 
 ## 1. Quick start
 
+Requires Python 3.12 or newer and git.
+
 ```bash
-cd "d:/AI work/code2req"
+git clone https://github.com/pr0ximaCent/Code2Req-Orchestration-for-Codebase-to-Natural-Language-.git code2req
+cd code2req
 python -m venv .venv
 .venv/Scripts/pip install -e ".[dev]"        # Windows layout; use .venv/bin on Linux/macOS
 
-# Use the sysmodeler-backend-ai keys directly ...
-.venv/Scripts/code2req analyze <repo path or git URL> --env-file "d:/AI work/sysmodeler-backend-ai/.env" --out out/myrun
-# ... or put the keys in ./.env, which is loaded automatically
+cp .env.example .env                          # then set GEMINI_API_KEY in .env
 .venv/Scripts/code2req analyze <repo path or git URL> --out out/myrun
 ```
+
+`./.env` is loaded automatically. To use a key file kept elsewhere, pass `--env-file path/to/.env`. `.env.example` lists every variable code2req reads.
 
 Open `out/myrun/requirements.md` to review the requirements. `out/myrun/requirements.json` is the machine-readable result.
 
 ### Web UI
 
 ```bash
-.venv/Scripts/code2req serve --env-file "d:/AI work/sysmodeler-backend-ai/.env"   # then open http://127.0.0.1:8765
+.venv/Scripts/code2req serve        # then open http://127.0.0.1:8765
 ```
 
 In the browser you can:
