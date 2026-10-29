@@ -4,7 +4,7 @@ Runs are stored under runs_dir/<run_id>/ with:
   run.json        status, target, options, progress, summary
   run.log         captured log lines
   review.json     per-requirement verdicts from the UI
-  requirements.json / requirements.md / ...   pipeline output
+  requirements.json / .md / .pdf / ...   pipeline output
 
 One run executes at a time (the pipeline's logging is process-wide). The
 server is meant for 127.0.0.1 only: it reads local folders and runs git clone.
@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import threading
 import time
 import uuid
@@ -24,12 +23,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from code2req.config import resolve_repo
+from code2req.cache import with_cache
+from code2req.config import is_git_url, prune_clone, referenced_files, resolve_repo, rmtree
 from code2req.llm import LLM
 from code2req.pipeline import run as run_pipeline
+from code2req.render_pdf import render_pdf
 from code2req.structure import DEFAULT_MODULE_CHARS
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,10 @@ class RunRequest(BaseModel):
     workers: int = Field(default=4, ge=1, le=16)
     max_module_chars: int = Field(default=DEFAULT_MODULE_CHARS, ge=5_000, le=400_000)
     followup: bool = True
+    entries: list[str] = Field(default_factory=list)  # extra entry-point globs for dead-code detection
+    assets: bool = True  # include prompts, templates, reference files and CI/CD
+    cache: bool = True  # reuse answers for modules whose code is unchanged
+    keep_clone: bool = False  # git URL: keep the whole clone, not only the files the result cites
 
 
 class ReviewRequest(BaseModel):
@@ -107,9 +112,11 @@ class _RunLogHandler(logging.Handler):
 
 
 class RunManager:
-    def __init__(self, runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]]):
+    def __init__(self, runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
+                 cache_path: str | None = None):
         self.runs_dir = os.path.abspath(runs_dir)
         self.llm_factory = llm_factory
+        self.cache_path = cache_path  # None: the shared default (~/.cache/code2req)
         self.lock = threading.Lock()
         self.active: str | None = None
         self.live_meta: dict[str, dict] = {}  # meta of the active run, served from memory
@@ -198,18 +205,27 @@ class RunManager:
             llm, label = self.llm_factory()
             meta["model"] = label
             logger.info("run %s: %s (%s)", run_id, repo, label)
+            llm = with_cache(llm, label, enabled=req.cache, path=self.cache_path)
             report = run_pipeline(repo, out_dir, llm, label, req.workers,
                                   req.exclude or None, req.max_module_chars, progress=progress,
-                                  followup=req.followup)
+                                  followup=req.followup, entries=req.entries or None,
+                                  include_assets=req.assets)
+            if is_git_url(meta["target"]) and not req.keep_clone:
+                kept, removed = prune_clone(repo, referenced_files(report))
+                logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)
             st = report.stats
             meta["summary"] = {
-                "requirements": st["requirements"], "gaps": st["gaps"],
+                "requirements": st["requirements"], "references": st["references"], "gaps": st["gaps"],
                 "rejected": st["rejected"], "modules": st["modules"],
+                "dead_code": len(report.dead_code),
                 "failed_modules": len(st.get("failed_modules", [])),
                 "coverage": st["surface_coverage"]["ratio"],
                 "function_coverage": st["function_coverage"]["ratio"],
                 "credits": (st.get("cost") or {}).get("credits"),
                 "cost_usd": (st.get("cost") or {}).get("cost_usd"),
+                "provider_cost_usd": (st.get("cost") or {}).get("provider_cost_usd"),
+                "calls": (st.get("cost") or {}).get("calls"),
+                "reused": ((st.get("cost") or {}).get("cache") or {}).get("hits"),
             }
             meta["status"] = "done"
         except Exception as e:  # noqa: BLE001 - report any failure to the UI
@@ -268,7 +284,7 @@ class RunManager:
             if self.active == run_id:
                 raise HTTPException(409, "this run is still in progress; wait for it to finish")
             self.logs.pop(run_id, None)
-            shutil.rmtree(path)
+            rmtree(path)  # a kept clone has read-only git files
 
     def reviews(self, run_id: str) -> dict:
         return _read_json(os.path.join(self._dir(run_id), "review.json"), {})
@@ -286,9 +302,10 @@ class RunManager:
         return data
 
 
-def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]]) -> FastAPI:
+def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
+               cache_path: str | None = None) -> FastAPI:
     app = FastAPI(title="code2req", docs_url="/api/docs", redoc_url=None)
-    mgr = RunManager(runs_dir, llm_factory)
+    mgr = RunManager(runs_dir, llm_factory, cache_path)
     app.state.manager = mgr
 
     @app.get("/", include_in_schema=False)
@@ -334,16 +351,30 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]]) -> Fas
     def set_review(run_id: str, req: ReviewRequest) -> dict:
         return mgr.set_review(run_id, req)
 
-    @app.get("/api/runs/{run_id}/export")
-    def export(run_id: str) -> JSONResponse:
+    def reviewed(run_id: str) -> dict:
         """Requirements with the UI verdict attached, for feedback or downstream use."""
         result, reviews = mgr.result(run_id), mgr.reviews(run_id)
-        for key in ("requirements", "gaps"):
+        for key in ("requirements", "references", "gaps"):
             for r in result.get(key, []):
                 if r.get("id") in reviews:
                     r["review"] = reviews[r["id"]]
+        return result
+
+    @app.get("/api/runs/{run_id}/export")
+    def export(run_id: str) -> JSONResponse:
         headers = {"Content-Disposition": f'attachment; filename="code2req-{run_id}.json"'}
-        return JSONResponse(result, headers=headers)
+        return JSONResponse(reviewed(run_id), headers=headers)
+
+    @app.get("/api/runs/{run_id}/export.pdf")
+    def export_pdf(run_id: str) -> Response:
+        """The same content as the JSON export, as a readable document. Rendered on request
+        so verdicts given in the UI since the run are in it."""
+        try:
+            pdf = render_pdf(reviewed(run_id))
+        except Exception as e:
+            raise HTTPException(500, f"PDF rendering failed: {e}") from e
+        headers = {"Content-Disposition": f'attachment; filename="code2req-{run_id}.pdf"'}
+        return Response(pdf, media_type="application/pdf", headers=headers)
 
     @app.get("/api/health")
     def health() -> dict:

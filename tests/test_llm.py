@@ -87,6 +87,62 @@ def test_single_key_wins_like_backend_pool_is_fallback(monkeypatch):
     assert not _Model("gemini", "g", 3).configured()
 
 
+def test_single_model_gemini_uses_the_key_pool(monkeypatch):
+    # --model gemini/... goes through LiteLLM, which on its own reads only GEMINI_API_KEY
+    import types
+
+    import litellm
+
+    from code2req.llm import LiteLLM
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEYS", "k1,k2")
+    seen = []
+
+    def fake_completion(**kw):
+        seen.append(kw.get("api_key"))
+        msg = types.SimpleNamespace(content="{}")
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)], usage=None)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    llm = LiteLLM("gemini/gemini-3.8-flash")
+    llm.complete("s", "u")
+    llm.complete("s", "u")
+    LiteLLM("anthropic/x").complete("s", "u")
+    assert seen == ["k1", "k2", None]
+
+
+def test_single_model_parks_an_invalid_key_and_waits_out_overload(monkeypatch):
+    import types
+
+    import litellm
+
+    from code2req import llm as llm_mod
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEYS", "bad,good")
+    waits, seen = [], []
+    monkeypatch.setattr(llm_mod.time, "sleep", waits.append)
+
+    class AuthenticationError(Exception): pass
+    class ServiceUnavailableError(Exception): pass
+
+    def fake_completion(**kw):
+        seen.append(kw["api_key"])
+        if kw["api_key"] == "bad":
+            raise AuthenticationError("API_KEY_INVALID")
+        if len(seen) < 3:
+            raise ServiceUnavailableError("This model is currently experiencing high demand.")
+        msg = types.SimpleNamespace(content="{}")
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)], usage=None)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    llm = llm_mod.LiteLLM("gemini/gemini-3.8-flash")
+    assert llm.complete("s", "u") == "{}"
+    assert seen == ["bad", "good", "good"]  # the bad key is not tried again
+    assert waits == [2.0, 30.0]  # auth error: short backoff; overload on attempt 2: 15 s x 2
+    llm.complete("s", "u")
+    assert seen[-1] == "good"
+
+
 def test_retry_wait_honours_per_minute_delay_not_daily():
     from code2req.llm import retry_wait
     per_minute = RuntimeError('"quotaId": "GenerateRequestsPerMinutePerProjectPerModel" "retryDelay": "23s"')
@@ -97,6 +153,8 @@ def test_retry_wait_honours_per_minute_delay_not_daily():
     assert retry_wait(daily, 1) == 2.0  # key gets parked instead of waiting hours
     assert retry_wait(RuntimeError("boom"), 2) == 4.0
     assert retry_wait(None, 1) == 2.0
+    overloaded = type("ServiceUnavailableError", (Exception,), {})("high demand")
+    assert (retry_wait(overloaded, 1), retry_wait(overloaded, 2), retry_wait(overloaded, 9)) == (15.0, 30.0, 60.0)
 
 
 def test_invalid_and_daily_quota_keys_are_parked(monkeypatch):

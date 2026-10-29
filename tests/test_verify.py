@@ -123,6 +123,28 @@ def test_citation_inside_long_constant_or_method_matches_declaration():
     assert "add_item" in files.enclosing_symbols("app/api.py", 26, 27)
 
 
+def test_non_code_files_are_anchored_by_quote_or_heading(tmp_path):
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "plan.md").write_text(
+        "# Planning\n\n## Output format\nReturn   a numbered list of steps.\nKeep each step short.\n"
+        "## Limits\nUse at most 7 steps.\n")
+    files = FileCache(str(tmp_path))
+
+    def check(start, end, symbol, attributes=None):
+        r = req([Evidence(file="prompts/plan.md", start_line=start, end_line=end, symbol=symbol)],
+                attributes=attributes)
+        return verify_requirement(r, files, VerifyStats())
+
+    assert check(4, 4, "return a numbered list")[1]          # quote, whitespace and case ignored
+    assert check(5, 5, "## Output format")[1]                # heading above the cited lines
+    assert check(4, 5, '"Output format"')[1]
+    out, ok = check(3, 3, "Limits")                          # a later heading, not the one above
+    assert not ok and out.evidence[0].note.startswith("quote 'Limits'")
+    assert not check(4, 5, "")[1]                            # an anchor is mandatory in text files
+    out, ok = check(7, 7, "at most 7 steps", [Attribute(name="maxSteps", operator="<=", value=7)])
+    assert ok and [a.name for a in out.attributes] == ["maxSteps"]
+
+
 def test_value_in_code_and_test_paths():
     assert value_in_code(0.5, [500.0])
     assert not value_in_code(3.0, [500.0])

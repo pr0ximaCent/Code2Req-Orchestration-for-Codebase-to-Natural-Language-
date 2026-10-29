@@ -37,19 +37,26 @@ class Tier:
     until: datetime | None = None  # tier applies to calls before this time only
 
 
+# Same models and rates as sysmodeler-backend-ai providers/gemini/cost.go (PricingRegistry)
+# and providers/openai/cost.go (pricingByModel). Keys are SysModeler's model IDs.
 PRICING: dict[str, list[Tier]] = {
     "gemini-3.1-pro-preview": [Tier(200_000, 2.00, 0.20, 12.00), Tier(None, 4.00, 0.40, 18.00)],
     "gemini-3.8-flash": [Tier(None, 0.75, 0.075, 3.75, until=FLASH_INTRO_ENDS),
                          Tier(None, 1.50, 0.15, 7.50)],
-    "gemini-3.1-flash-lite-preview": [Tier(None, 0.25, 0.025, 1.50)],
+    "gemini-3.1-flash-lite": [Tier(None, 0.25, 0.025, 1.50)],
     "gpt-5.4": [Tier(None, 3.75, 0.375, 15.00)],
     "gpt-5.5": [Tier(None, 7.50, 0.75, 30.00)],
     "gpt-5.6-terra": [Tier(None, 2.00, 0.20, 12.00)],
+    "gpt-6-sol-1": [Tier(None, 2.00, 0.20, 10.00)],
+    "gpt-6-luna-1": [Tier(None, 0.10, 0.01, 0.50)],
 }
+# Provider names for the same model that differ from SysModeler's ID.
+ALIASES = {"gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite"}
 
 
 def _tier(model: str, prompt_tokens: int, now: datetime) -> Tier | None:
-    for t in PRICING.get(model.rsplit("/", 1)[-1], []):
+    name = model.rsplit("/", 1)[-1]
+    for t in PRICING.get(ALIASES.get(name, name), []):
         if t.until is not None and now >= t.until:
             continue
         if t.max_prompt_tokens is None or prompt_tokens <= t.max_prompt_tokens:
@@ -83,6 +90,20 @@ class _Slice:
 
 
 _task = threading.local()
+_meter = threading.local()
+
+
+@contextmanager
+def call_meter():
+    """Collect the cost of the calls made inside the block on this thread (retries included),
+    so the answer cache knows what each answer cost."""
+    acc = {"cost_usd": 0.0, "provider_cost_usd": 0.0}
+    prev = getattr(_meter, "acc", None)
+    _meter.acc = acc
+    try:
+        yield acc
+    finally:
+        _meter.acc = prev
 
 
 @contextmanager
@@ -120,6 +141,10 @@ class UsageLedger:
                     + output_tokens * tier.output) / per
             provider = cost + thinking_tokens * tier.output / per
         task = getattr(_task, "name", None) or "other"
+        acc = getattr(_meter, "acc", None)
+        if acc is not None:
+            acc["cost_usd"] += cost
+            acc["provider_cost_usd"] += provider
         with self._lock:
             for s in (self.total, self.by_model.setdefault(model, _Slice()),
                       self.by_task.setdefault(task, _Slice())):
@@ -142,3 +167,36 @@ class UsageLedger:
             out["note"] = ("credits = SysModeler formula (thinking tokens not billed); "
                            "provider_cost_usd includes thinking tokens at the output rate")
             return out
+
+
+def cost_lines(c: dict | None) -> list[str]:
+    """The cost of a run in plain lines, for the CLI and requirements.md.
+
+    Two numbers, because they differ: what the providers bill for the calls,
+    and what SysModeler would charge a user for the same calls.
+    """
+    cache = (c or {}).get("cache") or {}
+    reused = (f"Answer cache: {cache['hits']} of {cache['hits'] + cache['misses']} answers reused for "
+              f"unchanged code, saving ${cache['saved_provider_cost_usd']:.4f} API / "
+              f"{credits_from_dollars(cache['saved_cost_usd']):,} credits") if cache.get("hits") else ""
+    if not c or not c.get("calls"):
+        return ["No paid model calls were made."] + ([reused] if reused else [])
+    lines = [
+        f"API cost: ${c['provider_cost_usd']:.4f} (what the providers bill; Gemini thinking tokens "
+        f"at the output rate)",
+        f"SysModeler charge: {c['credits']:,} credits = ${c['cost_usd']:.4f} (sysmodeler-backend-ai "
+        f"formula: thinking not billed; dollars x {c['credits_per_dollar']:,}, rounded half up, once per run)",
+        f"Calls: {c['calls']} · tokens: {c['input_tokens']:,} in ({c['cached_input_tokens']:,} cached) / "
+        f"{c['output_tokens']:,} out + {c['thinking_tokens']:,} thinking",
+    ]
+    for label, key in (("By stage", "by_task"), ("By model", "by_model")):
+        parts = [f"{k} {v['calls']} call(s) ${v['provider_cost_usd']:.4f} API / {v['credits']:,} credits"
+                 for k, v in sorted(c.get(key, {}).items(), key=lambda kv: -kv[1]["provider_cost_usd"])]
+        if parts:
+            lines.append(f"{label}: " + " · ".join(parts))
+    if c.get("unpriced_models"):
+        lines.append("Not priced (no rate in SysModeler's tables, counted as $0): "
+                     + ", ".join(c["unpriced_models"]))
+    if reused:
+        lines.append(reused)
+    return lines

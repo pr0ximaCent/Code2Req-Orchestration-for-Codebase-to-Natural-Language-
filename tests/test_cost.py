@@ -70,6 +70,37 @@ def test_tasks_and_models_are_broken_down_and_unknown_models_flagged():
     assert s["calls"] == 3
 
 
+def test_every_sysmodeler_model_is_priced_with_its_rates():
+    # providers/openai/cost.go pricingByModel and gemini/cost.go PricingRegistry, 1M in + 1M out
+    for model, want in [("gpt-6-sol-1", 12.00), ("gpt-6-luna-1", 0.60), ("gpt-5.6-terra", 14.00),
+                        ("gemini-3.1-flash-lite", 1.75), ("gemini/gemini-3.1-flash-lite-preview", 1.75)]:
+        s = one_call(model, 1_000_000, 0, 1_000_000)
+        assert s["cost_usd"] == pytest.approx(want) and s["unpriced_models"] == [], model
+
+
+def test_cost_lines_show_api_cost_and_sysmodeler_credits():
+    from code2req.cost import cost_lines
+    led = UsageLedger()
+    with llm_task("module"):
+        led.record("gemini-3.8-flash", 1_000_000, 0, 100_000, thinking_tokens=100_000, now=BEFORE_2027)
+    with llm_task("asset"):
+        led.record("gemini-3.8-flash", 100_000, 0, 0, now=BEFORE_2027)
+    lines = cost_lines(led.summary())
+    # SysModeler: 1.1M in x 0.75 + 0.1M out x 3.75 = $1.20 -> 12,000 credits; API adds 0.1M thinking: $1.575
+    assert lines[0].startswith("API cost: $1.5750")
+    assert lines[1].startswith("SysModeler charge: 12,000 credits = $1.2000")
+    assert lines[3].startswith("By stage: module 1 call(s) $1.5000 API / 11,250 credits · asset 1 call(s)")
+    assert cost_lines(None) == ["No paid model calls were made."]
+
+
+def test_cost_lines_report_reused_answers():
+    from code2req.cost import cost_lines
+    cache = {"hits": 3, "misses": 1, "saved_cost_usd": 0.5, "saved_provider_cost_usd": 0.75}
+    assert cost_lines({"calls": 0, "cache": cache}) == [
+        "No paid model calls were made.",
+        "Answer cache: 3 of 4 answers reused for unchanged code, saving $0.7500 API / 5,000 credits"]
+
+
 def test_litellm_completion_is_split_into_answer_and_thinking():
     # LiteLLM folds Gemini thoughtsTokenCount into completion_tokens (checked against the raw API)
     resp = SimpleNamespace(usage=SimpleNamespace(

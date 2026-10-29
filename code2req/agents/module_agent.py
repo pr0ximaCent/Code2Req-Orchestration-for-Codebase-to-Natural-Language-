@@ -40,6 +40,7 @@ class ModuleInput:
     module: Module
     surfaces: list[Surface] = field(default_factory=list)
     tests: list[TestSnippet] = field(default_factory=list)
+    unused: list[str] = field(default_factory=list)  # "name (file:start-end)" of dead functions
 
 
 def numbered(lines: list[str], start: int) -> str:
@@ -125,6 +126,10 @@ def build_module_prompt(inp: ModuleInput, components: dict[str, Any], read_lines
     parts.append("\nSOURCE CODE:")
     parts.append(render_code(m.component_ids, m.extra_files, components, read_lines))
 
+    if inp.unused:
+        parts.append("\nUNUSED CODE (nothing in the running system calls these; write no requirements for them):")
+        parts.extend(f"- {u}" for u in inp.unused)
+
     if inp.tests:
         parts.append("\nTESTS THAT EXERCISE THIS MODULE:")
         for t in inp.tests:
@@ -136,17 +141,13 @@ def build_module_prompt(inp: ModuleInput, components: dict[str, Any], read_lines
 
 
 def parse_requirements(raw: str, module: Module) -> list[FlatRequirement]:
-    return _parse(raw, module)[0]
+    return _parse(raw, module).requirements
 
 
-def _parse(raw: str, module: Module) -> tuple[list[FlatRequirement], list[str]]:
-    try:
-        data = parse_json_object(raw)
-    except ValueError as e:
-        logger.warning("module %s: unparsable reply: %s", module.name, e)
-        return [], []
+def parse_items(items: Any, module: Any) -> list[FlatRequirement]:
+    """Requirement items from a model reply, stamped with the module (anything with name and section)."""
     out: list[FlatRequirement] = []
-    for item in data.get("requirements") or []:
+    for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or not str(item.get("text", "")).strip():
             continue
         item.pop("id", None)
@@ -160,8 +161,48 @@ def _parse(raw: str, module: Module) -> tuple[list[FlatRequirement], list[str]]:
             out.append(FlatRequirement.model_validate(item))
         except ValidationError as e:
             logger.warning("module %s: dropped malformed item: %s", module.name, e.errors()[:1])
-    internal = [str(x).strip() for x in data.get("internal") or [] if str(x).strip()]
-    return out, internal
+    return out
+
+
+INTERNAL_REASONS = ("logging", "getter", "formatting", "not_supported", "boilerplate")
+SURFACE_CONTEXT = 3  # lines shown around each uncovered surface in the follow-up
+
+
+@dataclass
+class FollowUp:
+    """A follow-up answer: new requirements, plus how each other uncited function is accounted for."""
+
+    requirements: list[FlatRequirement] = field(default_factory=list)
+    covered: list[tuple[str, int]] = field(default_factory=list)  # (function, 1-based index into existing)
+    internal: list[tuple[str, str]] = field(default_factory=list)  # (function, reason)
+
+
+def _parse(raw: str, module: Module) -> FollowUp:
+    try:
+        data = parse_json_object(raw)
+    except ValueError as e:
+        logger.warning("module %s: unparsable reply: %s", module.name, e)
+        return FollowUp()
+    out = FollowUp(requirements=parse_items(data.get("requirements"), module))
+    for item in data.get("covered") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("function", "")).strip()
+        ref = str(item.get("by", "")).strip().upper().lstrip("R")
+        if name and ref.isdigit():
+            out.covered.append((name, int(ref)))
+    for item in data.get("internal") or []:
+        if isinstance(item, str):  # answers cached before reasons were asked for
+            name, reason = item.strip(), "unspecified"
+        elif isinstance(item, dict):
+            name = str(item.get("function", "")).strip()
+            reason = str(item.get("reason", "")).strip().lower()
+            reason = reason if reason in INTERNAL_REASONS else "unspecified"
+        else:
+            continue
+        if name:
+            out.internal.append((name, reason))
+    return out
 
 
 def run_module(llm: LLM, inp: ModuleInput, components: dict[str, Any],
@@ -174,20 +215,43 @@ def run_module(llm: LLM, inp: ModuleInput, components: dict[str, Any],
 
 
 def run_followup(llm: LLM, module: Module, uncited: list[Any], existing: list[FlatRequirement],
-                 components: dict[str, Any], read_lines: ReadLines) -> tuple[list[FlatRequirement], list[str]]:
-    """Ask for requirements for functions no requirement cites, or to mark them internal."""
-    names = ", ".join(sorted({n.name for n in uncited}))
-    already = "\n".join(f"- {r.text}" for r in existing) or "- (none)"
-    prompt = "\n".join([
+                 components: dict[str, Any], read_lines: ReadLines,
+                 surfaces: list[Surface] | None = None) -> FollowUp:
+    """Ask, for functions and types no requirement cites, for new requirements, the existing
+    requirement (R<n>, 1-based into existing) that states their behaviour, or why they are internal.
+    Surfaces (routes, flags, env vars, ...) no requirement covers yet are listed for new requirements."""
+    already = "\n".join(f"R{i}. {r.text}" for i, r in enumerate(existing, 1)) or "- (none)"
+    parts = [
         f"MODULE: {module.section}",
-        "\nREQUIREMENTS ALREADY WRITTEN FOR THIS MODULE (do not repeat them):",
+        "\nREQUIREMENTS ALREADY WRITTEN FOR THIS MODULE (do not repeat them; refer to them as R<n>):",
         already,
-        f"\nFUNCTIONS NOT CITED BY ANY REQUIREMENT: {names}",
-        "\nSOURCE CODE OF THOSE FUNCTIONS (with the file's top-level declarations):",
-        render_code([n.id for n in uncited], [], components, read_lines),
-    ])
+    ]
+    if surfaces:
+        parts.append("\nSURFACES NO REQUIREMENT COVERS YET (write a requirement for each, citing its line):")
+        parts += [f"- [{s.kind}] {s.name}{f' ({s.detail})' if s.detail else ''} - {s.file}:{s.line}"
+                  for s in surfaces]
+        files = sorted({s.file for s in surfaces})
+        parts.append("\nSOURCE OF THOSE SURFACES:")
+        for rel in files:
+            lines = read_lines(rel) or []
+            wanted = sorted({ln for s in surfaces if s.file == rel for ln in range(s.line, s.end_line + 1)})
+            shown = sorted({k for ln in wanted for k in range(max(1, ln - SURFACE_CONTEXT),
+                                                             min(len(lines), ln + SURFACE_CONTEXT) + 1)})
+            parts.append(f"\n### {rel} (excerpt)")
+            runs: list[list[int]] = []  # contiguous line runs, numbered like the code listings
+            for k in shown:
+                if runs and k == runs[-1][-1] + 1:
+                    runs[-1].append(k)
+                else:
+                    runs.append([k])
+            parts.append("\n...\n".join(numbered(lines[r[0] - 1:r[-1]], r[0]) for r in runs))
+    if uncited:
+        parts += [f"\nFUNCTIONS AND TYPES NOT CITED BY ANY REQUIREMENT: {', '.join(sorted({n.name for n in uncited}))}",
+                  "\nSOURCE CODE OF THOSE (with the file's top-level declarations):",
+                  render_code([n.id for n in uncited], [], components, read_lines)]
+    prompt = "\n".join(parts)
     raw = llm.complete(FOLLOWUP_SYSTEM, prompt, json_mode=True)
-    reqs, internal = _parse(raw, module)
-    logger.info("module %s follow-up: %d requirement(s), %d internal helper(s) of %d uncited",
-                module.name, len(reqs), len(internal), len(uncited))
-    return reqs, internal
+    out = _parse(raw, module)
+    logger.info("module %s follow-up: %d requirement(s), %d covered, %d internal of %d uncited",
+                module.name, len(out.requirements), len(out.covered), len(out.internal), len(uncited))
+    return out

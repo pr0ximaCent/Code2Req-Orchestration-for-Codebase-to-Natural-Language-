@@ -8,6 +8,7 @@ LiteLLM is a single-model client for any LiteLLM model string
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -52,6 +53,8 @@ class LiteLLM:
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.ledger = UsageLedger()
+        self._turn = itertools.count()
+        self._dead_keys: set[str] = set()  # invalid or out of daily quota; skipped for the run
 
     @property
     def usage(self) -> dict:
@@ -65,19 +68,32 @@ class LiteLLM:
                   "max_tokens": self.max_tokens, "timeout": self.timeout}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        # LiteLLM itself only reads GEMINI_API_KEY; use the same keys as the docreq chain,
+        # so a GEMINI_API_KEYS pool works too (rotated, a retry gets the next key).
+        pooled = self.model.startswith("gemini/") and bool(gemini_keys())
 
         last: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
+            key = None
+            if pooled:
+                keys = [k for k in gemini_keys() if k not in self._dead_keys]
+                if not keys:
+                    raise RuntimeError("no usable Gemini key left (all invalid or out of daily quota)")
+                key = kwargs["api_key"] = keys[next(self._turn) % len(keys)]
             try:
                 resp = litellm.completion(**kwargs)
                 record_litellm_usage(self.ledger, self.model, resp)
                 return resp.choices[0].message.content or ""
             except Exception as e:  # noqa: BLE001 - provider errors vary by backend
                 last = e
-                logger.warning("llm call failed (attempt %d/%d): %s", attempt, self.max_retries, e)
+                logger.warning("llm call failed (attempt %d/%d): %s", attempt, self.max_retries, _short_error(e))
+                if key and key_is_dead(e) and key not in self._dead_keys:
+                    self._dead_keys.add(key)
+                    logger.warning("gemini key parked for this run: %s",
+                                   "daily quota used up" if "PerDay" in str(e) else "invalid key")
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
-        raise RuntimeError(f"LLM call failed after {self.max_retries} attempts: {last}")
+                    time.sleep(retry_wait(e, attempt))
+        raise RuntimeError(f"LLM call failed after {self.max_retries} attempts: {_short_error(last)}")
 
 
 MAX_GEMINI_RETRIES = 3
@@ -191,7 +207,7 @@ class FallbackLLM:
     def _park_key_if_dead(self, key: str, err: Exception) -> None:
         """Retrying a key that is invalid or out of daily quota only wastes attempts."""
         text = f"{type(err).__name__} {err}"
-        if "AuthenticationError" in text or "API_KEY_INVALID" in text or "PerDay" in text:
+        if key_is_dead(err):
             with self._lock:
                 if key not in self._dead_keys:
                     self._dead_keys.add(key)
@@ -286,7 +302,14 @@ class FallbackLLM:
 
 
 MAX_RATE_LIMIT_WAIT = 60.0
+OVERLOAD_WAIT = 15.0
 _RETRY_DELAY_RE = re.compile(r'retryDelay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)s')
+
+
+def key_is_dead(err: Exception) -> bool:
+    """The key itself is the problem (invalid, or its daily quota is gone): retrying it is useless."""
+    text = f"{type(err).__name__} {err}"
+    return "AuthenticationError" in text or "API_KEY_INVALID" in text or "PerDay" in text
 
 
 def retry_wait(err: Exception | None, attempt: int) -> float:
@@ -295,15 +318,18 @@ def retry_wait(err: Exception | None, attempt: int) -> float:
     docreq's 2^n backoff, except for a per-minute rate limit: then wait the
     delay Gemini asks for (capped), since retrying sooner just fails again.
     A daily-quota error is not worth waiting for; the key is parked instead.
+    "Model overloaded" (503, high demand) clears in tens of seconds, not two.
     """
     base = float(2 ** attempt)
-    text = str(err or "")
+    text = f"{type(err).__name__} {err}" if err else ""
     if "PerDay" in text:  # Gemini lists daily and per-minute quotas together; daily wins
         return base
     if "PerMinute" in text or "RESOURCE_EXHAUSTED" in text:
         m = _RETRY_DELAY_RE.search(text)
         if m:
             return min(max(base, float(m.group(1))), MAX_RATE_LIMIT_WAIT)
+    if "ServiceUnavailable" in text or "high demand" in text or "overloaded" in text.lower():
+        return min(OVERLOAD_WAIT * attempt, MAX_RATE_LIMIT_WAIT)
     return base
 
 
