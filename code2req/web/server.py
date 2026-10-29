@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from code2req.cache import with_cache
 from code2req.config import is_git_url, prune_clone, referenced_files, resolve_repo, rmtree
 from code2req.llm import LLM
+from code2req.pipeline import RunStopped
 from code2req.pipeline import run as run_pipeline
 from code2req.render_pdf import render_pdf
 from code2req.structure import DEFAULT_MODULE_CHARS
@@ -121,6 +122,7 @@ class RunManager:
         self.active: str | None = None
         self.live_meta: dict[str, dict] = {}  # meta of the active run, served from memory
         self.logs: dict[str, list[str]] = {}
+        self.stops: dict[str, threading.Event] = {}  # stop flag of the active run
         os.makedirs(self.runs_dir, exist_ok=True)
         self._mark_interrupted()
 
@@ -140,6 +142,9 @@ class RunManager:
             if meta and meta.get("status") in ("queued", "running"):
                 meta.update(status="failed", error="server stopped during the run",
                             finished_at=_now())
+                _write_json(meta_path, meta)
+            elif meta and meta.get("status") == "stopping":
+                meta.update(status="stopped", error="stopped on request", finished_at=_now())
                 _write_json(meta_path, meta)
 
     def meta(self, run_id: str) -> dict:
@@ -177,6 +182,7 @@ class RunManager:
             self.active = run_id
             self.live_meta[run_id] = meta
             self.logs[run_id] = []
+            self.stops[run_id] = threading.Event()
         threading.Thread(target=self._execute, args=(run_id, req), daemon=True).start()
         return meta
 
@@ -198,7 +204,8 @@ class RunManager:
                 _write_json(meta_path, meta)
 
         try:
-            meta["status"] = "running"
+            if meta["status"] == "queued":  # a stop may already have been asked for
+                meta["status"] = "running"
             progress("resolving", 0, 0)
             repo = resolve_repo(meta["target"], out_dir)
             meta["repo_path"] = repo
@@ -209,7 +216,8 @@ class RunManager:
             report = run_pipeline(repo, out_dir, llm, label, req.workers,
                                   req.exclude or None, req.max_module_chars, progress=progress,
                                   followup=req.followup, entries=req.entries or None,
-                                  include_assets=req.assets, target=meta["target"])
+                                  include_assets=req.assets, target=meta["target"],
+                                  stop=self.stops[run_id])
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)
@@ -228,6 +236,13 @@ class RunManager:
                 "reused": ((st.get("cost") or {}).get("cache") or {}).get("hits"),
             }
             meta["status"] = "done"
+        except RunStopped:
+            logger.info("run %s stopped on request", run_id)
+            meta["status"] = "stopped"
+            meta["error"] = "stopped on request"
+            repo_path = meta.get("repo_path")
+            if repo_path and is_git_url(meta["target"]) and not req.keep_clone:
+                prune_clone(repo_path, set())  # a stopped run cites nothing: free the disk
         except Exception as e:  # noqa: BLE001 - report any failure to the UI
             logger.exception("run %s failed", run_id)
             meta["status"] = "failed"
@@ -241,6 +256,7 @@ class RunManager:
             with self.lock:
                 self.active = None
                 self.live_meta.pop(run_id, None)
+                self.stops.pop(run_id, None)
 
     def log(self, run_id: str, since: int) -> dict:
         lines = self.logs.get(run_id)
@@ -277,6 +293,20 @@ class RunManager:
         hi = min(len(lines), max(end, start) + SOURCE_CONTEXT)
         return {"file": file, "start": start, "end": end, "first_line": lo,
                 "lines": lines[lo - 1:hi], "total_lines": len(lines)}
+
+    def stop(self, run_id: str) -> dict:
+        """Ask the active run to stop. Model calls already in flight finish first."""
+        self._dir(run_id)  # 400 / 404 for a bad or unknown id
+        with self.lock:
+            if self.active != run_id:
+                raise HTTPException(409, "this run is not in progress")
+            self.stops[run_id].set()
+            meta = self.live_meta[run_id]
+            if meta["status"] in ("queued", "running"):
+                meta["status"] = "stopping"
+            snapshot = dict(meta)
+        logger.info("run %s: stop requested", run_id)
+        return snapshot
 
     def delete(self, run_id: str) -> None:
         path = self._dir(run_id)
@@ -330,6 +360,10 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
     def delete_run(run_id: str) -> dict:
         mgr.delete(run_id)
         return {"deleted": run_id}
+
+    @app.post("/api/runs/{run_id}/stop")
+    def stop_run(run_id: str) -> dict:
+        return mgr.stop(run_id)
 
     @app.get("/api/runs/{run_id}/log")
     def get_log(run_id: str, since: int = 0) -> dict:

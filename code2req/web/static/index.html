@@ -97,7 +97,7 @@ kbd { font: 11px var(--mono); color: var(--fg-3); border: 1px solid var(--line);
 .status .nums b { color: var(--fg); font-weight: 600; }
 .status .err { color: var(--bad); }
 .state { font-weight: 600; }
-.state.done { color: var(--ok); } .state.failed { color: var(--bad); } .state.running, .state.queued { color: var(--warn); }
+.state.done { color: var(--ok); } .state.failed { color: var(--bad); } .state.running, .state.queued, .state.stopping { color: var(--warn); } .state.stopped { color: var(--fg-3); }
 
 /* workspace */
 .ws { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); min-height: 0; }
@@ -183,6 +183,7 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
 .log { font: 11.5px/1.55 var(--mono); background: var(--code-bg); border: 1px solid var(--line);
   padding: 8px 10px; max-height: 46vh; overflow: auto; white-space: pre-wrap; color: var(--fg-2); }
 .failbox { border: 1px solid var(--bad); background: var(--bad-weak); color: var(--fg); padding: 10px 12px; max-width: 760px; white-space: pre-wrap; }
+.notebox { border: 1px solid var(--warn); background: var(--warn-weak); color: var(--fg); padding: 10px 12px; max-width: 760px; }
 .welcome { padding: 32px 22px; max-width: 640px; display: grid; gap: 10px; color: var(--fg-2); }
 .welcome h2 { font: 600 18px var(--cond); color: var(--fg); margin: 0; }
 
@@ -209,6 +210,7 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
   </form>
   <label class="sr" for="runSelect">Open run</label>
   <select class="field" id="runSelect"></select>
+  <button class="btn" type="button" id="stopBtn" hidden title="Stop this analysis; answers already received are kept for a re-run">Stop run</button>
   <button class="btn" type="button" id="deleteBtn" disabled>Delete run</button>
   <a class="btn" id="exportBtn" aria-disabled="true">Export JSON</a>
   <a class="btn" id="pdfBtn" aria-disabled="true" title="Readable report with your review verdicts">Export PDF</a>
@@ -296,6 +298,29 @@ function newAnalysis() {
 }
 $("#newBtn").onclick = newAnalysis;
 
+// a run in these states is still working: poll it, and it can be stopped but not deleted
+const ACTIVE = ["queued", "running", "stopping"];
+
+let stopArmed = null;
+$("#stopBtn").onclick = async () => {
+  const b = $("#stopBtn");
+  if (!S.runId || S.run?.status === "stopping") return;
+  if (stopArmed !== S.runId) {  // first click arms, second click stops
+    stopArmed = S.runId;
+    b.textContent = "Confirm stop";
+    b.classList.add("danger");
+    setTimeout(() => { if (stopArmed) { stopArmed = null; b.textContent = "Stop run"; b.classList.remove("danger"); } }, 4000);
+    return;
+  }
+  stopArmed = null;
+  b.textContent = "Stop run";
+  b.classList.remove("danger");
+  try {
+    await api(`/api/runs/${S.runId}/stop`, {method: "POST"});
+    await refresh();
+  } catch (err) { $("#status").innerHTML = `<span class="err">Could not stop the run: ${esc(err.message)}</span>`; }
+};
+
 let deleteArmed = null;
 $("#deleteBtn").onclick = async () => {
   const b = $("#deleteBtn");
@@ -352,7 +377,7 @@ async function openRun(id) {
   Object.assign(S, { runId: id, run: null, result: null, reviews: {}, sel: null, log: [], logNext: 0, src: new Map() });
   $("#runSelect").value = id;
   await refresh();
-  if (S.run && ["queued", "running"].includes(S.run.status)) S.poll = setInterval(refresh, 1500);
+  if (S.run && ACTIVE.includes(S.run.status)) S.poll = setInterval(refresh, 1500);
 }
 
 async function refresh() {
@@ -369,7 +394,7 @@ async function refresh() {
       S.result.rejected.forEach((r, i) => { r.id = r.id || `REJ-${i + 1}`; });  // rejected claims get no ID from the pipeline
       loadRuns();
     }
-  } else if (S.run.status === "failed") { clearInterval(S.poll); loadRuns(); }
+  } else if (["failed", "stopped"].includes(S.run.status)) { clearInterval(S.poll); loadRuns(); }
   render();
 }
 
@@ -381,7 +406,12 @@ function render() {
     if (S.run?.status === "done") { exp.href = `/api/runs/${S.runId}/${path}`; exp.setAttribute("aria-disabled", "false"); }
     else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
   }
-  $("#deleteBtn").disabled = !S.run || ["queued", "running"].includes(S.run.status);
+  $("#deleteBtn").disabled = !S.run || ACTIVE.includes(S.run.status);
+  const sb = $("#stopBtn");
+  sb.hidden = !S.run || !ACTIVE.includes(S.run.status);
+  sb.disabled = S.run?.status === "stopping";
+  if (S.run?.status === "stopping") sb.textContent = "Stopping…";
+  else if (stopArmed !== S.runId) sb.textContent = "Stop run";
   if (!S.run) return;
   if (S.run.status === "done" && S.result) renderWorkspace();
   else renderRun();
@@ -406,6 +436,8 @@ function renderStatus() {
     right = `<span class="nums"><b>${S.result.requirements.length}</b> requirements · <b>${st.confidence?.confirmed ?? 0}</b> confirmed by tests${refs ? ` · <b>${refs}</b> reference` : ""} · <b>${S.result.gaps.length}</b> gaps${dead ? ` · <b>${dead}</b> dead` : ""} · <b>${S.result.rejected.length}</b> rejected${funcs}${cov.total ? ` · surfaces <b>${cov.covered}/${cov.total}</b>` : ""}${credits} · reviewed <b>${rv.length}</b>${wrong ? `, ${wrong} wrong` : ""}</span>`;
   } else if (r.status === "failed") {
     right = `<span class="err">Failed ${esc(when(r.finished_at))}</span>`;
+  } else if (r.status === "stopped") {
+    right = `<span>Stopped ${esc(when(r.finished_at))}</span>`;
   }
   el.innerHTML = left + right;
 }
@@ -423,15 +455,19 @@ function renderRun() {
   let pct = idx < 0 ? 0 : Math.round((idx / (STEPS.length - 1)) * 100);
   if (p.stage === "modules" && p.total) pct = Math.round(((3 + p.done / p.total) / (STEPS.length - 1)) * 100);
   const steps = STEPS.map(([k, label], i) => {
-    const cls = r.status === "failed" ? (i < idx ? "past" : i === idx ? "now" : "") : i < idx ? "past" : i === idx ? "now" : "";
+    const cls = i < idx ? "past" : i === idx ? "now" : "";
     const extra = k === p.stage && ["modules", "followup"].includes(k) && p.total ? `${p.done} of ${p.total}` : "";
     return `<li class="${cls}"><span class="k">${i + 1}</span><span>${esc(label)}</span><span>${esc(extra)}</span></li>`;
   }).join("");
-  const fail = r.status === "failed" ? `<div class="failbox"><b>The analysis stopped.</b> ${esc(r.error)}</div>` : "";
+  const ended = ["failed", "stopped"].includes(r.status);
+  const fail = r.status === "failed" ? `<div class="failbox"><b>The analysis stopped.</b> ${esc(r.error)}</div>`
+    : r.status === "stopped" ? `<div class="notebox"><b>Stopped on request.</b> Answers received before the stop are kept, so running the same analysis again reuses them at no cost.</div>`
+    : r.status === "stopping" ? `<div class="notebox"><b>Stopping.</b> No new model calls start; the ones already running finish first, which can take a minute or two.</div>`
+    : "";
   $("#body").innerHTML = `<section class="run">
     ${fail}
     <ol class="steps">${steps}</ol>
-    ${r.status !== "failed" ? `<div class="meter"><div style="width:${pct}%"></div></div>` : ""}
+    ${!ended ? `<div class="meter"><div style="width:${pct}%"></div></div>` : ""}
     <div><h3>Log</h3></div>
     <div class="log" id="log">${esc(hideModels(S.log.slice(-500).join("\n"))) || "Waiting for output…"}</div>
   </section>`;
@@ -673,7 +709,7 @@ document.addEventListener("keydown", e => {
 /* ---------- start ---------- */
 (async () => {
   try { await loadRuns(); } catch (err) { $("#status").innerHTML = `<span class="err">The code2req server is not reachable: ${esc(err.message)}</span>`; return; }
-  const running = S.runs.find(r => ["queued", "running"].includes(r.status));
+  const running = S.runs.find(r => ACTIVE.includes(r.status));
   if (running) openRun(running.id);  // a run in progress is always shown
   else if (S.runs[0]) openRun(S.runs[0].id);
   else newAnalysis();

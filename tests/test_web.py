@@ -16,7 +16,7 @@ def wait_done(client, run_id, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         meta = client.get(f"/api/runs/{run_id}").json()
-        if meta["status"] in ("done", "failed"):
+        if meta["status"] in ("done", "failed", "stopped"):
             return meta
         time.sleep(0.2)
     raise AssertionError("run did not finish")
@@ -118,3 +118,31 @@ def test_interrupted_runs_are_marked_failed(tmp_path):
 
 
 assert CLAIMS  # shared fixture data
+
+
+def test_stop_a_run_in_progress(tmp_path):
+    import threading
+
+    called, release = threading.Event(), threading.Event()
+
+    class BlockingLLM(FixtureLLM):
+        def complete(self, system, user, json_mode=False):
+            called.set()
+            release.wait(10)  # a slow model call, in flight when Stop is pressed
+            return super().complete(system, user, json_mode)
+
+    app = create_app(str(tmp_path / "runs"), llm_factory=lambda: (BlockingLLM(), "fake/model"),
+                     cache_path=str(tmp_path / "cache.sqlite"))
+    client = TestClient(app)
+    meta = client.post("/api/runs", json={"target": FIXTURE, "workers": 1}).json()
+    assert called.wait(30), "the run never reached a model call"
+    assert client.delete(f"/api/runs/{meta['id']}").status_code == 409  # still running
+    stopping = client.post(f"/api/runs/{meta['id']}/stop")
+    assert stopping.status_code == 200 and stopping.json()["status"] == "stopping"
+    release.set()
+    done = wait_done(client, meta["id"])
+    assert (done["status"], done["error"]) == ("stopped", "stopped on request")
+    assert client.get(f"/api/runs/{meta['id']}/result").status_code == 404
+    assert client.post(f"/api/runs/{meta['id']}/stop").status_code == 409  # not in progress any more
+    assert client.post("/api/runs/no-such-run/stop").status_code == 404
+    assert client.delete(f"/api/runs/{meta['id']}").status_code == 200

@@ -216,3 +216,37 @@ def test_end_to_end(tmp_path):
     data = json.loads((tmp_path / "requirements.json").read_text(encoding="utf-8"))
     assert len(data["requirements"]) == 2
     assert "Rejected claims" in (tmp_path / "requirements.md").read_text(encoding="utf-8")
+
+
+def test_a_set_stop_flag_stops_before_any_model_call(tmp_path):
+    import threading
+
+    import pytest
+
+    from code2req.pipeline import RunStopped
+    llm, stop = FixtureLLM(), threading.Event()
+    stop.set()
+    with pytest.raises(RunStopped):
+        run(FIXTURE, str(tmp_path), llm, "fake/model", workers=1, stop=stop)
+    assert llm.prompts == []
+    assert not os.path.exists(os.path.join(tmp_path, "requirements.json"))
+
+
+def test_stopping_mid_run_lets_the_call_in_flight_finish(tmp_path):
+    import threading
+
+    import pytest
+
+    from code2req.pipeline import RunStopped
+    stop = threading.Event()
+
+    class StopsAfterFirstCall(FixtureLLM):
+        def complete(self, system, user, json_mode=False):
+            answer = super().complete(system, user, json_mode)
+            stop.set()  # someone pressed Stop while this call was running
+            return answer
+
+    llm = StopsAfterFirstCall()
+    with pytest.raises(RunStopped):
+        run(FIXTURE, str(tmp_path), llm, "fake/model", workers=1, stop=stop)
+    assert len(llm.prompts) == 1  # the follow-up never started

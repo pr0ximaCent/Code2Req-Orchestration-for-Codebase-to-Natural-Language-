@@ -65,6 +65,7 @@ Open `out/myrun/requirements.pdf` (or `requirements.md`) to review the requireme
 In the browser you can:
 
 - paste a folder path or git URL and start a run, with live progress (stage, modules done) and the log;
+- stop a run in progress with **Stop run** (click twice): no new model calls start, the ones already running finish, and the answers received so far stay in the answer cache, so a re-run reuses them; a stopped run's git clone is deleted;
 - browse requirements, gaps, rejected claims, uncovered surfaces and stats, filtered by text, confidence, type, section or review state;
 - click any `file:lines` citation to open the cited code with those lines highlighted;
 - mark each requirement **✓ Correct / ✗ Wrong / ? Unsure** with a note (saved in `review.json`), and export the JSON or a PDF report with reviews attached.
@@ -676,6 +677,7 @@ code2req pdf RESULT.json [-o REPORT.pdf]     # no keys needed; also reads older 
 `serve` exposes the same pipeline over a local HTTP API, which the page in `code2req/web/static/index.html` uses:
 
 - `POST /api/runs`: start a run
+- `POST /api/runs/{id}/stop`: stop the run in progress (status `stopping`, then `stopped`)
 - `GET /api/runs[/{id}]`: list runs, or one run's status
 - `GET /api/runs/{id}/log`, `/result`, `/source`: log, result, and the cited code
 - `GET` and `POST /api/runs/{id}/reviews`, `GET /api/runs/{id}/export`: reviews and export
@@ -797,7 +799,7 @@ code2req/
 
 ## 16. Tests
 
-100 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
+103 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
 
 | File | Covers |
 |---|---|
@@ -809,12 +811,12 @@ code2req/
 | `test_schema_dedup.py` | Every docreq JSON key present; reply parsing and repair; bad JSON; exact and claim-key dedup with evidence and confidence merge; ID format |
 | `test_structure.py` | File-aligned packing and labels, an oversized file split into parts, unassigned components following their file/directory, root renaming |
 | `test_llm.py` | Chain order and attempt counts match docreq; backoff then fall-over; unconfigured Azure skipped; truncated-JSON recovery without retry; total failure raises; Azure URL rule; Gemini keys from both env formats, rotated |
-| `test_pipeline.py` | Full run on the fixture with **real CodeWiki parsing** and a fake LLM: test code excluded but attached, surfaces in the prompt, confirmed / inferred / gap / rejected sorted correctly, coverage including constants and gaps, the follow-up asking about an uncited model, files written. A second run adds a prompt, a knowledge file, a dead file and a dead function: the dead file never reaches the model, the dead function is listed as unused, claims about either land in `dead_requirements`, the prompt yields a requirement and the knowledge file a `REF-` entry |
+| `test_pipeline.py` | Full run on the fixture with **real CodeWiki parsing** and a fake LLM: test code excluded but attached, surfaces in the prompt, confirmed / inferred / gap / rejected sorted correctly, coverage including constants and gaps, the follow-up asking about an uncited model, files written. A second run adds a prompt, a knowledge file, a dead file and a dead function: the dead file never reaches the model, the dead function is listed as unused, claims about either land in `dead_requirements`, the prompt yields a requirement and the knowledge file a `REF-` entry. A set stop flag halts a run before any model call; one set mid-run lets the call in flight finish and starts no more |
 | `test_cache.py` | Same prompt answered once and the saving counted; cache shared across runs but not across models; unparsable answers never replayed; parallel workers; a second pipeline run on unchanged code makes no model calls and gives the same requirements |
 | `test_clone.py` | A partial clone over `file://` leaves out images and `node_modules`; pruning keeps only the cited files and drops `.git`; a pruned clone is cloned again, an unpruned one reused |
 | `test_render_pdf.py` | By default the PDF holds only the requirements; with `details=True` every part (reviews, roles, reference material, gaps, rejected claims, dead code, cost); an older result missing keys and an empty one render; text full of Typst syntax (`#panic`, `@ref`, `$`) stays plain text |
 | `test_go_coverage.py` | Go routes, flags, cobra commands, env vars (through constants), numeric constants, sentinel errors and error types; Go tests only from `_test.go`; Gherkin scenarios as tests; mocks are test code but never confirm; GitHub actions and Makefiles as CI/CD; a tracked `build/Dockerfile` kept, cloned and found as an asset while an untracked `build/` is skipped; tests attached by file stem, route path and folder with the per-module cap; follow-up `covered` answers cited only when the call graph or the receiver type links them; `internal` reasons counted; follow-ups batched |
-| `test_web.py` | UI API: page served, run start → done with progress and log, result, source viewer, review set/clear, JSON and PDF export with reviews, source path traversal blocked (including another drive), bad target fails cleanly, bad IDs/inputs rejected, interrupted runs marked failed |
+| `test_web.py` | UI API: page served, run start → done with progress and log, result, source viewer, review set/clear, JSON and PDF export with reviews, source path traversal blocked (including another drive), bad target fails cleanly, bad IDs/inputs rejected, interrupted runs marked failed; a run stopped while a model call is in flight ends as `stopped` with no result, cannot be deleted while running, and can be after |
 
 ---
 

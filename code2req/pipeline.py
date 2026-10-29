@@ -37,6 +37,33 @@ from code2req.verify import (
 
 logger = logging.getLogger(__name__)
 
+
+class RunStopped(BaseException):
+    """Raised inside a run once its stop flag is set.
+
+    A BaseException, like KeyboardInterrupt, so the per-module ``except Exception``
+    handlers that keep a run going past one failed module let it through."""
+
+
+def _check_stop(stop: threading.Event | None) -> None:
+    if stop is not None and stop.is_set():
+        raise RunStopped()
+
+
+class _StopAware:
+    """The run's LLM, refusing new calls once the run is asked to stop. Calls already in
+    flight finish, and their answers still land in the answer cache for the next run."""
+
+    def __init__(self, inner: LLM, stop: threading.Event):
+        self._inner, self._stop = inner, stop
+
+    def complete(self, system: str, user: str, json_mode: bool = False) -> str:
+        _check_stop(self._stop)
+        return self._inner.complete(system, user, json_mode=json_mode)
+
+    def __getattr__(self, name: str) -> Any:  # usage, ledger, ... of the wrapped LLM
+        return getattr(self._inner, name)
+
 MAX_TESTS_PER_MODULE = 12
 MAX_TEST_LINES = 60
 MIN_SYMBOL_LEN = 4
@@ -398,9 +425,17 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         max_module_chars: int = DEFAULT_MODULE_CHARS,
         progress: Progress | None = None, followup: bool = True,
         entries: list[str] | None = None, include_assets: bool = True,
-        target: str | None = None) -> RunReport:
-    """target: what the user asked to analyse (a git URL or folder) when repo_path is a clone of it."""
-    report_progress = progress or (lambda stage, done, total: None)
+        target: str | None = None, stop: threading.Event | None = None) -> RunReport:
+    """target: what the user asked to analyse (a git URL or folder) when repo_path is a clone of it.
+    stop: once set, the run raises RunStopped at its next progress step or model call."""
+
+    def report_progress(stage: str, done: int, total: int) -> None:
+        _check_stop(stop)
+        if progress is not None:
+            progress(stage, done, total)
+
+    if stop is not None:
+        llm = _StopAware(llm, stop)
     repo_path = os.path.abspath(repo_path)
     os.makedirs(out_dir, exist_ok=True)
 
