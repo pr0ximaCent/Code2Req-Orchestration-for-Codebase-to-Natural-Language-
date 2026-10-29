@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from code2req.cost import llm_task
-from code2req.dependencies import enrich_dependency_graph
 from code2req.llm import LLM
+from code2req.pygraph import build_python_graph
 
 _VENDOR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "vendor", "codewiki")
@@ -74,6 +74,7 @@ class Structure:
     components: dict[str, Any]  # id -> codewiki Node
     modules: list[Module]
     module_tree: dict[str, Any]
+    graph_report: dict[str, Any] | None = None  # line-ownership summary of the Python graph
 
 
 def _codewiki_config(repo_path: str, work_dir: str, model: str, exclude: list[str] | None):
@@ -286,8 +287,13 @@ def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
     for node in components.values():
         node.relative_path = node.relative_path.replace("\\", "/")
     logger.info("codewiki: %d components, %d leaf nodes", len(components), len(leaf_nodes))
-    # CodeWiki's depends_on holds call edges only; add imports and module variables (Python).
-    enrich_dependency_graph(components, repo_path, config.dependency_graph_dir)
+    # CodeWiki's graph holds call edges between functions, methods and classes only. This adds
+    # module-level code, variables, attributes and comments, and links them (Python).
+    try:
+        graph_report = build_python_graph(components, repo_path, config.dependency_graph_dir, exclude)
+    except Exception:  # noqa: BLE001 - the extra graph must not stop a run
+        logger.exception("python graph failed; repo_dependency_graph.json keeps CodeWiki's edges only")
+        graph_report = None
 
     def completer(prompt: str) -> str:
         with llm_task("cluster"):
@@ -311,4 +317,5 @@ def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
     modules = attach_declaration_files(modules, components, repo_path, exclude, max_module_chars)
     _rename_root(modules, os.path.basename(os.path.normpath(repo_path)))
     logger.info("structure: %d modules", len(modules))
-    return Structure(components=components, modules=modules, module_tree=tree)
+    return Structure(components=components, modules=modules, module_tree=tree,
+                     graph_report=graph_report)

@@ -84,6 +84,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{st['requirements']} requirements, {st['gaps']} gaps, {st['rejected']} rejected; "
           f"functions cited {fc['cited']}/{fc['total']} (+{fc['internal_helpers']} internal); "
           f"surface coverage {cov['covered']}/{cov['total']}")
+    g = st.get("graph")
+    if g and g["files"]:
+        print(f"graph: {sum(g['nodes_by_type'].values())} nodes in {g['files']} Python files; "
+              f"lines owned {g['graph']}/{g['lines']} (CodeWiki alone {g['codewiki']}); "
+              f"comment lines owned {g['comment_lines_graph']}/{g['comment_lines']} "
+              f"(CodeWiki alone {g['comment_lines_codewiki']})")
     c = st.get("cost") or {}
     if c:
         print(f"cost: {c['credits']:,} credits (${c['cost_usd']:.4f}) by SysModeler's formula; "

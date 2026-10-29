@@ -222,6 +222,27 @@ CodeWiki also honours `.gitignore`.
   - A test that mentions a module's function is attached to that module, up to 12 tests per module.
   - This is how the agent can mark a requirement `confirmed`.
 
+### 5.1 Python relationship graph
+
+**Files:** `code2req/pygraph/` (`source.py`, `resolve.py`, `comments.py`, `ownership.py`, `build.py`), called from `build_structure`
+
+CodeWiki's `repo_dependency_graph.json` holds functions, methods and classes, with call edges. For Python files this pass adds every other line of code as a node and links the nodes. It only changes the graph file and the `depends_on` sets in memory; the module agents and prompts are unchanged.
+
+| New node | What it is |
+|---|---|
+| `docstring`, `imports`, `script_block`, `main_script` | Module-level code between the functions. Consecutive statements of one kind form one node (cut at 150 lines) |
+| `variable`, `constant` | One node per module-level assignment, with its `value`. `constant` when every name is UPPER_CASE |
+| `class_attribute`, `instance_attribute` | `x = 5` in a class body; `self.x = ...` in any method (the first assignment defines the node, `writes_at` lists the rest) |
+| `function`, `method`, `class` with `synthetic: true` | Defs CodeWiki did not list, such as nested functions |
+| `comment_block` | Comment-only lines that sit outside every node and not directly above one. `describes` names the node just below |
+| `module` | One per file. `depends_on` lists the repo modules it imports, `children` lists its nodes |
+
+**Links.** `depends_on` holds ids of real nodes: a function lists the variables, class and instance attributes, functions and classes it uses (`self.x`, `Base.LEVEL`, `config.MAX_ITEMS`, `from app.config import limit`, base-class attributes included). Things outside the repo stay strings, such as `import:requests.get`. `reads` and `writes` split out the variables and attributes it reads and assigns (`x += 1` counts as both). `unresolved_attributes` lists `self.x` names that no class in the repo defines. Python builtins are not listed yet.
+
+**Comments.** A comment inside a node is already part of its `source_code`. A comment block directly above a node (no blank line between) becomes that node's `leading_comments`. Entries carry `tag` for `TODO`, `FIXME`, `NOTE`, `HACK` and `XXX`, and `pragma` for `noqa` and `type:` comments.
+
+**Line ownership.** Every non-blank line of a Python file should belong to a node. `<repo>_line_ownership.json` next to the graph lists the lines that do not, and compares the count with CodeWiki alone. The CLI prints the totals after a run.
+
 ---
 
 ## 6. Stage 2: Surfaces (deterministic detectors)
@@ -631,6 +652,7 @@ code2req/
 | `test_structure.py` | File-aligned packing and labels, an oversized file split into parts, unassigned components following their file/directory, root renaming |
 | `test_llm.py` | Chain order and attempt counts match docreq; backoff then fall-over; unconfigured Azure skipped; truncated-JSON recovery without retry; total failure raises; Azure URL rule; Gemini keys from both env formats, rotated |
 | `test_pipeline.py` | Full run on the fixture with **real CodeWiki parsing** and a fake LLM: test code excluded but attached, surfaces in the prompt, confirmed / inferred / gap / rejected sorted correctly, coverage including constants, files written |
+| `test_pygraph.py` | Module-level nodes, variable values, `self.x` / class attribute / inherited attribute links with `reads` and `writes`, imports resolved to node ids (absolute, relative, `module.NAME`), globals, nested defs, comment attachment and blocks, `module` nodes, 100% line ownership, unparsable files reported |
 | `test_web.py` | UI API: page served, run start → done with progress and log, result, source viewer, review set/clear, export with reviews, source path traversal blocked (including another drive), bad target fails cleanly, bad IDs/inputs rejected, interrupted runs marked failed |
 
 ---
