@@ -7,6 +7,10 @@
 
 #let data = json(bytes(sys.inputs.at("data", default: "{}")))
 #let generated = sys.inputs.at("generated", default: "")
+// Off for now: the PDF holds the requirement count, how to read it, and the
+// requirements. On, it adds the run overview, coverage, reference material,
+// gaps, rejected claims, uncovered surfaces, dead code and cost.
+#let details = sys.inputs.at("details", default: "false") == "true"
 
 // ---- palette and type ----
 #let fg = rgb("#18181b")
@@ -252,11 +256,21 @@
 #let rejected = items("rejected")
 #let dead-claims = items("dead_requirements")
 #let dead-code = items("dead_code")
-#let reviewed = (reqs + refs + gaps).filter(r => val(r, "review", default: none) != none)
+#let reviewed = (if details { reqs + refs + gaps } else { reqs }).filter(r => val(r, "review", default: none) != none)
 #let cost = stat("cost", default: none)
 #let cache = val(cost, "cache", default: (:))
 #let reused = val(cache, "hits", default: 0)
 
+#if not details {
+  block(below: 18pt, {
+    text(font: cond, size: 26pt, weight: 600, thousands(reqs.len()))
+    h(8pt)
+    text(font: cond, size: 14pt, weight: 600, fill: fg2,
+      if reqs.len() == 1 { "requirement" } else { "requirements" })
+  })
+}
+
+#if details [
 #block(below: 18pt, {
   caps("code2req report")
   v(4pt)
@@ -319,6 +333,7 @@
 )
 
 #v(16pt)
+]
 #caps("How to read this report")
 #v(4pt)
 #block(width: 100%, inset: 10pt, fill: surface2, radius: 2pt, {
@@ -327,10 +342,15 @@
     columns: (auto, 1fr), column-gutter: 10pt, row-gutter: 7pt, align: (left, left),
     tag("Confirmed by test", ok), [A test exercises the cited code.],
     tag("Read from code", fg2), [A model read this from the cited code and the code check passed. Review it before relying on it.],
-    tag("Not implemented", warn), [The code shows the intent (a stub, TODO or unfinished path) but not the behaviour.],
+    ..if details {
+      (tag("Not implemented", warn), [The code shows the intent (a stub, TODO or unfinished path) but not the behaviour.])
+    },
   )
   v(4pt)
-  [Each requirement lists its evidence as `file:lines`. Reference material is content the system hands to its AI components; it describes what they know, not what the system must do. Dead code is listed but has no requirements.]
+  [Each requirement lists its evidence as `file:lines`.]
+  if details {
+    [ Reference material is content the system hands to its AI components; it describes what they know, not what the system must do. Dead code is listed but has no requirements.]
+  }
   if reviewed.len() > 0 {
     let n(v) = reviewed.filter(r => val(val(r, "review"), "verdict") == v).len()
     v(4pt)
@@ -343,6 +363,7 @@
 // ---- the parts ----
 #part("Requirements", reqs,
   intro: "Every requirement cites code or a file the code loads, grouped by the module it came from.")
+#if details [
 #if refs.len() > 0 {
   part("Reference material", refs,
     intro: "Examples, libraries and knowledge-base content the system provides to its AI components. These are not obligations on the system.")
@@ -446,3 +467,4 @@
     text(size: 8pt, fill: warn, "Not priced (no rate in SysModeler's tables, counted as $0): " + unpriced.join(", "))
   }
 }
+]

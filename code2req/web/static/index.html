@@ -390,7 +390,7 @@ function render() {
 function renderStatus() {
   const r = S.run; const el = $("#status");
   if (!r) { el.innerHTML = "<span>New analysis: enter a folder path or git URL, then press Analyze.</span>"; return; }
-  const left = `<span><span class="state ${esc(r.status)}">${esc(cap(r.status))}</span> · <span class="src">${esc(r.target)}</span>${r.model ? " · " + esc(r.model) : ""}</span>`;
+  const left = `<span><span class="state ${esc(r.status)}">${esc(cap(r.status))}</span> · <span class="src">${esc(r.target)}</span></span>`;
   let right = "";
   if (S.result) {
     const st = S.result.stats || {}, cov = st.surface_coverage || {}, fc = st.function_coverage;
@@ -410,6 +410,11 @@ function renderStatus() {
   el.innerHTML = left + right;
 }
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : "";
+// The UI never names the models behind a run: the chain label is dropped, and model IDs in the
+// log ("gemini:gemini-3.1-pro-preview", "gpt-5.4", ...) read as "model".
+const hideModels = s => s
+  .replace(/\s*\(docreq-chain\([^)]*\)\)|\s*docreq-chain\([^)]*\)/g, "")
+  .replace(/\b(?:gemini|azure|openai|anthropic|vertex_ai)[:/][\w.\-]+|\b(?:gemini|gpt|claude|kimi|o\d)-[\w.\-]*\d[\w.\-]*/gi, "model");
 
 /* ---------- running / failed ---------- */
 function renderRun() {
@@ -428,7 +433,7 @@ function renderRun() {
     <ol class="steps">${steps}</ol>
     ${r.status !== "failed" ? `<div class="meter"><div style="width:${pct}%"></div></div>` : ""}
     <div><h3>Log</h3></div>
-    <div class="log" id="log">${esc(S.log.slice(-500).join("\n")) || "Waiting for output…"}</div>
+    <div class="log" id="log">${esc(hideModels(S.log.slice(-500).join("\n"))) || "Waiting for output…"}</div>
   </section>`;
   const lg = $("#log"); lg.scrollTop = lg.scrollHeight;
 }

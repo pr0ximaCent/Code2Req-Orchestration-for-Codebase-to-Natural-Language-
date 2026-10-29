@@ -294,31 +294,54 @@ def _reaches(start: set[str], target: set[str], components: dict[str, Any], hops
     return False
 
 
-def cited_components(req: FlatRequirement, by_file: dict[str, list[Any]]) -> set[str]:
-    """Function and method components whose lines a requirement cites."""
+def cited_components(req: FlatRequirement, by_file: dict[str, list[Any]],
+                     kinds: tuple[str, ...] = FUNCTION_TYPES) -> set[str]:
+    """Components of the given kinds (functions and methods by default) whose lines a requirement cites."""
     return {n.id for e in req.evidence for n in by_file.get(e.file, [])
-            if n.component_type in FUNCTION_TYPES and n.start_line <= e.end_line and e.start_line <= n.end_line}
+            if n.component_type in kinds and n.start_line <= e.end_line and e.start_line <= n.end_line}
+
+
+def _receiver(name: str) -> str:
+    """"FormData.String" -> "FormData"; "" for a plain function."""
+    return name.rsplit(".", 1)[0] if "." in name else ""
+
+
+def link_basis(req: FlatRequirement, node: Any, components: dict[str, Any],
+               by_file: dict[str, list[Any]]) -> str:
+    """Why the requirement's cited code and the helper belong together, or "" when nothing shows it:
+    "call_graph" when one calls the other, "same_type" when the helper is a method of a type
+    whose methods or declaration the requirement cites, in the same package."""
+    cited = cited_components(req, by_file)
+    if cited and (_reaches(cited, {node.id}, components, CALLEE_HOPS)
+                  or _reaches({node.id}, cited, components, CALLER_HOPS)):
+        return "call_graph"
+    recv, pkg = _receiver(node.name), os.path.dirname(node.relative_path)
+    if recv:
+        for cid in cited_components(req, by_file, FUNCTION_TYPES + TYPE_COMPONENTS):
+            c = components[cid]
+            if os.path.dirname(c.relative_path) == pkg and recv in (_receiver(c.name), c.name):
+                return "same_type"
+    return ""
 
 
 def link_helper(req: FlatRequirement, node: Any, components: dict[str, Any], by_file: dict[str, list[Any]],
-                files: FileCache) -> bool:
+                files: FileCache) -> str:
     """Cite a helper in the requirement the model says states its behaviour, but only when the
-    call graph connects the two: the requirement's cited code calls it, or it calls that code."""
-    cited = cited_components(req, by_file)
-    if not cited or not (_reaches(cited, {node.id}, components, CALLEE_HOPS)
-                         or _reaches({node.id}, cited, components, CALLER_HOPS)):
-        return False
+    code shows they belong together (link_basis). Returns the basis, "" when not linked."""
+    basis = link_basis(req, node, components, by_file)
+    if not basis:
+        return ""
     ev = check_evidence(Evidence(file=node.relative_path, start_line=node.start_line, end_line=node.end_line,
                                  symbol=node.name.rsplit(".", 1)[-1]), files)
     if not ev.ok:
-        return False
+        return ""
     req.evidence.append(ev)
-    return True
+    return basis
 
 
 def function_coverage(modules: list[Module], components: dict[str, Any], reqs: list[FlatRequirement],
                       first_pass_cited: int, internal: dict[str, str],
-                      dead: set[str] | frozenset = frozenset(), links: dict[str, int] | None = None) -> dict:
+                      dead: set[str] | frozenset = frozenset(), links: Counter | None = None) -> dict:
     """Share of non-trivial live functions cited by a requirement, plus the ones the model called
     internal (by reason). Functions neither cited nor explained are listed as uncited."""
     total = sum(len(module_functions(m, components, dead)) for m in modules)
@@ -333,8 +356,10 @@ def function_coverage(modules: list[Module], components: dict[str, Any], reqs: l
         "cited": cited,
         "internal_helpers": len(internal),
         "internal_by_reason": dict(sorted(Counter(internal.values()).items())),
-        "covered_linked": (links or {}).get("linked", 0),
-        "covered_unlinked": (links or {}).get("unlinked", 0),
+        "covered_linked": (links or Counter())["call_graph"] + (links or Counter())["same_type"],
+        "covered_linked_by": {"call_graph": (links or Counter())["call_graph"],
+                              "same_type": (links or Counter())["same_type"]},
+        "covered_unlinked": (links or Counter())["unlinked"],
         "dead_excluded": len(dead),
         "ratio": round(cited / total, 3) if total else None,
         "accounted_ratio": round(min(total, cited + len(internal)) / total, 3) if total else None,
@@ -463,7 +488,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     first_pass_cited = len(cited_functions(modules, components, passed + gaps, dead))
 
     internal: dict[str, str] = {}  # "module::function" -> reason the model gave
-    links = {"linked": 0, "unlinked": 0}
+    links: Counter = Counter()  # call_graph / same_type / unlinked
     if followup:
         by_file: dict[str, list[Any]] = {}
         for n in components.values():
@@ -505,13 +530,14 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
                 by_name = {n.name: n for n in fns}
                 for name, ref in fu.covered:
                     if name in by_name and 1 <= ref <= len(existing):
-                        ok = link_helper(existing[ref - 1], by_name[name], components, by_file, files)
-                        links["linked" if ok else "unlinked"] += 1
+                        basis = link_helper(existing[ref - 1], by_name[name], components, by_file, files)
+                        links[basis or "unlinked"] += 1
                 for name, reason in fu.internal:
                     if name in by_name:
                         internal[f"{m.name}::{name}"] = reason
-        logger.info("follow-up: %d helper(s) linked to the requirement stating them, %d claim(s) not "
-                    "confirmed by the call graph, %d internal", links["linked"], links["unlinked"], len(internal))
+        logger.info("follow-up: %d helper(s) linked to the requirement stating them (%d by call graph, %d by "
+                    "type), %d claim(s) the code doesn't confirm, %d internal", links["call_graph"] + links["same_type"],
+                    links["call_graph"], links["same_type"], links["unlinked"], len(internal))
 
     passed, dead_passed = split_dead(passed, reach)
     gaps, dead_gaps = split_dead(gaps, reach)

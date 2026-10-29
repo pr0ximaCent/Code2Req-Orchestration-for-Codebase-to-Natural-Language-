@@ -260,3 +260,28 @@ def test_test_code_surfaces_are_dropped_and_open_surfaces_go_to_one_followup(tmp
     assert len(prompts) == 3 and len(with_surfaces) == 1  # surfaces ride with the first batch only
     assert "[env_var] SHOP_API_KEY" in with_surfaces[0] and "API_KEY = os.getenv" in with_surfaces[0]
     assert "[constant] MAX_CART_ITEMS" in with_surfaces[0]
+
+
+def test_link_basis_call_graph_then_same_type_in_same_package():
+    from code2req.pipeline import link_basis
+    from code2req.schema import Evidence, FlatRequirement
+
+    def comp(cid, name, lo, hi, kind="method", rel="pkg/api/formdata.go", deps=()):
+        return SimpleNamespace(id=cid, name=name, relative_path=rel, start_line=lo, end_line=hi,
+                               component_type=kind, depends_on=set(deps))
+    comps = {c.id: c for c in [
+        comp("validate", "FormData.Validate", 10, 20),
+        comp("string", "FormData.String", 30, 40),           # same type, no call edge
+        comp("caller", "parseThing", 50, 60, "function", deps=["validate"]),
+        comp("free", "unrelated", 70, 80, "function"),        # same file, no link at all
+        comp("other_pkg", "FormData.Bool", 5, 9, rel="pkg/other/formdata.go"),
+    ]}
+    by_file = {}
+    for c in comps.values():
+        by_file.setdefault(c.relative_path, []).append(c)
+    req = FlatRequirement(text="The API shall return 400 when validation fails.", type="constraint",
+                          evidence=[Evidence(file="pkg/api/formdata.go", start_line=12, end_line=14)])
+    assert link_basis(req, comps["caller"], comps, by_file) == "call_graph"
+    assert link_basis(req, comps["string"], comps, by_file) == "same_type"
+    assert link_basis(req, comps["free"], comps, by_file) == ""
+    assert link_basis(req, comps["other_pkg"], comps, by_file) == ""
