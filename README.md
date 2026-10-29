@@ -581,6 +581,7 @@ Interactive API docs are at `/api/docs`.
 | `--out` | `code2req-out` | Output directory |
 | `--workers` | 4 | Modules processed in parallel |
 | `--exclude` | none | Glob passed to CodeWiki's exclude patterns; repeatable (e.g. `--exclude "*_test.go"`) |
+| `--no-builtins` | off | Leave Python builtins (`builtin:len`, ...) out of `repo_dependency_graph.json` |
 | `--max-module-chars` | 40,000 | Source size of one module-agent unit (§5.2) |
 | `-v` | off | Debug logging |
 
