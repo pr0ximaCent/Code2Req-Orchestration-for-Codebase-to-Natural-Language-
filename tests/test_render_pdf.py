@@ -1,7 +1,11 @@
 """The PDF report renders any requirements.json: current, older (missing keys), empty, and
 text that would be markup if the template ever read it as such."""
 
-from code2req.render_pdf import render_pdf
+import json
+
+import typst
+
+from code2req.render_pdf import FONTS, TEMPLATE, render_pdf
 
 
 def req(i, text, **extra):
@@ -11,8 +15,8 @@ def req(i, text, **extra):
                          {"file": "app/api.py", "start_line": 40, "end_line": 40}], **extra}
 
 
-def test_renders_a_current_result_with_every_part():
-    result = {
+def full_result():
+    return {
         "requirements": [req(1, "The API shall hold at most 50 items in a `Cart`.",
                              attributes=[{"name": "cartItems", "operator": "<=", "value": 50}],
                              review={"verdict": "accepted", "note": "checked"}),
@@ -36,7 +40,25 @@ def test_renders_a_current_result_with_every_part():
                            "by_task": {"module": {"calls": 3, "provider_cost_usd": 0.0012, "credits": 10}},
                            "by_model": {}, "unpriced_models": ["anthropic/x"]}},
     }
-    assert render_pdf(result).startswith(b"%PDF")
+
+
+def part_titles(result, details):
+    data = {k: v for k, v in result.items() if k != "surfaces"}
+    found = json.loads(typst.query(TEMPLATE, "heading", font_paths=[FONTS], sys_inputs={
+        "data": json.dumps(data), "generated": "now", "details": "true" if details else "false"}))
+    return [h["body"].get("text") for h in found if h["level"] == 1]
+
+
+def test_renders_a_current_result_with_every_part():
+    assert render_pdf(full_result(), details=True).startswith(b"%PDF")
+    assert part_titles(full_result(), details=True) == [
+        "Contents", "Requirements", "Reference material", "Gaps", "Rejected claims",
+        "Surfaces with no requirement", "Dead code", "Claims about dead code", "Cost of this run"]
+
+
+def test_by_default_only_requirements_are_reported():
+    assert render_pdf(full_result()).startswith(b"%PDF")
+    assert part_titles(full_result(), details=False) == ["Contents", "Requirements"]
 
 
 def test_renders_older_and_empty_results():

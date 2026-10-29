@@ -397,12 +397,12 @@ The call includes the requirements already written for that module, numbered `R1
 - `covered`: `{"function": ..., "by": "R7"}` when an existing requirement already states what the function does (a step, check or helper of it, or a thin entry point into it);
 - `internal`: `{"function": ..., "reason": ...}` with reason `logging`, `getter`, `formatting`, `not_supported` or `boilerplate`. A function that enforces a rule, limit, check, fallback, security filter or error mapping may not be called internal.
 
-A `covered` answer is checked against CodeWiki's call graph (`depends_on`): it is accepted only when the requirement's cited code calls the function within 3 calls, or the function reaches that code within 2. The function is then added to the requirement's evidence and verified like any citation. A claim the call graph doesn't confirm is ignored, so the function stays uncited.
+A `covered` answer is accepted only when the code shows the function and the requirement belong together (`link_basis`): through CodeWiki's call graph (`depends_on`), when the requirement's cited code calls the function within 3 calls or the function reaches that code within 2; or by type, when the function is a method of a type whose methods or declaration the requirement cites, in the same package (sibling methods such as `FormData.String` next to the cited `FormData.Validate`, or not-supported stubs next to the cited ones). The function is then added to the requirement's evidence and verified like any citation. A claim the code doesn't confirm is ignored, so the function stays uncited and is listed for review.
 
 Follow-up requirements go through the same verification. `stats.function_coverage` reports:
 
 - `total`, `cited_first_pass`, `cited`, `internal_helpers`, `internal_by_reason` and `dead_excluded`;
-- `covered_linked` and `covered_unlinked`: `covered` answers the call graph confirmed or not;
+- `covered_linked` (with `covered_linked_by`: `call_graph`, `same_type`) and `covered_unlinked`: `covered` answers the code confirmed or not;
 - `ratio`: cited ÷ total;
 - `accounted_ratio`: cited plus internal, ÷ total;
 - the remaining `uncited` functions: neither cited nor judged internal. `requirements.md` lists them under "Functions no requirement explains", the place to look for missed behaviour.
@@ -508,7 +508,7 @@ Files written to `--out`:
 |---|---|
 | `requirements.json` | Full result (§12) |
 | `requirements.md` | Review report: summary with function, type and non-code coverage; requirements grouped by section with type, confidence, role, `file:lines` and attributes; reference material; gaps; uncovered surfaces; rejected claims with reasons; dead code (entry points, files, functions, non-code files) with reasons; claims about dead code that were set aside |
-| `requirements.pdf` | The same content as a document styled like the web UI: an overview page (counts, coverage bars, API cost and credits, a key to the confidence tags), contents with page numbers and PDF bookmarks, then one entry per requirement with tags for type, confidence, role and review verdict. Rendered from the JSON by Typst (`render_pdf.py`, `report/report.typ`) with the UI's IBM Plex fonts bundled, so it looks the same on any machine; about 4 seconds for 1,500 requirements. If rendering fails the run still succeeds and logs a warning |
+| `requirements.pdf` | The requirements as a document styled like the web UI: the number of requirements, a key to the confidence tags ("How to read this report"), contents with page numbers and PDF bookmarks, then one entry per requirement with tags for type, confidence, role and review verdict. For now it leaves out the run overview, coverage, reference material, gaps, rejected claims, uncovered surfaces, dead code and cost; `render_pdf(..., details=True)` puts them back. Rendered from the JSON by Typst (`render_pdf.py`, `report/report.typ`) with the UI's IBM Plex fonts bundled, so it looks the same on any machine; about 4 seconds for 1,500 requirements. If rendering fails the run still succeeds and logs a warning |
 | `cost.json` | `stats.cost` with the repo and model (§11.1) |
 | `module_tree.json` | CodeWiki's module tree (`{}` when clustering was skipped) |
 | `temp/dependency_graphs/*.json` | CodeWiki's dependency graph |
@@ -591,7 +591,7 @@ On the demo app, one Pro call came to **230 credits by SysModeler's formula, 527
 
 - **CLI:** the API cost, the SysModeler charge in credits and dollars, calls and tokens, and the breakdown by stage and by model.
 - **`requirements.md`:** the same lines under "Cost of this run".
-- **`requirements.pdf`:** on the overview page, and as tables by stage and by model on the last page.
+- **`requirements.pdf`:** not shown for now (only with `details=True`: on the overview page, and as tables by stage and by model on the last page).
 - **`cost.json`** in the output folder: `stats.cost` with the repo and model, for scripts that total spend across runs.
 - **Web UI:** the status line shows `API cost $X` and `SysModeler N credits ($Y)`, with tokens on hover, and the run list shows each finished run's API cost and credits.
 
@@ -797,7 +797,7 @@ code2req/
 
 ## 16. Tests
 
-97 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
+99 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
 
 | File | Covers |
 |---|---|
@@ -812,8 +812,8 @@ code2req/
 | `test_pipeline.py` | Full run on the fixture with **real CodeWiki parsing** and a fake LLM: test code excluded but attached, surfaces in the prompt, confirmed / inferred / gap / rejected sorted correctly, coverage including constants and gaps, the follow-up asking about an uncited model, files written. A second run adds a prompt, a knowledge file, a dead file and a dead function: the dead file never reaches the model, the dead function is listed as unused, claims about either land in `dead_requirements`, the prompt yields a requirement and the knowledge file a `REF-` entry |
 | `test_cache.py` | Same prompt answered once and the saving counted; cache shared across runs but not across models; unparsable answers never replayed; parallel workers; a second pipeline run on unchanged code makes no model calls and gives the same requirements |
 | `test_clone.py` | A partial clone over `file://` leaves out images and `node_modules`; pruning keeps only the cited files and drops `.git`; a pruned clone is cloned again, an unpruned one reused |
-| `test_render_pdf.py` | PDF of a result with every part (reviews, roles, dead code, cost), of an older result missing keys, of an empty one; text full of Typst syntax (`#panic`, `@ref`, `$`) stays plain text |
-| `test_go_coverage.py` | Go routes, flags, cobra commands, env vars (through constants), numeric constants, sentinel errors and error types; Go tests only from `_test.go`; Gherkin scenarios as tests; mocks are test code but never confirm; GitHub actions and Makefiles as CI/CD; a tracked `build/Dockerfile` kept, cloned and found as an asset while an untracked `build/` is skipped; tests attached by file stem, route path and folder with the per-module cap; follow-up `covered` answers cited only when the call graph links them; `internal` reasons counted; follow-ups batched |
+| `test_render_pdf.py` | By default the PDF holds only the requirements; with `details=True` every part (reviews, roles, reference material, gaps, rejected claims, dead code, cost); an older result missing keys and an empty one render; text full of Typst syntax (`#panic`, `@ref`, `$`) stays plain text |
+| `test_go_coverage.py` | Go routes, flags, cobra commands, env vars (through constants), numeric constants, sentinel errors and error types; Go tests only from `_test.go`; Gherkin scenarios as tests; mocks are test code but never confirm; GitHub actions and Makefiles as CI/CD; a tracked `build/Dockerfile` kept, cloned and found as an asset while an untracked `build/` is skipped; tests attached by file stem, route path and folder with the per-module cap; follow-up `covered` answers cited only when the call graph or the receiver type links them; `internal` reasons counted; follow-ups batched |
 | `test_web.py` | UI API: page served, run start → done with progress and log, result, source viewer, review set/clear, JSON and PDF export with reviews, source path traversal blocked (including another drive), bad target fails cleanly, bad IDs/inputs rejected, interrupted runs marked failed |
 
 ---
