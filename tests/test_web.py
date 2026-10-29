@@ -23,7 +23,8 @@ def wait_done(client, run_id, timeout=60):
 
 
 def make_client(tmp_path):
-    app = create_app(str(tmp_path / "runs"), llm_factory=lambda: (FixtureLLM(), "fake/model"))
+    app = create_app(str(tmp_path / "runs"), llm_factory=lambda: (FixtureLLM(), "fake/model"),
+                     cache_path=str(tmp_path / "cache.sqlite"))
     return TestClient(app)
 
 
@@ -58,6 +59,8 @@ def test_run_browse_review_export(tmp_path):
     assert reviews[req["id"]]["verdict"] == "wrong" and reviews[req["id"]]["note"] == "not true"
     exported = client.get(f"/api/runs/{meta['id']}/export").json()
     assert exported["requirements"][0]["review"]["verdict"] == "wrong"
+    pdf = client.get(f"/api/runs/{meta['id']}/export.pdf")
+    assert pdf.headers["content-type"] == "application/pdf" and pdf.content.startswith(b"%PDF")
     cleared = client.post(f"/api/runs/{meta['id']}/reviews",
                           json={"req_id": req["id"], "verdict": "clear"}).json()
     assert cleared == {}

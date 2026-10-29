@@ -1,15 +1,20 @@
 """code2req analyze <path|git-url> [--env-file .env] [--model <litellm model>] [--out DIR]
-code2req serve [--port 8765] [--env-file .env]"""
+code2req serve [--port 8765] [--env-file .env]
+code2req pdf <requirements.json> [-o report.pdf]"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
 
-from code2req.config import build_llm, load_env, resolve_repo
+from code2req.cache import with_cache
+from code2req.config import build_llm, is_git_url, load_env, prune_clone, referenced_files, resolve_repo
+from code2req.cost import cost_lines
 from code2req.pipeline import run
+from code2req.render_pdf import write_pdf
 from code2req.structure import DEFAULT_MODULE_CHARS
 
 NOISY_LOGGERS = ("LiteLLM", "litellm", "httpx", "openai", "uvicorn.access")
@@ -42,6 +47,15 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--max-module-chars", type=int, default=DEFAULT_MODULE_CHARS)
     a.add_argument("--no-followup", action="store_true",
                    help="skip the second call per module for functions no requirement cites")
+    a.add_argument("--entry", action="append", default=None,
+                   help="extra entry-point glob for dead-code detection, e.g. 'jobs/*.py' (repeatable)")
+    a.add_argument("--no-assets", action="store_true",
+                   help="skip non-code files (prompts, skills, templates, reference material, CI/CD)")
+    a.add_argument("--no-cache", action="store_true",
+                   help="call the model for every module even when its code is unchanged since a "
+                        "cached run (cache: ~/.cache/code2req or env CODE2REQ_CACHE)")
+    a.add_argument("--keep-clone", action="store_true",
+                   help="for a git URL, keep the whole clone instead of only the files the result cites")
     a.add_argument("-v", "--verbose", action="store_true")
 
     s = sub.add_parser("serve", help="start the local web UI")
@@ -53,8 +67,18 @@ def main(argv: list[str] | None = None) -> int:
                    help="where web runs are stored")
     s.add_argument("-v", "--verbose", action="store_true")
 
+    d = sub.add_parser("pdf", help="render a requirements.json (or a UI export) as a PDF report")
+    d.add_argument("json", help="requirements.json from a run, or the JSON from Export JSON in the UI")
+    d.add_argument("-o", "--out", help="PDF path (default: next to the JSON, same name)")
+    d.add_argument("-v", "--verbose", action="store_true")
+
     args = p.parse_args(argv)
     setup_logging(args.verbose)
+    if args.cmd == "pdf":  # no model needed
+        with open(args.json, encoding="utf-8") as f:
+            result = json.load(f)
+        print(f"wrote {write_pdf(result, args.out or os.path.splitext(args.json)[0] + '.pdf')}")
+        return 0
     try:
         load_env(args.env_file)
         llm, label = build_llm(args.model)
@@ -77,20 +101,32 @@ def main(argv: list[str] | None = None) -> int:
         repo = resolve_repo(args.target, args.out)
     except (ValueError, subprocess.CalledProcessError) as e:
         p.error(str(e))
+    llm = with_cache(llm, label, enabled=not args.no_cache)
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
-                 followup=not args.no_followup)
+                 followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets)
+    if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
+        kept, removed = prune_clone(repo, referenced_files(report))
+        print(f"clone pruned to the {kept} files the result cites ({removed} removed, git data dropped)")
     st = report.stats
-    cov, fc = st["surface_coverage"], st["function_coverage"]
-    print(f"{st['requirements']} requirements, {st['gaps']} gaps, {st['rejected']} rejected; "
-          f"functions cited {fc['cited']}/{fc['total']} (+{fc['internal_helpers']} internal); "
+    cov, fc, ac, rc = (st["surface_coverage"], st["function_coverage"], st["asset_coverage"],
+                       st["reachability"])
+    print(f"{st['requirements']} requirements, {st['references']} reference entries, {st['gaps']} gaps, "
+          f"{st['rejected']} rejected; functions cited {fc['cited']}/{fc['total']} "
+          f"(+{fc['internal_helpers']} internal, {len(fc['uncited'])} unexplained); types cited {st['type_coverage']['cited']}/"
+          f"{st['type_coverage']['total']}; non-code files cited {ac['cited']}/{ac['files']}; "
           f"surface coverage {cov['covered']}/{cov['total']}")
-    c = st.get("cost") or {}
-    if c:
-        print(f"cost: {c['credits']:,} credits (${c['cost_usd']:.4f}) by SysModeler's formula; "
-              f"{c['provider_credits']:,} credits (${c['provider_cost_usd']:.4f}) including "
-              f"{c['thinking_tokens']:,} thinking tokens; {c['calls']} calls, "
-              f"{c['input_tokens']:,} in / {c['output_tokens']:,} out")
-    print(f"wrote {os.path.join(args.out, 'requirements.json')} and requirements.md")
+    rf = st["repo_files"]
+    print(f"source files: {rf['files']} {'git-tracked' if rf['git'] else 'found'}; skipped "
+          f"{len(rf['generated_skipped'])} generated, {rf['untracked_code_skipped']} untracked code files")
+    if rc["analysed"]:
+        print(f"dead code left out: {rc['dead_files']} files, {rc['dead_functions']} functions, "
+              f"{ac['dead']} non-code files; {st['dead_requirements']} claims about dead code set aside")
+    else:
+        print("dead code: not analysed (no entry point found; pass --entry)")
+    for line in cost_lines(st.get("cost")):
+        print(line)
+    pdf = "requirements.pdf, " if os.path.isfile(os.path.join(args.out, "requirements.pdf")) else ""
+    print(f"wrote {os.path.join(args.out, 'requirements.json')}, requirements.md, {pdf}cost.json")
     return 0
 
 

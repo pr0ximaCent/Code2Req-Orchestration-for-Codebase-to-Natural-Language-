@@ -211,6 +211,7 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
   <select class="field" id="runSelect"></select>
   <button class="btn" type="button" id="deleteBtn" disabled>Delete run</button>
   <a class="btn" id="exportBtn" aria-disabled="true">Export JSON</a>
+  <a class="btn" id="pdfBtn" aria-disabled="true" title="Readable report with your review verdicts">Export PDF</a>
 </header>
 <div class="options" id="options" hidden>
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
@@ -219,7 +220,12 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
     <input class="field" id="workers" type="number" value="4" min="1" max="16"></label>
   <label for="chars">Module size (characters)
     <input class="field" id="chars" type="number" value="40000" min="5000" step="5000"></label>
-  <div class="hint">Git URLs are cloned with your own git login, so private repositories work.</div>
+  <label class="grow" for="entries">Extra entry points for dead-code detection (comma-separated globs)
+    <input class="field" id="entries" placeholder="jobs/*.py, worker.py"></label>
+  <label for="assets"><input id="assets" type="checkbox" checked> Prompts, templates, reference files and CI/CD</label>
+  <label for="cache"><input id="cache" type="checkbox" checked> Reuse answers for unchanged code</label>
+  <label for="keepClone"><input id="keepClone" type="checkbox"> Keep the whole clone</label>
+  <div class="hint">Git URLs are cloned with your own git login, so private repositories work. Only the latest commit is downloaded, without images, media or binaries; after the run the clone is cut down to the files the result cites.</div>
 </div>
 <div class="status" id="status"><span>No run selected.</span></div>
 <main id="body" style="min-height:0; display:grid;"></main>
@@ -243,14 +249,16 @@ const CONF_SHORT = { confirmed: "Confirmed", inferred: "Inferred", gap: "Gap" };
 const VERDICT = { accepted: "Correct", wrong: "Wrong", unsure: "Unsure" };
 const STEPS = [
   ["resolving", "Get the source"],
-  ["surfaces", "Find routes, commands, settings and limits"],
+  ["surfaces", "Find routes, settings, limits, non-code files and dead code"],
   ["structure", "Parse the code and group it into modules"],
   ["modules", "Write requirements for each module"],
   ["verify", "Check every citation against the code"],
   ["followup", "Cover functions no requirement cites yet"],
   ["done", "Save results"],
 ];
-const VIEWS = [["requirements", "Requirements"], ["gaps", "Gaps"], ["rejected", "Rejected"], ["surfaces", "Surfaces"]];
+const VIEWS = [["requirements", "Requirements"], ["references", "Reference"], ["gaps", "Gaps"], ["rejected", "Rejected"],
+  ["dead_code", "Dead code"], ["surfaces", "Surfaces"]];
+const LISTING = v => v === "surfaces" || v === "dead_code";  // rows are code locations, not requirements
 
 const S = { runs: [], runId: null, run: null, result: null, reviews: {}, view: "requirements",
   f: { q: "", type: "", conf: "", section: "", review: "" }, sel: null, log: [], logNext: 0, poll: null, src: new Map() };
@@ -263,7 +271,9 @@ async function loadRuns() {
   S.runs = await api("/api/runs");
   const sel = $("#runSelect");
   sel.innerHTML = `<option value="">${S.runs.length ? "Open a previous run…" : "No runs yet"}</option>` +
-    S.runs.map(r => `<option value="${esc(r.id)}">${esc(shortTarget(r.target))} · ${esc(when(r.started_at))}${r.status !== "done" ? " · " + esc(r.status) : ""}</option>`).join("");
+    S.runs.map(r => { const s = r.summary || {};
+      const cost = s.provider_cost_usd != null ? ` · $${s.provider_cost_usd.toFixed(2)} · ${(s.credits ?? 0).toLocaleString()} cr` : "";
+      return `<option value="${esc(r.id)}">${esc(shortTarget(r.target))} · ${esc(when(r.started_at))}${r.status !== "done" ? " · " + esc(r.status) : cost}</option>`; }).join("");
   sel.value = S.runId || "";
 }
 
@@ -321,6 +331,10 @@ $("#runForm").onsubmit = async e => {
     exclude: $("#exclude").value.split(",").map(s => s.trim()).filter(Boolean),
     workers: +$("#workers").value || 4,
     max_module_chars: +$("#chars").value || 40000,
+    entries: $("#entries").value.split(",").map(s => s.trim()).filter(Boolean),
+    assets: $("#assets").checked,
+    cache: $("#cache").checked,
+    keep_clone: $("#keepClone").checked,
   };
   $("#runBtn").disabled = true;
   try {
@@ -362,9 +376,11 @@ async function refresh() {
 /* ---------- top-level render ---------- */
 function render() {
   renderStatus();
-  const exp = $("#exportBtn");
-  if (S.run?.status === "done") { exp.href = `/api/runs/${S.runId}/export`; exp.setAttribute("aria-disabled", "false"); }
-  else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
+  for (const [btn, path] of [["#exportBtn", "export"], ["#pdfBtn", "export.pdf"]]) {
+    const exp = $(btn);
+    if (S.run?.status === "done") { exp.href = `/api/runs/${S.runId}/${path}`; exp.setAttribute("aria-disabled", "false"); }
+    else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
+  }
   $("#deleteBtn").disabled = !S.run || ["queued", "running"].includes(S.run.status);
   if (!S.run) return;
   if (S.run.status === "done" && S.result) renderWorkspace();
@@ -381,8 +397,13 @@ function renderStatus() {
     const rv = Object.values(S.reviews), wrong = rv.filter(v => v.verdict === "wrong").length;
     const funcs = fc && fc.total ? ` · functions cited <b>${fc.cited}/${fc.total}</b>${fc.internal_helpers ? ` (+${fc.internal_helpers} internal)` : ""}` : "";
     const c = st.cost;
-    const credits = c && c.credits != null ? ` · <b title="SysModeler formula: $${c.cost_usd.toFixed(4)} × 10,000. Including ${c.thinking_tokens.toLocaleString()} thinking tokens: ${c.provider_credits.toLocaleString()} credits ($${c.provider_cost_usd.toFixed(4)})">${c.credits.toLocaleString()}</b> credits` : "";
-    right = `<span class="nums"><b>${S.result.requirements.length}</b> requirements · <b>${st.confidence?.confirmed ?? 0}</b> confirmed by tests · <b>${S.result.gaps.length}</b> gaps · <b>${S.result.rejected.length}</b> rejected${funcs}${cov.total ? ` · surfaces <b>${cov.covered}/${cov.total}</b>` : ""}${credits} · reviewed <b>${rv.length}</b>${wrong ? `, ${wrong} wrong` : ""}</span>`;
+    const credits = c && c.credits != null
+      ? ` · API cost <b title="What the providers bill for ${c.calls} call(s): ${c.input_tokens.toLocaleString()} in, ${c.output_tokens.toLocaleString()} out, ${c.thinking_tokens.toLocaleString()} thinking (at the output rate)">$${c.provider_cost_usd.toFixed(2)}</b>`
+        + ` · SysModeler <b title="sysmodeler-backend-ai formula: thinking not billed; $${c.cost_usd.toFixed(4)} × 10,000, rounded half up, once per run">${c.credits.toLocaleString()}</b> credits ($${c.cost_usd.toFixed(2)})`
+        + (c.cache?.hits ? ` · <b title="Answers reused from earlier runs for unchanged code, saving $${c.cache.saved_provider_cost_usd.toFixed(2)}">${c.cache.hits}</b> reused` : "")
+      : "";
+    const refs = (S.result.references || []).length, dead = (S.result.dead_code || []).length;
+    right = `<span class="nums"><b>${S.result.requirements.length}</b> requirements · <b>${st.confidence?.confirmed ?? 0}</b> confirmed by tests${refs ? ` · <b>${refs}</b> reference` : ""} · <b>${S.result.gaps.length}</b> gaps${dead ? ` · <b>${dead}</b> dead` : ""} · <b>${S.result.rejected.length}</b> rejected${funcs}${cov.total ? ` · surfaces <b>${cov.covered}/${cov.total}</b>` : ""}${credits} · reviewed <b>${rv.length}</b>${wrong ? `, ${wrong} wrong` : ""}</span>`;
   } else if (r.status === "failed") {
     right = `<span class="err">Failed ${esc(when(r.finished_at))}</span>`;
   }
@@ -418,16 +439,21 @@ function items() {
     const cov = S.result.stats.surface_coverage || {};
     const uncovered = new Set(cov.uncovered || []);
     return (S.result.surfaces || []).filter(s => s.kind !== "test").map(s => ({
-      _surface: true, id: `${s.file}:${s.line}`, kind: s.kind, name: s.name, file: s.file, line: s.line,
+      _surface: true, id: `${s.kind}:${s.file}:${s.line}`, kind: s.kind, name: s.name, file: s.file, line: s.line,
       end_line: s.end_line, detail: s.detail,
       covered: !uncovered.has(`[${s.kind}] ${s.name} - ${s.file}:${s.line}`) }));
+  }
+  if (S.view === "dead_code") {
+    return (S.result.dead_code || []).map(d => ({
+      _surface: true, _dead: true, id: `${d.kind}:${d.file}:${d.line}:${d.name}`, kind: d.kind,
+      name: d.name || d.file, file: d.file, line: d.line, end_line: d.end_line, detail: d.reason, covered: false }));
   }
   return S.result[S.view] || [];
 }
 
 function filtered() {
   const f = S.f, list = items();
-  if (S.view === "surfaces") {
+  if (LISTING(S.view)) {
     return list.filter(s => (!f.q || `${s.name} ${s.file}`.toLowerCase().includes(f.q.toLowerCase())) && (!f.type || s.kind === f.type)
       && (!f.conf || (f.conf === "covered") === s.covered));
   }
@@ -473,9 +499,9 @@ function opts(values, current, any, labels = {}) {
 function renderFilters() {
   const list = items(), f = S.f;
   let html = `<label class="sr" for="fQ">Search</label><input class="field" id="fQ" placeholder="Search text, ID or file" value="${esc(f.q)}">`;
-  if (S.view === "surfaces") {
-    html += `<select class="field" id="fType" aria-label="Kind">${opts([...new Set(list.map(s => s.kind))].sort(), f.type, "Any kind")}</select>
-      <select class="field" id="fConf" aria-label="Coverage">${opts(["covered", "uncovered"], f.conf, "Covered or not", {covered: "Covered", uncovered: "Not covered"})}</select>`;
+  if (LISTING(S.view)) {
+    html += `<select class="field" id="fType" aria-label="Kind">${opts([...new Set(list.map(s => s.kind))].sort(), f.type, "Any kind")}</select>`;
+    if (S.view === "surfaces") html += `<select class="field" id="fConf" aria-label="Coverage">${opts(["covered", "uncovered"], f.conf, "Covered or not", {covered: "Covered", uncovered: "Not covered"})}</select>`;
   } else {
     html += `<select class="field" id="fType" aria-label="Type">${opts([...new Set(list.map(r => r.type))].sort(), f.type, "Any type")}</select>
       <select class="field" id="fConf" aria-label="Evidence">${opts(["confirmed", "inferred", "gap"], f.conf, "Any evidence", CONF)}</select>
@@ -493,7 +519,12 @@ function renderTable() {
   $("#count").textContent = `${rows.length} of ${total} shown`;
   if (!rows.length) { $("#tablewrap").innerHTML = `<div class="none">${total ? "Nothing matches these filters." : emptyText()}</div>`; return; }
   let head, body;
-  if (S.view === "surfaces") {
+  if (S.view === "dead_code") {
+    head = `<tr><th>Kind</th><th>Name</th><th>Location</th><th>Why it is dead</th></tr>`;
+    body = rows.map(s => `<tr data-id="${esc(s.id)}" aria-selected="${s.id === S.sel}">
+      <td class="small">${esc(s.kind)}</td><td class="txt"><div>${esc(s.name)}</div></td>
+      <td class="id">${esc(s.file)}:${s.line}</td><td class="small">${esc(s.detail)}</td></tr>`).join("");
+  } else if (S.view === "surfaces") {
     head = `<tr><th>Kind</th><th>Name</th><th>Location</th><th>Covered</th></tr>`;
     body = rows.map(s => `<tr data-id="${esc(s.id)}" aria-selected="${s.id === S.sel}">
       <td class="small">${esc(s.kind.replace("_", " "))}</td><td class="txt"><div>${esc(s.name)}</div></td>
@@ -505,7 +536,7 @@ function renderTable() {
       const v = S.reviews[r.id]?.verdict;
       return `<tr data-id="${esc(r.id)}" aria-selected="${r.id === S.sel}">
         <td class="id">${esc(r.id)}</td><td class="txt"><div>${esc(r.text)}</div></td>
-        <td class="small">${esc(r.type)}</td><td class="small">${rej ? '<span class="v-wrong">Failed</span>' : esc(CONF_SHORT[r.confidence])}</td>
+        <td class="small">${esc(r.type)}${r.asset_role ? `<br>${esc(r.asset_role)}` : ""}</td><td class="small">${rej ? '<span class="v-wrong">Failed</span>' : esc(CONF_SHORT[r.confidence])}</td>
         ${rej ? "" : `<td class="small ${v ? "v-" + v : "v-none"}">${v ? esc(VERDICT[v]) : "–"}</td>`}</tr>`;
     }).join("");
   }
@@ -515,7 +546,12 @@ function renderTable() {
 
 function emptyText() {
   return { requirements: "No requirements were produced.", gaps: "No unimplemented behaviour was found.",
-    rejected: "Every claim passed the citation check.", surfaces: "No routes, commands, settings or constants were detected. Detection currently covers Python." }[S.view];
+    references: "No reference material (examples, libraries, knowledge bases) is loaded by the code.",
+    rejected: "Every claim passed the citation check.",
+    dead_code: S.result.stats?.reachability?.analysed === false
+      ? "Dead code was not analysed: no entry point was found. Add one under Options."
+      : "No dead files, functions or non-code files were found.",
+    surfaces: "No routes, commands, settings or constants were detected. Detection currently covers Python." }[S.view];
 }
 
 function select(id, scroll = false) {
@@ -542,6 +578,7 @@ function renderDetail() {
     item.subject_name && ["Subject", `<span class="mono">${esc(item.subject_name)}</span>`],
     item.claim_attribute && ["Claim key", `<span class="mono">${esc(item.claim_attribute)} = ${esc(item.claim_value)}</span>`],
     item.actors?.length && ["Actors", esc(item.actors.map(a => a.name).join(", "))],
+    item.asset_role && ["Source", `${esc(item.asset_role)} file`],
   ].filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   const attrs = item.attributes?.length ? `<div><h3>Limits</h3><table class="attrs"><thead><tr><th>Name</th><th>Rule</th><th>Unit</th><th>Value type</th></tr></thead><tbody>${
     item.attributes.map(a => `<tr><td>${esc(a.name)}</td><td>${esc(a.operator)} ${esc(a.value)}</td><td>${esc(a.unit_literal) || "–"}</td><td>${esc(a.isq_type)}</td></tr>`).join("")}</tbody></table></div>` : "";
@@ -572,10 +609,13 @@ function renderDetail() {
 }
 
 function surfaceDetail(s) {
+  const tag = s._dead ? `<span class="tag rejected">Dead code: no requirements written</span>`
+    : `<span class="tag ${s.covered ? "confirmed" : "rejected"}">${s.covered ? "Covered by a requirement" : "No requirement covers this"}</span>`;
+  const detail = s.detail ? `<dt>${s._dead ? "Why" : "Detail"}</dt><dd class="${s._dead ? "" : "mono"}">${esc(s.detail)}</dd>` : "";
   return `<article class="d">
-    <div class="d-head"><span class="d-id">${esc(s.kind.replace("_", " "))}</span><span class="tag ${s.covered ? "confirmed" : "rejected"}">${s.covered ? "Covered by a requirement" : "No requirement covers this"}</span></div>
+    <div class="d-head"><span class="d-id">${esc(s.kind.replace("_", " "))}</span>${tag}</div>
     <p class="d-text">${esc(s.name)}</p>
-    <dl class="meta"><dt>Location</dt><dd class="mono">${esc(s.file)}:${s.line}</dd>${s.detail ? `<dt>Detail</dt><dd class="mono">${esc(s.detail)}</dd>` : ""}</dl>
+    <dl class="meta"><dt>Location</dt><dd class="mono">${esc(s.file)}:${s.line}</dd>${detail}</dl>
     <div class="cites"><h3>Code</h3><figure class="cite"><figcaption><span>${esc(s.file)} · lines ${s.line}–${s.end_line}</span></figcaption>
     <div class="code" data-file="${esc(s.file)}" data-s="${s.line}" data-e="${s.end_line}">Loading…</div></figure></div></article>`;
 }
@@ -594,7 +634,7 @@ function loadCites() {
 }
 
 async function setVerdict(v, keepIfSame = false) {
-  const id = S.sel; if (!id || S.view === "rejected" || S.view === "surfaces") return;
+  const id = S.sel; if (!id || S.view === "rejected" || LISTING(S.view)) return;
   const cur = S.reviews[id]?.verdict;
   const verdict = !keepIfSame && cur === v ? "clear" : v;  // pressing the active verdict again clears it
   try {
