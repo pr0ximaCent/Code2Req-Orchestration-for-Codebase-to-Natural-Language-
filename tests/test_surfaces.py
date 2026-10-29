@@ -53,5 +53,19 @@ def test_environ_subscript_and_get():
     assert set(by_kind(detect_python(src, "c.py"), "env_var")) == {"DB_URL", "DEBUG"}
 
 
+def test_enums_and_error_types():
+    src = (
+        "from enum import Enum\n"
+        "class NodeType(str, Enum):\n    FRAME = 'act::frame'\n"
+        "class AuthError(Exception):\n    pass\n"
+        "class LockedError(AuthError):\n    pass\n"
+        "class Plain:\n    pass\n"
+    )
+    surfaces = detect_python(src, "defs.py")
+    assert set(by_kind(surfaces, "enum")) == {"NodeType"}
+    assert set(by_kind(surfaces, "error")) == {"AuthError", "LockedError"}
+    assert "Plain" not in {s.name for s in surfaces}
+
+
 def test_unparsable_file_is_skipped():
     assert detect_python("def broken(:\n", "bad.py") == []

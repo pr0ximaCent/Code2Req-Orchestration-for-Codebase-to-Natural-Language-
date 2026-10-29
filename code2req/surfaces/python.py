@@ -8,6 +8,7 @@ concrete anchors and the run can report surface coverage:
   - module-level numeric constants (UPPER_CASE = number)
   - pytest tests (test_* functions)
   - data models: classes based on BaseModel / Base / models.Model / dataclass
+  - enums (Enum / IntEnum / StrEnum / Flag) and error types (*Error / *Exception bases)
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "websocket"}
 MODEL_BASES = {"BaseModel", "Base", "Model", "SQLModel", "Document", "TypedDict"}
+ENUM_BASES = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+
+
+def _is_error_base(name: str) -> bool:
+    return name.endswith(("Error", "Exception")) or name in {"Exception", "BaseException"}
 
 
 def _dotted(node: ast.AST) -> str:
@@ -117,8 +123,11 @@ def detect_python(source: str, rel: str) -> list[Surface]:
         elif isinstance(node, ast.ClassDef):
             bases = {_dotted(b).rsplit(".", 1)[-1] for b in node.bases}
             is_dc = any(_dotted(d).endswith("dataclass") for d in node.decorator_list)
-            if bases & MODEL_BASES or is_dc:
-                out.append(Surface(kind="model", name=node.name, file=rel, line=node.lineno,
+            kind = ("model" if bases & MODEL_BASES or is_dc
+                    else "enum" if bases & ENUM_BASES
+                    else "error" if any(_is_error_base(b) for b in bases) else None)
+            if kind:
+                out.append(Surface(kind=kind, name=node.name, file=rel, line=node.lineno,
                                    end_line=node.end_lineno or node.lineno,
                                    detail=",".join(sorted(bases)) or "dataclass"))
         else:
