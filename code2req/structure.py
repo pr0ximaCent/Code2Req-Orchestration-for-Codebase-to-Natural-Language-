@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from code2req.cost import llm_task
+from code2req.dependencies import enrich_dependency_graph
 from code2req.llm import LLM
 
 _VENDOR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -285,6 +286,8 @@ def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
     for node in components.values():
         node.relative_path = node.relative_path.replace("\\", "/")
     logger.info("codewiki: %d components, %d leaf nodes", len(components), len(leaf_nodes))
+    # CodeWiki's depends_on holds call edges only; add imports and module variables (Python).
+    enrich_dependency_graph(components, repo_path, config.dependency_graph_dir)
 
     def completer(prompt: str) -> str:
         with llm_task("cluster"):
