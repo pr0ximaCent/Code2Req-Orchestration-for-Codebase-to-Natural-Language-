@@ -209,7 +209,7 @@ class RunManager:
             report = run_pipeline(repo, out_dir, llm, label, req.workers,
                                   req.exclude or None, req.max_module_chars, progress=progress,
                                   followup=req.followup, entries=req.entries or None,
-                                  include_assets=req.assets)
+                                  include_assets=req.assets, target=meta["target"])
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)

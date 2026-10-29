@@ -285,3 +285,12 @@ def test_link_basis_call_graph_then_same_type_in_same_package():
     assert link_basis(req, comps["string"], comps, by_file) == "same_type"
     assert link_basis(req, comps["free"], comps, by_file) == ""
     assert link_basis(req, comps["other_pkg"], comps, by_file) == ""
+
+
+def test_the_analysed_target_is_recorded(tmp_path):
+    llm = ScriptedFollowup(lambda names: {"requirements": [], "covered": [], "internal": []})
+    report = run(SHOP, str(tmp_path / "a"), llm, "fake/model", workers=1, followup=False,
+                 target="https://github.com/acme/shop")
+    assert report.stats["target"] == "https://github.com/acme/shop"
+    report = run(SHOP, str(tmp_path / "b"), llm, "fake/model", workers=1, followup=False)
+    assert report.stats["target"] == report.stats["repo"]  # a folder analysed in place

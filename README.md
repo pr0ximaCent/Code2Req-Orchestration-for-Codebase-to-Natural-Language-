@@ -508,7 +508,7 @@ Files written to `--out`:
 |---|---|
 | `requirements.json` | Full result (§12) |
 | `requirements.md` | Review report: summary with function, type and non-code coverage; requirements grouped by section with type, confidence, role, `file:lines` and attributes; reference material; gaps; uncovered surfaces; rejected claims with reasons; dead code (entry points, files, functions, non-code files) with reasons; claims about dead code that were set aside |
-| `requirements.pdf` | The requirements as a document styled like the web UI: the number of requirements, a key to the confidence tags ("How to read this report"), contents with page numbers and PDF bookmarks, then one entry per requirement with tags for type, confidence, role and review verdict. For now it leaves out the run overview, coverage, reference material, gaps, rejected claims, uncovered surfaces, dead code and cost; `render_pdf(..., details=True)` puts them back. Rendered from the JSON by Typst (`render_pdf.py`, `report/report.typ`) with the UI's IBM Plex fonts bundled, so it looks the same on any machine; about 4 seconds for 1,500 requirements. If rendering fails the run still succeeds and logs a warning |
+| `requirements.pdf` | The requirements as a document styled like the web UI. Page 1 holds the repository name (`owner/repo` for a git URL) and date, tiles for requirements, confirmed by tests, read from code and areas, bars of requirements by type and by area (top 10), a key to the confidence tags ("How to read this report"), and the start of the contents (page numbers and PDF bookmarks). Then one entry per requirement with tags for type, confidence, role and review verdict. For now it leaves out the run overview, coverage, reference material, gaps, rejected claims, uncovered surfaces, dead code and cost; `render_pdf(..., details=True)` puts them back. Rendered from the JSON by Typst (`render_pdf.py`, `report/report.typ`) with the UI's IBM Plex fonts bundled, so it looks the same on any machine; about 4 seconds for 1,500 requirements. If rendering fails the run still succeeds and logs a warning |
 | `cost.json` | `stats.cost` with the repo and model (§11.1) |
 | `module_tree.json` | CodeWiki's module tree (`{}` when clustering was skipped) |
 | `temp/dependency_graphs/*.json` | CodeWiki's dependency graph |
@@ -610,7 +610,7 @@ On the demo app, one Pro call came to **230 credits by SysModeler's formula, 527
   "dead_requirements": [ /* FlatRequirement whose every cited line is dead code, with dead_reason */ ],
   "dead_code":         [ /* {kind: file|function|asset, file, name, line, end_line, reason} */ ],
   "surfaces":          [ /* {kind, name, file, line, end_line, detail} */ ],
-  "stats":             { /* counts, verify, surface/function/type/asset coverage, reachability, cost */ }
+  "stats":             { /* repo and target (the git URL or folder asked for), counts, verify, surface/function/type/asset coverage, reachability, cost */ }
 }
 ```
 
@@ -797,7 +797,7 @@ code2req/
 
 ## 16. Tests
 
-99 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
+100 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
 
 | File | Covers |
 |---|---|

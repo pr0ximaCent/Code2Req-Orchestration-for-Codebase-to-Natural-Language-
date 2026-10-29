@@ -397,7 +397,9 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         exclude: list[str] | None = None,
         max_module_chars: int = DEFAULT_MODULE_CHARS,
         progress: Progress | None = None, followup: bool = True,
-        entries: list[str] | None = None, include_assets: bool = True) -> RunReport:
+        entries: list[str] | None = None, include_assets: bool = True,
+        target: str | None = None) -> RunReport:
+    """target: what the user asked to analyse (a git URL or folder) when repo_path is a clone of it."""
     report_progress = progress or (lambda stage, done, total: None)
     repo_path = os.path.abspath(repo_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -557,6 +559,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     covering = reqs + gaps + references
     report.stats = {
         "repo": repo_path,
+        "target": target or repo_path,
         "model": model,
         "components": len(components),
         "modules": len(modules),

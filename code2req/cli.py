@@ -103,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         p.error(str(e))
     llm = with_cache(llm, label, enabled=not args.no_cache)
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
+                 target=args.target.strip().strip('"'),
                  followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets)
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
         kept, removed = prune_clone(repo, referenced_files(report))

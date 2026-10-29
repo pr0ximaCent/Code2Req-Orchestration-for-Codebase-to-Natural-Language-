@@ -84,9 +84,14 @@
 }
 
 #let repo = str(stat("repo", default: ""))
+// What was analysed, as a short name: "owner/repo" for a git URL, the last two folders of a path.
+// Older results have no target; their repo path is used instead.
+#let target = str(stat("target", default: repo))
 #let repo-name = {
-  let parts = repo.replace("\\", "/").split("/").filter(p => p != "")
-  if parts.len() > 0 { parts.last() } else { "repository" }
+  let t = target.replace("\\", "/").trim("/")
+  if t.ends-with(".git") { t = t.slice(0, t.len() - 4) }
+  let parts = t.split(regex("[/:]")).filter(p => p != "")
+  if parts.len() == 0 { "repository" } else { parts.slice(calc.max(0, parts.len() - 2)).join("/") }
 }
 
 // ---- small pieces ----
@@ -238,7 +243,8 @@
 )
 
 #show heading.where(level: 1): it => {
-  pagebreak(weak: true)
+  // without details the contents follow the overview on page 1; every part still starts a page
+  if details or it.outlined { pagebreak(weak: true) }
   block(width: 100%, below: 12pt, text(font: cond, size: 18pt, weight: 600, it.body))
 }
 #show heading.where(level: 2): it => block(
@@ -262,12 +268,63 @@
 #let reused = val(cache, "hits", default: 0)
 
 #if not details {
-  block(below: 18pt, {
-    text(font: cond, size: 26pt, weight: 600, thousands(reqs.len()))
-    h(8pt)
-    text(font: cond, size: 14pt, weight: 600, fill: fg2,
-      if reqs.len() == 1 { "requirement" } else { "requirements" })
+  let confirmed = reqs.filter(r => val(r, "confidence") == "confirmed").len()
+  let areas = by-section(reqs)
+  block(below: 16pt, {
+    caps("code2req report")
+    v(4pt)
+    text(font: cond, size: 26pt, weight: 600, "Requirements recovered from code")
+    v(8pt)
+    text(font: mono, size: 9pt, fill: fg2, brk(repo-name))
+    if generated != "" { text(fill: fg3, "  ·  " + generated) }
   })
+  grid(
+    columns: (1fr,) * 4, rows: 64pt, gutter: 8pt,
+    tile("Requirements", thousands(reqs.len()), note: "with code evidence"),
+    tile("Confirmed by tests", thousands(confirmed), note: "a test exercises the code", color: ok),
+    tile("Read from code", thousands(reqs.len() - confirmed), note: "review before use"),
+    tile("Areas", thousands(areas.len()), note: "modules they come from"),
+  )
+  v(16pt)
+  // requirements by type and by area, each with a bar against the largest count
+  let order = ("functional", "interface", "constraint", "safety", "performance", "design")
+  let types = (:)
+  for r in reqs {
+    let t = val(r, "type", default: "functional")
+    types.insert(t, types.at(t, default: 0) + 1)
+  }
+  let type-keys = (order + types.keys().filter(k => k not in order)).filter(k => types.at(k, default: 0) > 0)
+  let max-type = calc.max(1, ..types.values())
+  let area-keys = areas.keys().sorted().sorted(key: k => -areas.at(k).len())
+  let shown = 10
+  let max-area = calc.max(1, ..areas.values().map(v => v.len()))
+  let bar-rows(keys, count, top, label) = keys.map(k => (
+    label(k), align(horizon, meter(count(k), top)), text(font: mono, size: 8pt, thousands(count(k))),
+  )).flatten()
+  // label-col: auto for short labels (types); a fixed share for area paths, so the bars stay visible
+  let bars(rows, label-col: auto) = grid(
+    columns: (label-col, 1fr, auto), column-gutter: 10pt, row-gutter: 7pt, align: (left, horizon, right),
+    ..rows,
+  )
+  grid(
+    columns: (1fr, 1fr), column-gutter: 24pt,
+    {
+      caps("By type")
+      v(4pt)
+      bars(bar-rows(type-keys, k => types.at(k), max-type, k => text(fill: fg2, k)))
+    },
+    {
+      caps("By area")
+      v(4pt)
+      bars(bar-rows(area-keys.slice(0, calc.min(shown, area-keys.len())), k => areas.at(k).len(), max-area,
+        k => text(font: mono, size: 7.5pt, fill: fg2, brk(k))), label-col: 62%)
+      if area-keys.len() > shown {
+        v(5pt)
+        text(size: 7.5pt, fill: fg3, "+ " + str(area-keys.len() - shown) + " more areas, listed in the contents")
+      }
+    },
+  )
+  v(16pt)
 }
 
 #if details [
