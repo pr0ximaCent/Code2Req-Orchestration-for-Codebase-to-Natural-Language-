@@ -210,8 +210,6 @@ def split_large_modules(modules: list[Module], components: dict[str, Any],
     return out
 
 
-CODE_EXTS = {".py", ".go", ".java", ".js", ".jsx", ".mjs", ".ts", ".tsx", ".c", ".h", ".cc",
-             ".cpp", ".hpp", ".cs", ".kt", ".php", ".rb", ".scala", ".rs", ".dart", ".zig", ".vue"}
 MAX_DECLARATION_FILE_FACTOR = 3  # larger component-less files are likely generated
 
 
@@ -220,16 +218,30 @@ def _excluded(rel: str, patterns: list[str] | None) -> bool:
     return any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(base, p) for p in patterns or [])
 
 
+def _walk_code_files(repo_path: str) -> list[str]:
+    from code2req.surfaces import CODE_EXTS, WALK_SKIP_DIRS
+
+    out = []
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = sorted(d for d in dirs if d not in WALK_SKIP_DIRS and not d.startswith("."))
+        for name in sorted(files):
+            if os.path.splitext(name)[1] in CODE_EXTS:
+                out.append(os.path.relpath(os.path.join(root, name), repo_path).replace(os.sep, "/"))
+    return out
+
+
 def attach_declaration_files(modules: list[Module], components: dict[str, Any], repo_path: str,
                              exclude: list[str] | None = None,
-                             max_chars: int = DEFAULT_MODULE_CHARS) -> list[Module]:
+                             max_chars: int = DEFAULT_MODULE_CHARS,
+                             files: list[str] | None = None) -> list[Module]:
     """Give every source file without components (prompts.py, constants.go, ...) a module.
 
     Each joins the smallest module that already covers its directory, or gets
-    its own module when none does or it would overflow max_chars.
+    its own module when none does or it would overflow max_chars. files is the
+    repo's source list (repofiles); without it the tree is walked.
     """
-    from code2req.surfaces import SKIP_DIRS
-    from code2req.verify import is_test_path
+    from code2req.surfaces import CODE_EXTS
+    from code2req.verify import is_test_code
 
     with_components = {n.relative_path for n in components.values()}
     module_size = {id(m): _size(components, m.component_ids) for m in modules}
@@ -239,41 +251,57 @@ def attach_declaration_files(modules: list[Module], components: dict[str, Any], 
             by_dir[d].append(m)
 
     out = list(modules)
-    for root, dirs, files in os.walk(repo_path):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
-        for name in sorted(files):
-            if os.path.splitext(name)[1] not in CODE_EXTS:
-                continue
-            rel = os.path.relpath(os.path.join(root, name), repo_path).replace(os.sep, "/")
-            if rel in with_components or is_test_path(rel) or _excluded(rel, exclude):
-                continue
-            try:
-                size = os.path.getsize(os.path.join(root, name))
-            except OSError:
-                continue
-            if size == 0:
-                continue
-            if size > max_chars * MAX_DECLARATION_FILE_FACTOR:
-                logger.info("skip large file without functions (likely generated): %s", rel)
-                continue
-            d = os.path.dirname(rel)
-            fits = [m for m in by_dir.get(d, []) if module_size[id(m)] + size <= max_chars]
-            if fits:
-                target = min(fits, key=lambda m: module_size[id(m)])
-            else:
-                stem = os.path.splitext(name)[0]
-                target = Module(name=stem, path=[d or ROOT_DIR, stem])
-                module_size[id(target)] = 0
-                by_dir[d].append(target)
-                out.append(target)
-            target.extra_files.append(rel)
-            module_size[id(target)] += size
+    candidates = files if files is not None else _walk_code_files(repo_path)
+    for rel in candidates:
+        name = rel.rsplit("/", 1)[-1]
+        if os.path.splitext(name)[1] not in CODE_EXTS:
+            continue
+        if rel in with_components or is_test_code(rel) or _excluded(rel, exclude):
+            continue
+        try:
+            size = os.path.getsize(os.path.join(repo_path, rel))
+        except OSError:
+            continue
+        if size == 0:
+            continue
+        if size > max_chars * MAX_DECLARATION_FILE_FACTOR:
+            logger.info("skip large file without functions (likely generated): %s", rel)
+            continue
+        d = os.path.dirname(rel)
+        fits = [m for m in by_dir.get(d, []) if module_size[id(m)] + size <= max_chars]
+        if fits:
+            target = min(fits, key=lambda m: module_size[id(m)])
+        else:
+            stem = os.path.splitext(name)[0]
+            target = Module(name=stem, path=[d or ROOT_DIR, stem])
+            module_size[id(target)] = 0
+            by_dir[d].append(target)
+            out.append(target)
+        target.extra_files.append(rel)
+        module_size[id(target)] += size
     return out
+
+
+def keep_source_components(components: dict[str, Any], leaf_nodes: list[str],
+                           files: set[str] | Any) -> tuple[dict[str, Any], list[str]]:
+    """Drop components of files that are not the system (untracked, ignored, generated).
+
+    Done before clustering, so they never reach the cluster prompt either.
+    """
+    kept = {cid: n for cid, n in components.items() if n.relative_path in files}
+    dropped = len(components) - len(kept)
+    if dropped:
+        paths = sorted({n.relative_path for cid, n in components.items() if cid not in kept})
+        logger.info("dropped %d component(s) in %d untracked, ignored or generated file(s)",
+                    dropped, len(paths))
+    return kept, [c for c in leaf_nodes if c in kept]
 
 
 def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
                     exclude: list[str] | None = None,
-                    max_module_chars: int = DEFAULT_MODULE_CHARS) -> Structure:
+                    max_module_chars: int = DEFAULT_MODULE_CHARS,
+                    files: Any = None) -> Structure:
+    """files: the repo's source list (repofiles.RepoFiles); components outside it are dropped."""
     _import_codewiki_config()
     from codewiki.src.be.cluster_modules import cluster_modules, super_group_modules
     from codewiki.src.be.dependency_analyzer import DependencyGraphBuilder
@@ -285,6 +313,8 @@ def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
     for node in components.values():
         node.relative_path = node.relative_path.replace("\\", "/")
     logger.info("codewiki: %d components, %d leaf nodes", len(components), len(leaf_nodes))
+    if files is not None:
+        components, leaf_nodes = keep_source_components(components, leaf_nodes, files)
 
     def completer(prompt: str) -> str:
         with llm_task("cluster"):
@@ -305,7 +335,8 @@ def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
 
     modules = assign_all_components(modules, components)
     modules = split_large_modules(modules, components, max_module_chars)
-    modules = attach_declaration_files(modules, components, repo_path, exclude, max_module_chars)
+    modules = attach_declaration_files(modules, components, repo_path, exclude, max_module_chars,
+                                       files=getattr(files, "files", None))
     _rename_root(modules, os.path.basename(os.path.normpath(repo_path)))
     logger.info("structure: %d modules", len(modules))
     return Structure(components=components, modules=modules, module_tree=tree)
