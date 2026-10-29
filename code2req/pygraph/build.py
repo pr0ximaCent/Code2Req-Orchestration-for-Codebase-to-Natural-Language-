@@ -28,6 +28,7 @@ from code2req.surfaces import SKIP_DIRS
 logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 1_500_000
+LINK_KEYS = ("inherits", "decorators", "annotations", "overrides")  # relations by kind, on defs
 
 
 def _excluded(rel: str, patterns: list[str] | None) -> bool:
@@ -56,7 +57,7 @@ def _python_files(repo_path: str, exclude: list[str] | None) -> list[str]:
 
 
 def build_python_graph(components: dict[str, Any], repo_path: str, dependency_graph_dir: str,
-                       exclude: list[str] | None = None) -> dict[str, Any]:
+                       exclude: list[str] | None = None, builtins: bool = True) -> dict[str, Any]:
     """Add module-level code, variables, attributes and comments to the graph and link everything.
 
     `components` (CodeWiki's id -> Node) gets the new links in `depends_on`; the graph JSON gets
@@ -97,9 +98,11 @@ def build_python_graph(components: dict[str, Any], repo_path: str, dependency_gr
         build_module_nodes(fm, alloc)
         build_class_nodes(fm, alloc)
 
-    repo = Repo(models)
+    repo = Repo(models, builtins)
     for fm in models.values():
         repo.register(fm)
+    for fm in models.values():
+        repo.infer_types(fm)
 
     module_ids = {fm.module_id for fm in models.values()}
     for fm in models.values():
@@ -109,6 +112,7 @@ def build_python_graph(components: dict[str, Any], repo_path: str, dependency_gr
             if node.component_type in ("function", "method", "class") and node.id in by_id:
                 refs = repo.refs_of_def(fm, by_id[node.id])
                 node.extra["unresolved_attributes"] = sorted(refs.unresolved)
+                node.extra.update(repo.header_links(fm, by_id[node.id]))
             elif node.component_type == "imports":
                 refs = repo.refs_of_imports(fm, node.stmts)
             elif node.stmts and node.component_type in ("variable", "constant", "script_block",
@@ -137,7 +141,7 @@ def build_python_graph(components: dict[str, Any], repo_path: str, dependency_gr
     for fm in models.values():  # carry the new links into the in-memory components
         for n in fm.nodes:
             if n.existing and n.id in components:
-                components[n.id].depends_on.update(n.depends_on)
+                components[n.id].depends_on.update(d for d in n.depends_on if not d.startswith("builtin:"))
 
     report = ownership_report(models, unparsed)
     _write_graph(graph_path, repo_path, components, models)
@@ -163,13 +167,16 @@ def _write_graph(path: str, repo_path: str, components: dict[str, Any], models: 
                 new.append(n)
             elif n.id in data:
                 entry = data[n.id]
-                entry["depends_on"] = sorted(components[n.id].depends_on) if n.id in components else entry["depends_on"]
+                if n.id in components:  # builtins stay out of the in-memory components
+                    entry["depends_on"] = sorted(
+                        set(components[n.id].depends_on) | {d for d in n.depends_on if d.startswith("builtin:")})
                 entry["reads"] = sorted(n.reads)
                 entry["writes"] = sorted(n.writes)
                 entry["leading_comments"] = n.leading_comments
                 entry["unresolved_attributes"] = n.extra.get("unresolved_attributes", [])
-                if "parent" in n.extra:
-                    entry["parent"] = n.extra["parent"]
+                for key in ("parent", *LINK_KEYS):
+                    if key in n.extra:
+                        entry[key] = n.extra[key]
     for n in sorted(new, key=lambda x: (x.rel, x.start_line, x.id)):
         data[n.id] = n.to_json(repo_path)
     with open(path, "w", encoding="utf-8") as f:

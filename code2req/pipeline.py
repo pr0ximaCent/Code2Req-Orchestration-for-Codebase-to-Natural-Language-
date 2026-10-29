@@ -202,7 +202,8 @@ def function_coverage(modules: list[Module], components: dict[str, Any], reqs: l
 def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         exclude: list[str] | None = None,
         max_module_chars: int = DEFAULT_MODULE_CHARS,
-        progress: Progress | None = None, followup: bool = True) -> RunReport:
+        progress: Progress | None = None, followup: bool = True,
+        builtins: bool = True) -> RunReport:
     report_progress = progress or (lambda stage, done, total: None)
     repo_path = os.path.abspath(repo_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -212,7 +213,8 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     logger.info("surfaces: %d", len(surfaces))
 
     report_progress("structure", 0, 0)
-    structure = build_structure(repo_path, out_dir, llm, model, exclude, max_module_chars)
+    structure = build_structure(repo_path, out_dir, llm, model, exclude, max_module_chars,
+                               builtins=builtins)
     components = structure.components
     modules = drop_test_components(structure.modules, components)
 

@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--max-module-chars", type=int, default=DEFAULT_MODULE_CHARS)
     a.add_argument("--no-followup", action="store_true",
                    help="skip the second call per module for functions no requirement cites")
+    a.add_argument("--no-builtins", action="store_true",
+                   help="leave Python builtins (len, ValueError, ...) out of the dependency graph")
     a.add_argument("-v", "--verbose", action="store_true")
 
     s = sub.add_parser("serve", help="start the local web UI")
@@ -78,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, subprocess.CalledProcessError) as e:
         p.error(str(e))
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
-                 followup=not args.no_followup)
+                 followup=not args.no_followup, builtins=not args.no_builtins)
     st = report.stats
     cov, fc = st["surface_coverage"], st["function_coverage"]
     print(f"{st['requirements']} requirements, {st['gaps']} gaps, {st['rejected']} rejected; "

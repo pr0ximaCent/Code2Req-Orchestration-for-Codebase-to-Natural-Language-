@@ -275,7 +275,8 @@ def attach_declaration_files(modules: list[Module], components: dict[str, Any], 
 
 def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
                     exclude: list[str] | None = None,
-                    max_module_chars: int = DEFAULT_MODULE_CHARS) -> Structure:
+                    max_module_chars: int = DEFAULT_MODULE_CHARS,
+                    builtins: bool = True) -> Structure:
     _import_codewiki_config()
     from codewiki.src.be.cluster_modules import cluster_modules, super_group_modules
     from codewiki.src.be.dependency_analyzer import DependencyGraphBuilder
@@ -290,7 +291,8 @@ def build_structure(repo_path: str, work_dir: str, llm: LLM, model: str,
     # CodeWiki's graph holds call edges between functions, methods and classes only. This adds
     # module-level code, variables, attributes and comments, and links them (Python).
     try:
-        graph_report = build_python_graph(components, repo_path, config.dependency_graph_dir, exclude)
+        graph_report = build_python_graph(components, repo_path, config.dependency_graph_dir, exclude,
+                                        builtins=builtins)
     except Exception:  # noqa: BLE001 - the extra graph must not stop a run
         logger.exception("python graph failed; repo_dependency_graph.json keeps CodeWiki's edges only")
         graph_report = None

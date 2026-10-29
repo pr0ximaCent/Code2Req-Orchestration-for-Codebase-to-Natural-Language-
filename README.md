@@ -237,7 +237,13 @@ CodeWiki's `repo_dependency_graph.json` holds functions, methods and classes, wi
 | `comment_block` | Comment-only lines that sit outside every node and not directly above one. `describes` names the node just below |
 | `module` | One per file. `depends_on` lists the repo modules it imports, `children` lists its nodes |
 
-**Links.** `depends_on` holds ids of real nodes: a function lists the variables, class and instance attributes, functions and classes it uses (`self.x`, `Base.LEVEL`, `config.MAX_ITEMS`, `from app.config import limit`, base-class attributes included). Things outside the repo stay strings, such as `import:requests.get`. `reads` and `writes` split out the variables and attributes it reads and assigns (`x += 1` counts as both). `unresolved_attributes` lists `self.x` names that no class in the repo defines. Python builtins are not listed yet.
+**Links.** `depends_on` holds ids of real nodes: a function lists the variables, class and instance attributes, functions and classes it uses (`self.x`, `Base.LEVEL`, `config.MAX_ITEMS`, `from app.config import limit`, base-class attributes included). Things outside the repo stay strings, such as `import:requests.get`. `reads` and `writes` split out the variables and attributes it reads and assigns (`x += 1` counts as both). `unresolved_attributes` lists `self.x` names that no class in the repo defines.
+
+**Builtins.** Python builtins a function uses (`len`, `ValueError`, `sorted`) are listed as `builtin:len` in `depends_on` in the JSON file only; the in-memory components and the prompts do not get them. `--no-builtins` leaves them out.
+
+**Relations by kind.** Every function, method and class also carries `decorators` (`@deco`, `@property`), `inherits` (base classes, `builtin:Exception` included) for classes, `annotations` (types in parameters and return type) for functions, and `overrides` (the base-class method it replaces) for methods. They are all in `depends_on` too.
+
+**Calls through instances.** A call such as `x.run()` is linked to the method when `x` is a local set from `Cls(...)`, `with Cls() as x`, a module variable `x = Cls()`, or an attribute `self.x = Cls()`. This is simple inference: names assigned two different classes, values returned by functions, and parameters are not resolved.
 
 **Comments.** A comment inside a node is already part of its `source_code`. A comment block directly above a node (no blank line between) becomes that node's `leading_comments`. Entries carry `tag` for `TODO`, `FIXME`, `NOTE`, `HACK` and `XXX`, and `pragma` for `noqa` and `type:` comments.
 
@@ -652,7 +658,7 @@ code2req/
 | `test_structure.py` | File-aligned packing and labels, an oversized file split into parts, unassigned components following their file/directory, root renaming |
 | `test_llm.py` | Chain order and attempt counts match docreq; backoff then fall-over; unconfigured Azure skipped; truncated-JSON recovery without retry; total failure raises; Azure URL rule; Gemini keys from both env formats, rotated |
 | `test_pipeline.py` | Full run on the fixture with **real CodeWiki parsing** and a fake LLM: test code excluded but attached, surfaces in the prompt, confirmed / inferred / gap / rejected sorted correctly, coverage including constants, files written |
-| `test_pygraph.py` | Module-level nodes, variable values, `self.x` / class attribute / inherited attribute links with `reads` and `writes`, imports resolved to node ids (absolute, relative, `module.NAME`), globals, nested defs, comment attachment and blocks, `module` nodes, 100% line ownership, unparsable files reported |
+| `test_pygraph.py` | Module-level nodes, variable values, `self.x` / class attribute / inherited attribute links with `reads` and `writes`, imports resolved to node ids (absolute, relative, `module.NAME`), globals, nested defs, comment attachment and blocks, `module` nodes, 100% line ownership, unparsable files reported, builtins and `--no-builtins`, inherits/decorators/annotations/overrides, calls through constructed instances |
 | `test_web.py` | UI API: page served, run start → done with progress and log, result, source viewer, review set/clear, export with reviews, source path traversal blocked (including another drive), bad target fails cleanly, bad IDs/inputs rejected, interrupted runs marked failed |
 
 ---

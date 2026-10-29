@@ -132,9 +132,9 @@ def test_function_links_point_at_real_node_ids(built):
     limit_id = entry(by, "app/config.py", "limit")["id"]
     assert {max_items, limit_id, "import:os", "import:json"} <= deps
     assert entry(by, "app/api.py", "TIMEOUT")["id"] not in deps  # shadowed by a local
-    assert not any("len" in d for d in deps)  # builtins come in a later phase
+    assert {"builtin:len", "builtin:ValueError"} <= deps
     assert max_items in add["reads"]
-    assert all(d in graph or d.startswith("import:") for d in deps)  # no dangling ids
+    assert all(d in graph or d.startswith(("import:", "builtin:")) for d in deps)  # no dangling ids
 
 
 def test_module_attribute_access_resolves_through_the_module(built):
@@ -229,7 +229,8 @@ def test_existing_fields_and_call_edges_are_kept(built):
     for cid, comp in st.components.items():
         e = graph[cid]
         assert e["source_code"] == comp.source_code and e["start_line"] == comp.start_line
-        assert set(e["depends_on"]) == set(comp.depends_on)  # JSON and in-memory agree
+        # JSON and in-memory agree; builtins are in the JSON only
+        assert {d for d in e["depends_on"] if not d.startswith("builtin:")} == set(comp.depends_on)
     helper_id = next(i for i, c in st.components.items() if c.name == "helper")
     assert any(d.endswith("config.py::limit") for d in graph[helper_id]["depends_on"])
 
@@ -244,3 +245,88 @@ def test_unparsable_file_is_reported_not_fatal(tmp_path):
     report = json.loads((work / "temp" / "dependency_graphs" / "repo_line_ownership.json").read_text("utf-8"))
     assert report["summary"]["unparsed_files"] == [{"file": "bad.py", "reason": "Python syntax error"}]
     assert report["summary"]["ratio_graph"] == 1.0
+
+
+MODELS = '''from typing import Optional
+
+
+class Engine:
+    def run(self):
+        return 1
+
+    def stop(self):
+        return 0
+
+
+class Turbo(Engine):
+    def run(self):
+        return super().run() + 1
+
+
+class Boom(Exception):
+    pass
+
+
+def deco(fn):
+    return fn
+
+
+engine = Engine()
+
+
+class Car:
+    def __init__(self):
+        self.engine = Turbo()
+
+    @deco
+    @property
+    def power(self) -> Optional[Engine]:
+        return self.engine.run()
+
+    def drive(self, e: Engine):
+        local = Turbo()
+        local.stop()
+        engine.run()
+        return sorted(str(x) for x in range(3))
+'''
+
+
+def build_models(tmp_path, **kw):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "models.py").write_text(MODELS, encoding="utf-8")
+    work = tmp_path / "work"
+    build_structure(str(repo), str(work), None, "m", **kw)
+    graph = json.loads((work / "temp" / "dependency_graphs" / "repo_dependency_graph.json").read_text("utf-8"))
+    return {e["name"]: e for e in graph.values()}
+
+
+def test_inheritance_decorators_annotations_and_overrides(tmp_path):
+    by = build_models(tmp_path)
+    eid = lambda n: by[n]["id"]  # noqa: E731
+    assert by["Turbo"]["inherits"] == [eid("Engine")]
+    assert by["Boom"]["inherits"] == ["builtin:Exception"]
+    assert by["Car.power"]["decorators"] == sorted([eid("deco"), "builtin:property"])
+    assert eid("Engine") in by["Car.power"]["annotations"] and "import:typing.Optional" in by["Car.power"]["annotations"]
+    assert by["Car.drive"]["annotations"] == [eid("Engine")]
+    assert by["Turbo.run"]["overrides"] == [eid("Engine.run")]
+    assert by["Engine.run"]["overrides"] == []
+
+
+def test_calls_through_constructed_instances_are_resolved(tmp_path):
+    by = build_models(tmp_path)
+    eid = lambda n: by[n]["id"]  # noqa: E731
+    drive = set(by["Car.drive"]["depends_on"])
+    assert eid("Engine.stop") in drive  # local = Turbo(); local.stop() found on the base class
+    assert eid("Engine.run") in drive  # engine = Engine() at module level; engine.run()
+    assert {"builtin:sorted", "builtin:str", "builtin:range"} <= drive
+    power = set(by["Car.power"]["depends_on"])
+    assert eid("Turbo.run") in power  # self.engine = Turbo() in __init__; self.engine.run()
+    assert by["Car.engine"]["id"] in by["Car.power"]["reads"]
+
+
+def test_no_builtins_flag_drops_builtin_entries(tmp_path):
+    by = build_models(tmp_path, builtins=False)
+    everything = {d for e in by.values() for d in e["depends_on"]}
+    assert not any(d.startswith("builtin:") for d in everything)
+    assert by["Boom"]["inherits"] == []

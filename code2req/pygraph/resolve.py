@@ -10,6 +10,7 @@ A reference resolves to a *state*:
 from __future__ import annotations
 
 import ast
+import builtins as _builtins
 from dataclasses import dataclass, field
 
 from code2req.pygraph.source import (
@@ -22,6 +23,8 @@ from code2req.pygraph.source import (
 
 VAR_TYPES = {"variable", "constant", "class_attribute", "instance_attribute"}
 MAX_REEXPORT_DEPTH = 5
+# `len`, `ValueError`, ...; dunders (`__name__`, `__file__`) are module plumbing, not dependencies.
+BUILTIN_NAMES = frozenset(n for n in dir(_builtins) if not n.startswith("_"))
 
 State = tuple
 
@@ -113,9 +116,11 @@ def module_free_names(stmts: list[ast.stmt]) -> set[str]:
 # --- repo-wide resolution ---------------------------------------------------------------
 
 class Repo:
-    def __init__(self, models: dict[str, FileModel]):
+    def __init__(self, models: dict[str, FileModel], builtins: bool = True):
         self.models = models
+        self.builtins = builtins
         self.types: dict[str, str] = {}  # node id -> component_type
+        self.id_type: dict[str, State] = {}  # variable/attribute node id -> repo class it holds
         self.id_file: dict[str, str] = {}  # node id -> file
         self.exact: dict[tuple[str, ...], str] = {}
         suffixes: dict[tuple[str, ...], set[str]] = {}
@@ -134,6 +139,68 @@ class Repo:
         for n in fm.nodes:
             self.types[n.id] = n.component_type
             self.id_file[n.id] = fm.rel
+
+    # simple type inference -----------------------------------------------------------------
+    def instance_state(self, fm: FileModel, value: ast.AST | None) -> State | None:
+        """The repo class when `value` is a constructor call such as `Cls(...)`."""
+        if isinstance(value, ast.Call):
+            st = self.expr_state(fm, value.func)
+            if st and st[0] == "class":
+                return st
+        return None
+
+    def infer_types(self, fm: FileModel) -> None:
+        """Remember which module variables and attributes are assigned `Cls(...)` (once, in this
+        file), so that `var.method()` and `self.attr.method()` link to the method."""
+        for s in fm.tree.body:
+            if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
+                st, nid_ = self.instance_state(fm, s.value), fm.symbols.get(s.targets[0].id)
+                if st and nid_:
+                    self.id_type.setdefault(nid_, st)
+        for d in fm.defs:
+            if d.kind == "class":
+                body, owner, sname = d.node.body, fm.classes[d.qual], None
+            else:
+                sname = self_name_of(d)
+                if sname is None:
+                    continue
+                body, owner = list(ast.walk(d.node)), fm.classes[d.parent.qual]
+            for s in body:
+                if not (isinstance(s, ast.Assign) and len(s.targets) == 1):
+                    continue
+                t = s.targets[0]
+                if sname is None and isinstance(t, ast.Name):
+                    attr = t.id
+                elif (sname is not None and isinstance(t, ast.Attribute)
+                      and isinstance(t.value, ast.Name) and t.value.id == sname):
+                    attr = t.attr
+                else:
+                    continue
+                st, member = self.instance_state(fm, s.value), owner.members.get(attr)
+                if st and member:
+                    self.id_type.setdefault(member, st)
+
+    def local_types(self, fm: FileModel, roots: list[ast.AST]) -> dict[str, State]:
+        """Local names assigned `Cls(...)` (also `with Cls() as x`); a name given two classes is dropped."""
+        out: dict[str, State] = {}
+        clash: set[str] = set()
+        for root in roots:
+            for n in ast.walk(root):
+                if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                    name, value = n.targets[0].id, n.value
+                elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+                    name, value = n.target.id, n.value
+                elif isinstance(n, ast.withitem) and isinstance(n.optional_vars, ast.Name):
+                    name, value = n.optional_vars.id, n.context_expr
+                else:
+                    continue
+                st = self.instance_state(fm, value)
+                if st is None:
+                    continue
+                if name in out and out[name] != st:
+                    clash.add(name)
+                out[name] = st
+        return {k: v for k, v in out.items() if k not in clash}
 
     # modules ---------------------------------------------------------------------------
     def find_module(self, parts: tuple[str, ...]) -> str | None:
@@ -274,6 +341,8 @@ class Repo:
                 cm = fm.classes.get(m.parent.qual)
                 self_class = ("class", fm.rel, m.parent.qual, cm.id) if cm else None
 
+        local_types = self.local_types(fm, roots)
+
         def ref(node: ast.AST, ctx: str | None = None) -> bool:
             attrs: list[str] = []
             cur = node
@@ -287,20 +356,28 @@ class Repo:
                 ctx = "load" if isinstance(node.ctx, ast.Load) else "store"
             name = cur.id
             is_self = bool(self_class) and name == self_name
+            inst = is_self  # `self`, or a local holding an instance of a repo class
             if is_self:
                 st: State | None = self_class
             elif name in free or (ctx != "load" and name in glob):
                 st = self.root_state(fm, name)
+                if st is None:
+                    if self.builtins and name in BUILTIN_NAMES and ctx == "load":
+                        refs.deps.add("builtin:" + name)
+                    return True
+            elif name in local_types:
+                st, inst = local_types[name], True
             else:
                 return True
-            if st is None:
-                return True
-            if not attrs and is_self:
+            if not attrs and inst:
                 return True
             if not attrs and ctx == "store" and name not in glob:
                 return True
             consumed = 0
             for i, a in enumerate(attrs):
+                if st[0] == "id" and st[1] in self.id_type:  # `var.method`: var holds a repo class
+                    self.record(refs, st, "load")
+                    st = self.id_type[st[1]]
                 nxt = self.step(st, a)
                 if nxt is None:
                     if is_self and i == 0:
@@ -308,9 +385,9 @@ class Repo:
                     break
                 st = nxt
                 consumed += 1
-                if st[0] == "id":
+                if st[0] == "id" and not (st[1] in self.id_type and i + 1 < len(attrs)):
                     break
-            if is_self and consumed == 0:
+            if inst and consumed == 0:
                 return True
             self.record(refs, st, ctx if consumed == len(attrs) else "load")
             return True
@@ -334,6 +411,46 @@ class Repo:
         refs = self.scan(fm, [d.node], free_names(d.node), d, global_names(d.node))
         refs.deps.discard(d.id)
         return refs
+
+    def header_links(self, fm: FileModel, d: DefInfo) -> dict[str, list[str]]:
+        """The def's relations by kind: base classes, decorators, annotations, overridden method."""
+        node = d.node
+
+        def targets(exprs: list[ast.AST], names: bool = False) -> list[str]:
+            if names:  # annotations: every name inside, so `Optional[Foo]` links Foo as well
+                free = {n.id for e in exprs for n in ast.walk(e) if isinstance(n, ast.Name)}
+                return sorted(self.scan(fm, exprs, free).deps)
+            refs = Refs()
+            for e in exprs:
+                core = e.func if isinstance(e, ast.Call) else e
+                st = self.expr_state(fm, core)
+                if st is not None:
+                    self.record(refs, st, "load")
+                elif self.builtins and isinstance(core, ast.Name) and core.id in BUILTIN_NAMES:
+                    refs.deps.add("builtin:" + core.id)
+            return sorted(refs.deps - {d.id})
+
+        out: dict[str, list[str]] = {"decorators": targets(node.decorator_list)}
+        if d.kind == "class":
+            out["inherits"] = targets(node.bases)
+            return out
+        a = node.args
+        notes = [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]
+                 if x is not None and x.annotation is not None]
+        if node.returns is not None:
+            notes.append(node.returns)
+        out["annotations"] = sorted(set(targets(notes, names=True)) - {d.id})
+        if d.kind == "method":
+            cm = fm.classes[d.parent.qual]
+            hits: list[str] = []
+            for base in cm.bases:
+                st = self.expr_state(fm, base)
+                hit = self.lookup_member(st[1], st[2], node.name) if st and st[0] == "class" else None
+                if hit and self.types.get(hit) in ("method", "function"):
+                    hits.append(hit)
+                    break
+            out["overrides"] = hits
+        return out
 
     def refs_of_stmts(self, fm: FileModel, stmts: list[ast.stmt], own_id: str) -> Refs:
         refs = self.scan(fm, list(stmts), module_free_names(stmts))
