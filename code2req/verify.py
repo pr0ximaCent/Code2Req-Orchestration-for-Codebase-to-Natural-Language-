@@ -1,9 +1,11 @@
 """Deterministic grounding checks for LLM requirement claims.
 
 A requirement survives only if at least one evidence entry points at real
-lines in the repo that contain the cited symbol. "confirmed" needs a passing
-evidence entry in a test file. Attribute values must appear in the cited code
-(directly or after a common unit scaling); otherwise the attribute is dropped.
+lines in the repo that contain the cited symbol. In a non-code file (prompt,
+template, CI/CD) the symbol is a short quote from the cited lines or the
+heading above them. "confirmed" needs a passing evidence entry in a test file.
+Attribute values must appear in the cited code (directly or after a common
+unit scaling); otherwise the attribute is dropped.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 
 from code2req.schema import Evidence, FlatRequirement
+from code2req.surfaces import CODE_EXTS
 
 SYMBOL_SLACK = 2  # lines of tolerance around a cited range
 NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:_\d+)*(?:\.\d+)?(?:[eE][-+]?\d+)?")
@@ -27,7 +30,23 @@ def is_test_path(rel: str) -> bool:
     base = parts[-1]
     return (any(p in ("tests", "test", "__tests__", "spec") for p in parts[:-1])
             or base.startswith("test_") or base.endswith("_test.py") or base.endswith("_test.go")
-            or ".test." in base or ".spec." in base or base == "conftest.py")
+            or ".test." in base or ".spec." in base or base == "conftest.py" or base.endswith(".feature"))
+
+
+MOCK_DIRS = ("mocks", "mock", "__mocks__", "fakes")
+
+
+def is_mock_path(rel: str) -> bool:
+    """Test doubles (mocks.go, user_mock.go, mock_store.py, __mocks__/...): test code, not the system."""
+    parts = rel.replace("\\", "/").split("/")
+    stem = os.path.splitext(parts[-1])[0].lower()
+    return (any(p.lower() in MOCK_DIRS for p in parts[:-1])
+            or stem in ("mock", "mocks") or stem.endswith(("_mock", "_mocks")) or stem.startswith("mock_"))
+
+
+def is_test_code(rel: str) -> bool:
+    """Tests and test doubles. Only real tests (is_test_path) can confirm a requirement."""
+    return is_test_path(rel) or is_mock_path(rel)
 
 
 @dataclass
@@ -111,6 +130,35 @@ def declared_above(lines: list[str], symbol: str, start_line: int) -> bool:
     return False
 
 
+HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$")
+
+
+def is_text_path(rel: str) -> bool:
+    """A non-code file: prompt, template, Markdown, YAML, Dockerfile, ..."""
+    return os.path.splitext(rel)[1].lower() not in CODE_EXTS
+
+
+def _plain(text: str) -> str:
+    text = re.sub(r"^\s*#+\s*", "", text.strip()).strip("\"'`*")
+    return " ".join(text.lower().split())
+
+
+def quote_anchored(lines: list[str], quote: str, start: int, end: int) -> bool:
+    """True when quote appears in the cited lines or is the nearest heading above them."""
+    q = _plain(quote)
+    if not q:
+        return False
+    lo = max(0, start - 1 - SYMBOL_SLACK)
+    hi = min(len(lines), end + SYMBOL_SLACK)
+    if q in _plain(" ".join(lines[lo:hi])):
+        return True
+    for i in range(start - 1, -1, -1):
+        m = HEADING_RE.match(lines[i]) if i < len(lines) else None
+        if m:
+            return q in _plain(m.group(1))
+    return False
+
+
 def check_evidence(ev: Evidence, files: FileCache) -> Evidence:
     ev = ev.model_copy()
     ev.file = files.normalize(ev.file)
@@ -124,6 +172,12 @@ def check_evidence(ev: Evidence, files: FileCache) -> Evidence:
     if ev.end_line < ev.start_line:
         ev.end_line = ev.start_line
     ev.end_line = min(ev.end_line, len(lines))
+    if is_text_path(ev.file):
+        if not quote_anchored(lines, ev.symbol, ev.start_line, ev.end_line):
+            ev.ok, ev.note = False, f"quote '{ev.symbol.strip()[:60]}' not in cited lines"
+            return ev
+        ev.ok, ev.note = True, ""
+        return ev
     symbol = ev.symbol.strip().rsplit(".", 1)[-1].strip("()")
     if symbol:
         lo = max(0, ev.start_line - 1 - SYMBOL_SLACK)
