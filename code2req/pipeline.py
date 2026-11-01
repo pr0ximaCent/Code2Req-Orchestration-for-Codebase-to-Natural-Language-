@@ -19,10 +19,10 @@ from code2req.agents.asset_agent import run_asset
 from code2req.agents.module_agent import FollowUp, ModuleInput, TestSnippet, run_followup, run_module
 from code2req.cost import llm_task
 from code2req.dedup import assign_ids, dedup
-from code2req.llm import LLM
+from code2req.llm import LLM, BudgetReached
 from code2req.render_md import render_markdown
 from code2req.render_pdf import write_pdf
-from code2req.repofiles import list_repo_files
+from code2req.repofiles import list_repo_files, matches_globs
 from code2req.schema import Evidence, FlatRequirement, RunReport, Surface
 from code2req.structure import DEFAULT_MODULE_CHARS, Module, build_structure
 from code2req.surfaces import detect_surfaces
@@ -425,9 +425,12 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         max_module_chars: int = DEFAULT_MODULE_CHARS,
         progress: Progress | None = None, followup: bool = True,
         entries: list[str] | None = None, include_assets: bool = True,
-        target: str | None = None, stop: threading.Event | None = None) -> RunReport:
+        target: str | None = None, stop: threading.Event | None = None,
+        only_files: list[str] | None = None) -> RunReport:
     """target: what the user asked to analyse (a git URL or folder) when repo_path is a clone of it.
-    stop: once set, the run raises RunStopped at its next progress step or model call."""
+    stop: once set, the run raises RunStopped at its next progress step or model call.
+    only_files: globs; only code and asset modules with a file matching one are sent to the
+    model (an eval slice). Module prompts are unchanged, so their cached answers still apply."""
 
     def report_progress(stage: str, done: int, total: int) -> None:
         _check_stop(stop)
@@ -458,6 +461,10 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     structure = build_structure(repo_path, out_dir, llm, model, exclude, max_module_chars, files=source)
     components = structure.components
     modules = drop_dead_files(drop_test_components(structure.modules, components), components, reach)
+    if only_files:
+        modules = [m for m in modules
+                   if any(matches_globs(components[c].relative_path, only_files) for c in m.component_ids)
+                   or any(matches_globs(f, only_files) for f in m.extra_files)]
     dead = dead_components(modules, components, reach)
 
     files = build_file_cache(repo_path, components, surfaces)
@@ -469,11 +476,15 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
                                   for c in m.component_ids if c in dead])
               for i, m in enumerate(modules)]
     asset_modules = asset_files.build_modules(asset_set.assets, max_module_chars)
+    if only_files:
+        asset_modules = [a for a in asset_modules
+                         if any(matches_globs(asset.file, only_files) for asset, _, _ in a.units)]
     jobs: list[ModuleInput | asset_files.AssetModule] = [*inputs, *asset_modules]
 
     done = 0
     done_lock = threading.Lock()
     failed_modules: list[str] = []
+    budget_skipped: list[str] = []  # not analysed: the run's budget was spent
     report_progress("modules", 0, len(jobs))
 
     def one(job: ModuleInput | asset_files.AssetModule) -> tuple[list[FlatRequirement], list[FlatRequirement]]:
@@ -486,6 +497,9 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
                     return run_module(llm, job, components, files.lines), []
             with llm_task("asset"):
                 return run_asset(llm, job)
+        except BudgetReached:
+            budget_skipped.append(name)
+            return [], []
         except Exception as e:  # noqa: BLE001 - one module failing must not stop the run
             logger.error("module %s failed: %s", name, e)
             failed_modules.append(name)
@@ -526,6 +540,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
 
     internal: dict[str, str] = {}  # "module::function" -> reason the model gave
     links: Counter = Counter()  # call_graph / same_type / unlinked
+    followups_skipped = 0
     if followup:
         by_file: dict[str, list[Any]] = {}
         for n in components.values():
@@ -534,7 +549,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         cited_text = evidence_text([e for r in passed + gaps for e in r.evidence], files)
         todo: list[tuple[Module, list[Any], list[FlatRequirement], list[Surface]]] = []
         for i, m in enumerate(modules):
-            if m.name in failed_modules:
+            if m.name in failed_modules or m.name in budget_skipped:
                 continue
             fns = uncited_functions(m, components, passed + gaps, dead, types)
             open_surfaces = [s for s in surf_by_mod.get(i, []) if s.kind in FOLLOWUP_SURFACE_KINDS
@@ -547,11 +562,15 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         fdone = 0
 
         def follow(item: tuple[Module, list[Any], list[FlatRequirement], list[Surface]]) -> FollowUp:
-            nonlocal fdone
+            nonlocal fdone, followups_skipped
             m, fns, existing, open_surfaces = item
             try:
                 with llm_task("followup"):
                     return run_followup(llm, m, fns, existing, components, files.lines, open_surfaces)
+            except BudgetReached:
+                with done_lock:
+                    followups_skipped += 1
+                return FollowUp()
             except Exception as e:  # noqa: BLE001 - a failed follow-up keeps the first pass
                 logger.error("module %s follow-up failed: %s", m.name, e)
                 return FollowUp()
@@ -596,10 +615,12 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         "repo": repo_path,
         "target": target or repo_path,
         "model": model,
+        "only_files": only_files or [],
         "components": len(components),
         "modules": len(modules),
         "asset_modules": len(asset_modules),
         "failed_modules": failed_modules,
+        "budget_skipped": {"modules": budget_skipped, "followups": followups_skipped},
         "claims": len(claims) + len(ref_claims),
         "requirements": len(reqs),
         "references": len(references),

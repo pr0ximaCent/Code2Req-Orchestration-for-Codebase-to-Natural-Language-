@@ -27,11 +27,12 @@ def load_env(env_file: str | None) -> str | None:
     return None
 
 
-def build_llm(model: str | None) -> tuple[LLM, str]:
-    """A single LiteLLM model when given, else docreq's fallback chain. Returns (llm, label)."""
+def build_llm(model: str | None, reasoning: dict[str, str] | None = None) -> tuple[LLM, str]:
+    """A single LiteLLM model when given, else docreq's fallback chain. Returns (llm, label).
+    reasoning: thinking level per stage (see llm.REASONING_LEVELS); empty means provider defaults."""
     if model:
-        return LiteLLM(model), model
-    llm = FallbackLLM()
+        return LiteLLM(model, reasoning=reasoning), model
+    llm = FallbackLLM(reasoning=reasoning)
     usable = [str(m) for m in llm.models if m.configured()]
     if not usable:
         raise ValueError("no LLM credentials: set GEMINI_API_KEY / GEMINI_API_KEYS or "

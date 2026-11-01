@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 
 from code2req.cache import with_cache
 from code2req.config import is_git_url, prune_clone, referenced_files, resolve_repo, rmtree
-from code2req.llm import LLM
+from code2req.estimate import estimate
+from code2req.llm import LLM, with_budget
 from code2req.pipeline import RunStopped
 from code2req.pipeline import run as run_pipeline
 from code2req.render_pdf import render_pdf
@@ -51,6 +52,12 @@ class RunRequest(BaseModel):
     assets: bool = True  # include prompts, templates, reference files and CI/CD
     cache: bool = True  # reuse answers for modules whose code is unchanged
     keep_clone: bool = False  # git URL: keep the whole clone, not only the files the result cites
+    max_cost: float | None = Field(default=None, gt=0)  # stop paid calls once the run's API cost reaches it
+
+
+class EstimateRequest(BaseModel):
+    target: str = Field(min_length=1)
+    exclude: list[str] = Field(default_factory=list)
 
 
 class ReviewRequest(BaseModel):
@@ -212,7 +219,8 @@ class RunManager:
             llm, label = self.llm_factory()
             meta["model"] = label
             logger.info("run %s: %s (%s)", run_id, repo, label)
-            llm = with_cache(llm, label, enabled=req.cache, path=self.cache_path)
+            # The budget sits below the cache, so answers for unchanged code stay free after the cap.
+            llm = with_cache(with_budget(llm, req.max_cost), label, enabled=req.cache, path=self.cache_path)
             report = run_pipeline(repo, out_dir, llm, label, req.workers,
                                   req.exclude or None, req.max_module_chars, progress=progress,
                                   followup=req.followup, entries=req.entries or None,
@@ -234,6 +242,7 @@ class RunManager:
                 "provider_cost_usd": (st.get("cost") or {}).get("provider_cost_usd"),
                 "calls": (st.get("cost") or {}).get("calls"),
                 "reused": ((st.get("cost") or {}).get("cache") or {}).get("hits"),
+                "budget_skipped": len(st["budget_skipped"]["modules"]) + st["budget_skipped"]["followups"],
             }
             meta["status"] = "done"
         except RunStopped:
@@ -351,6 +360,25 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
     @app.post("/api/runs")
     def start_run(req: RunRequest) -> dict:
         return mgr.start(req)
+
+    @app.post("/api/estimate")
+    def estimate_run(req: EstimateRequest) -> dict:
+        """A first run's cost from the code size, without model calls. A git URL is
+        cloned into a temporary folder that is removed afterwards."""
+        target = req.target.strip().strip('"')
+        tmp = os.path.join(runs_dir, f"estimate-{uuid.uuid4().hex[:8]}") if is_git_url(target) else None
+        if tmp:
+            os.makedirs(tmp)
+        try:
+            est = estimate(resolve_repo(target, tmp or runs_dir), req.exclude or None)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except Exception as e:  # noqa: BLE001 - a failed clone is reported to the UI
+            raise HTTPException(400, getattr(e, "stderr", None) or str(e)) from e
+        finally:
+            if tmp and os.path.isdir(tmp):
+                rmtree(tmp)
+        return {**est.to_dict(), "lines_of_text": est.lines_of_text()}
 
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict:

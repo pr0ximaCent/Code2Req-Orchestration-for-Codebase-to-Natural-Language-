@@ -1,4 +1,6 @@
-"""code2req analyze <path|git-url> [--env-file .env] [--model <litellm model>] [--out DIR]
+"""code2req analyze <path|git-url> [--env-file .env] [--model <litellm model>] [--out DIR] [--max-cost USD]
+code2req estimate <path|git-url> [--exclude GLOB]
+code2req eval <path|git-url> --baseline requirements.json --slice GLOB [--noise eval.json] [--candidate run.json]
 code2req serve [--port 8765] [--env-file .env]
 code2req pdf <requirements.json> [-o report.pdf]"""
 
@@ -9,10 +11,22 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 
 from code2req.cache import with_cache
-from code2req.config import build_llm, is_git_url, load_env, prune_clone, referenced_files, resolve_repo
+from code2req.config import (
+    build_llm,
+    is_git_url,
+    load_env,
+    prune_clone,
+    referenced_files,
+    resolve_repo,
+    rmtree,
+)
 from code2req.cost import cost_lines
+from code2req.estimate import estimate
+from code2req.eval import eval_markdown, evaluate
+from code2req.llm import REASONING_LEVELS, with_budget
 from code2req.pipeline import run
 from code2req.render_pdf import write_pdf
 from code2req.structure import DEFAULT_MODULE_CHARS
@@ -27,20 +41,19 @@ def setup_logging(verbose: bool) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="code2req")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    env_help = ("dotenv file with GEMINI_API_KEY / AZURE_OPENAI_* "
-                "(e.g. the sysmodeler-backend-ai .env; env CODE2REQ_ENV_FILE). "
-                "Defaults to ./.env when present")
+ENV_HELP = ("dotenv file with GEMINI_API_KEY / AZURE_OPENAI_* "
+            "(e.g. the sysmodeler-backend-ai .env; env CODE2REQ_ENV_FILE). "
+            "Defaults to ./.env when present")
 
-    a = sub.add_parser("analyze", help="recover requirements from a codebase")
+
+def add_run_args(a: argparse.ArgumentParser, out: str) -> None:
+    """Options of a pipeline run, shared by analyze and eval."""
     a.add_argument("target", help="local path or git URL")
-    a.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
+    a.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=ENV_HELP)
     a.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"),
                    help="single LiteLLM model instead of the docreq fallback chain "
                         "(env CODE2REQ_MODEL)")
-    a.add_argument("--out", default="code2req-out")
+    a.add_argument("--out", default=out)
     a.add_argument("--workers", type=int, default=4)
     a.add_argument("--exclude", action="append", default=None,
                    help="glob to exclude (repeatable)")
@@ -54,9 +67,79 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--no-cache", action="store_true",
                    help="call the model for every module even when its code is unchanged since a "
                         "cached run (cache: ~/.cache/code2req or env CODE2REQ_CACHE)")
+    a.add_argument("--max-cost", type=float, default=None, metavar="USD",
+                   help="stop making paid model calls once the run's provider cost reaches USD; the run "
+                        "finishes with what it has (cached answers are still used)")
+    a.add_argument("--reasoning", action="append", default=None, metavar="[STAGE=]LEVEL",
+                   help=f"thinking level ({', '.join(REASONING_LEVELS)}) for every stage, or for one "
+                        "stage (module, followup, asset, cluster) as STAGE=LEVEL (repeatable); "
+                        "default: the provider's own (high for Gemini 3)")
+    a.add_argument("-v", "--verbose", action="store_true")
+
+
+def parse_reasoning(values: list[str] | None) -> dict[str, str]:
+    """["low"] -> {"*": "low"}; ["followup=low", "module=high"] -> per stage."""
+    out: dict[str, str] = {}
+    for v in values or []:
+        stage, _, level = v.rpartition("=")
+        level = level.strip().lower()
+        if level not in REASONING_LEVELS:
+            raise ValueError(f"--reasoning {v!r}: level must be one of {', '.join(REASONING_LEVELS)}")
+        out[stage.strip().lower() or "*"] = level
+    return out
+
+
+def write_eval(args: argparse.Namespace, candidate: dict) -> int:
+    """Compare a slice run with the baseline; exit code 1 when a check fails."""
+    with open(args.baseline, encoding="utf-8") as f:
+        baseline = json.load(f)
+    noise = None
+    if args.noise:
+        with open(args.noise, encoding="utf-8") as f:
+            noise = json.load(f)
+    ev = evaluate(baseline, candidate, args.slice, noise)
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "eval.json"), "w", encoding="utf-8") as f:
+        json.dump(ev, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(args.out, "eval.md"), "w", encoding="utf-8") as f:
+        f.write(eval_markdown(ev))
+    c = ev["candidate"]
+    print(f"eval {'passed' if ev['passed'] else 'FAILED'}: recall {ev['matched']}/{ev['baseline']['requirements']} "
+          f"({ev['recall']:.0%}); {c['requirements']} requirements, {c['rejected']} rejected; "
+          f"cost ${c['cost_usd'] or 0:.4f}"
+          + (f" ({ev['cost_saving_vs_noise_run']:.0%} less than the noise run)"
+             if ev["cost_saving_vs_noise_run"] is not None else ""))
+    for check in ev["checks"]:
+        if not check["ok"]:
+            print(f"  failed: {check['metric']} = {check['value']} (needed {check['needed']})")
+    print(f"wrote {os.path.join(args.out, 'eval.md')} and eval.json")
+    return 0 if ev["passed"] else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="code2req")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    env_help = ENV_HELP
+
+    a = sub.add_parser("analyze", help="recover requirements from a codebase")
+    add_run_args(a, out="code2req-out")
     a.add_argument("--keep-clone", action="store_true",
                    help="for a git URL, keep the whole clone instead of only the files the result cites")
-    a.add_argument("-v", "--verbose", action="store_true")
+
+    v = sub.add_parser("eval", help="run a slice of the code and compare it with a baseline run")
+    add_run_args(v, out="code2req-eval")
+    v.add_argument("--baseline", required=True, help="requirements.json of the baseline run")
+    v.add_argument("--slice", action="append", required=True, metavar="GLOB",
+                   help="files of the slice, e.g. 'pkg/modules/exiftool/*' (repeatable)")
+    v.add_argument("--candidate", help="compare this requirements.json instead of running the slice "
+                                       "(no model calls)")
+    v.add_argument("--noise", help="eval.json of a noise run (same config as the baseline, cache off): "
+                                   "sets the recall bar and the band every other metric must stay in")
+
+    e = sub.add_parser("estimate", help="estimate a first run's cost from the code size, without model calls")
+    e.add_argument("target", help="local path or git URL")
+    e.add_argument("--exclude", action="append", default=None, help="glob to exclude (repeatable)")
+    e.add_argument("-v", "--verbose", action="store_true")
 
     s = sub.add_parser("serve", help="start the local web UI")
     s.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
@@ -79,9 +162,27 @@ def main(argv: list[str] | None = None) -> int:
             result = json.load(f)
         print(f"wrote {write_pdf(result, args.out or os.path.splitext(args.json)[0] + '.pdf')}")
         return 0
+    if args.cmd == "estimate":  # no model needed
+        target = args.target.strip().strip('"')
+        tmp = tempfile.mkdtemp(prefix="code2req-estimate-") if is_git_url(target) else None
+        try:
+            repo = resolve_repo(target, tmp or ".")
+            for line in estimate(repo, args.exclude).lines_of_text():
+                print(line)
+        except (ValueError, subprocess.CalledProcessError) as err:
+            p.error(str(err))
+        finally:
+            if tmp:
+                rmtree(tmp)
+        return 0
+    if args.cmd == "eval" and args.candidate:  # compare two finished runs, no model needed
+        with open(args.candidate, encoding="utf-8") as f:
+            return write_eval(args, json.load(f))
+    if args.cmd in ("analyze", "eval") and args.max_cost is not None and args.max_cost <= 0:
+        p.error("--max-cost must be more than 0")
     try:
         load_env(args.env_file)
-        llm, label = build_llm(args.model)
+        llm, label = build_llm(args.model, parse_reasoning(getattr(args, "reasoning", None)))
     except (FileNotFoundError, ValueError) as e:
         p.error(str(e))
     logging.getLogger("code2req").info("llm: %s", label)
@@ -101,10 +202,17 @@ def main(argv: list[str] | None = None) -> int:
         repo = resolve_repo(args.target, args.out)
     except (ValueError, subprocess.CalledProcessError) as e:
         p.error(str(e))
-    llm = with_cache(llm, label, enabled=not args.no_cache)
+    if args.cmd == "analyze":
+        for line in estimate(repo, args.exclude).lines_of_text()[:2]:
+            print(line)
+    # The budget sits below the cache, so answers for unchanged code stay free after the cap.
+    llm = with_cache(with_budget(llm, args.max_cost), label, enabled=not args.no_cache)
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
                  target=args.target.strip().strip('"'),
-                 followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets)
+                 followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets,
+                 only_files=args.slice if args.cmd == "eval" else None)
+    if args.cmd == "eval":
+        return write_eval(args, report.to_json())
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
         kept, removed = prune_clone(repo, referenced_files(report))
         print(f"clone pruned to the {kept} files the result cites ({removed} removed, git data dropped)")
@@ -124,6 +232,10 @@ def main(argv: list[str] | None = None) -> int:
               f"{ac['dead']} non-code files; {st['dead_requirements']} claims about dead code set aside")
     else:
         print("dead code: not analysed (no entry point found; pass --entry)")
+    skipped = st["budget_skipped"]
+    if skipped["modules"] or skipped["followups"]:
+        print(f"budget reached: {len(skipped['modules'])} module(s) and {skipped['followups']} follow-up(s) "
+              f"not analysed; re-run with a higher --max-cost to finish (answers so far are cached)")
     for line in cost_lines(st.get("cost")):
         print(line)
     pdf = "requirements.pdf, " if os.path.isfile(os.path.join(args.out, "requirements.pdf")) else ""

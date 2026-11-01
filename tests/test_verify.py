@@ -123,6 +123,88 @@ def test_citation_inside_long_constant_or_method_matches_declaration():
     assert "add_item" in files.enclosing_symbols("app/api.py", 26, 27)
 
 
+def test_citation_inside_tsx_component_or_nested_handler_matches_declaration():
+    # Real-run cases from a React frontend, rejected before because `function` and
+    # `export default` were not declarations and only column-0 lines were looked at.
+    from code2req.verify import declared_above
+    tsx = [
+        'import { useState } from "react";',                       # 1
+        "",                                                         # 2
+        "export default function TermsPage() {",                    # 3
+        "    const [open, setOpen] = useState(false);",             # 4
+        "    const handleKeyDown = (e: React.KeyboardEvent) => {",  # 5
+        '        if (e.key === "Backspace" && !open) {',            # 6
+        "            setOpen(true);",                               # 7
+        "        }",                                                # 8
+        "    };",                                                   # 9
+        "    const handleSubmit = async (",                         # 10
+        "        values: FormValues,",                              # 11
+        "    ) => {",                                               # 12
+        "        if (values.name) {",                               # 13
+        "            await save(values);",                          # 14
+        "        }",                                                # 15
+        "    };",                                                   # 16
+        "    return (",                                             # 17
+        "        <div onKeyDown={handleKeyDown}>",                  # 18
+        '            <p>{open ? "a" : "b"}</p>',                    # 19
+        "        </div>",                                           # 20
+        "    );",                                                   # 21
+        "}",                                                        # 22
+        "",                                                         # 23
+        "function PackageNode({ id }: Props) {",                    # 24
+        "    return <div>{id}</div>;",                              # 25
+        "}",                                                        # 26
+    ]
+    assert declared_above(tsx, "TermsPage", 19)
+    assert declared_above(tsx, "handleKeyDown", 7)
+    assert declared_above(tsx, "handleSubmit", 14)  # multi-line parameter list
+    assert declared_above(tsx, "TermsPage", 14)
+    assert declared_above(tsx, "PackageNode", 25)
+    # a sibling handler that closed above does not enclose the JSX
+    assert not declared_above(tsx, "handleKeyDown", 19)
+    assert not declared_above(tsx, "handleSubmit", 7)
+    assert not declared_above(tsx, "TermsPage", 25)
+    # parameter types on the declaration line are not what it declares
+    assert not declared_above(tsx, "Props", 25)
+    assert not declared_above(tsx, "FormValues", 14)
+    assert not declared_above(tsx, "KeyboardEvent", 7)
+    # a Go method's receiver type still counts, its parameter types do not
+    go = ["func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {",
+          "\tif err := decode(r); err != nil {",
+          "\t\thttp.Error(w, err.Error(), 400)",
+          "\t}",
+          "}"]
+    assert declared_above(go, "Handle", 3)
+    assert declared_above(go, "Server", 3)
+    assert not declared_above(go, "Request", 3)
+
+
+def test_tsx_components_are_extracted_with_full_ranges():
+    from code2req import structure
+
+    structure._import_codewiki_config()
+    from codewiki.src.be.dependency_analyzer.analyzers.typescript import (
+        analyze_typescript_file_treesitter,
+    )
+    src = "\n".join([
+        'import { cn } from "@/lib/utils";',
+        "",
+        "function PackageNode({ id, data }: Props) {",
+        "    const label = data.name ?? id;",
+        "    return (",
+        '        <div className={cn("rounded border")}>',
+        "            <span>{label}</span>",
+        "        </div>",
+        "    );",
+        "}",
+        "",
+        "export default PackageNode;",
+    ])
+    nodes, _ = analyze_typescript_file_treesitter("src/nodes/package.tsx", src, "")
+    ranges = {n.name: (n.start_line, n.end_line) for n in nodes}
+    assert ranges.get("PackageNode") == (3, 10)
+
+
 def test_non_code_files_are_anchored_by_quote_or_heading(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "plan.md").write_text(

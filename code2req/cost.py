@@ -117,6 +117,10 @@ def llm_task(name: str):
         _task.name = prev
 
 
+def current_task() -> str:
+    return getattr(_task, "name", None) or "other"
+
+
 @dataclass
 class UsageLedger:
     total: _Slice = field(default_factory=_Slice)
@@ -197,6 +201,10 @@ def cost_lines(c: dict | None) -> list[str]:
     if c.get("unpriced_models"):
         lines.append("Not priced (no rate in SysModeler's tables, counted as $0): "
                      + ", ".join(c["unpriced_models"]))
+    budget = c.get("budget") or {}
+    if budget.get("reached"):
+        lines.append(f"Budget cap ${budget['max_cost_usd']:.2f} reached: {budget['refused_calls']} paid call(s) "
+                     f"refused, so part of the code was not analysed (cached answers were still used)")
     if reused:
         lines.append(reused)
     return lines

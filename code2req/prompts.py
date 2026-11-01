@@ -22,6 +22,11 @@ ATTRIBUTE_RULES = """ATTRIBUTES - populate "attributes" when the requirement sta
 - multiplicity: "".
 """
 
+# Pretty-printed JSON is a third of a reply's tokens (measured on cached answers), and
+# empty fields default to empty when parsed, so compact output loses nothing.
+COMPACT_JSON = ("Write the JSON compactly, without indentation or line breaks, and leave out every field "
+                "whose value would be empty (\"\" or []): it defaults to empty.")
+
 MODULE_SYSTEM = """You reverse-engineer software requirements from source code.
 
 You are given one module of a codebase: its source code with line numbers, the observable surfaces found in it (routes, CLI commands, env vars, constants, data models), and tests that exercise it.
@@ -56,25 +61,10 @@ TYPE: one of functional, performance, interface, safety, constraint, design.
 CLAIM KEY: claim_attribute and claim_value are lowercase snake_case, no verbs (e.g. "login_attempts" / "max_5_per_minute"). Same obligation -> same pair.
 
 """ + NAMING_RULES + "\n" + ATTRIBUTE_RULES + """
-Return ONLY valid JSON:
-{
-  "requirements": [
-    {
-      "text": "The system shall ...",
-      "type": "functional",
-      "confidence": "inferred",
-      "canonical_name": "...",
-      "group_id": "...",
-      "subject_name": "",
-      "actors": [],
-      "claim_attribute": "...",
-      "claim_value": "...",
-      "attributes": [],
-      "evidence": [{"file": "...", "start_line": 1, "end_line": 5, "symbol": "..."}]
-    }
-  ]
-}
-If the module implements nothing worth a requirement, return {"requirements": []}.
+Return ONLY valid JSON of this shape. """ + COMPACT_JSON + """
+{"requirements":[{"text":"The system shall ...","type":"functional","confidence":"inferred","canonical_name":"...","group_id":"...","claim_attribute":"...","claim_value":"...","evidence":[{"file":"...","start_line":1,"end_line":5,"symbol":"..."}]}]}
+Add "subject_name", "actors" and "attributes" to an item only when they have a value (see NAMING and ATTRIBUTES).
+If the module implements nothing worth a requirement, return {"requirements":[]}.
 """
 
 FOLLOWUP_SYSTEM = MODULE_SYSTEM + """
@@ -89,8 +79,8 @@ A function that enforces a rule, limit, check, fallback, security filter or erro
 SURFACES listed as not covered (routes, CLI flags and commands, env vars, constants, errors) are part of the external contract: write a requirement for each one that states what it does, its default or values, citing its line. Several flags of one feature may share one requirement if it names each of them.
 Do not restate an existing requirement. Do not invent behaviour.
 
-Return ONLY valid JSON:
-{"requirements": [ ... same item shape as above ... ], "covered": [{"function": "...", "by": "R3"}], "internal": [{"function": "...", "reason": "getter"}]}
+Return ONLY valid JSON of this shape, compact as above:
+{"requirements":[ ... same item shape as above ... ],"covered":[{"function":"...","by":"R3"}],"internal":[{"function":"...","reason":"getter"}]}
 """
 
 ASSET_SYSTEM = """You reverse-engineer requirements from the non-code files that shape a software system: LLM prompts, agent skills, message templates, reference material and CI/CD definitions.
@@ -121,10 +111,8 @@ TYPE: one of functional, performance, interface, safety, constraint, design. Out
 CLAIM KEY: claim_attribute and claim_value are lowercase snake_case, no verbs (e.g. "plan_output_format" / "numbered_steps"). Same obligation -> same pair.
 
 """ + NAMING_RULES + "\n" + ATTRIBUTE_RULES + """
-Return ONLY valid JSON:
-{
-  "requirements": [ {"text": "...", "type": "constraint", "confidence": "inferred", "canonical_name": "...", "group_id": "...", "subject_name": "", "actors": [], "claim_attribute": "...", "claim_value": "...", "attributes": [], "evidence": [{"file": "...", "start_line": 1, "end_line": 5, "symbol": "..."}]} ],
-  "references": [ ... same item shape ... ]
-}
-If the files hold nothing worth either list, return {"requirements": [], "references": []}.
+Return ONLY valid JSON of this shape. """ + COMPACT_JSON + """
+{"requirements":[{"text":"...","type":"constraint","confidence":"inferred","canonical_name":"...","group_id":"...","claim_attribute":"...","claim_value":"...","evidence":[{"file":"...","start_line":1,"end_line":5,"symbol":"..."}]}],"references":[ ... same item shape ... ]}
+Add "subject_name", "actors" and "attributes" to an item only when they have a value (see NAMING and ATTRIBUTES).
+If the files hold nothing worth either list, return {"requirements":[],"references":[]}.
 """

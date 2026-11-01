@@ -17,9 +17,19 @@ import threading
 import time
 from typing import Protocol
 
-from code2req.cost import UsageLedger
+from code2req.cost import UsageLedger, current_task
 
 logger = logging.getLogger(__name__)
+
+# Thinking levels per stage ("module", "followup", "asset", "cluster", or "*" for all).
+# Gemini 3 takes a level, not a token budget: LiteLLM maps reasoning_effort to thinkingLevel
+# (Pro accepts low and high; minimal is Flash-only). Unset means the provider default (high).
+REASONING_LEVELS = ("minimal", "low", "medium", "high")
+
+
+def stage_level(reasoning: dict[str, str]) -> str:
+    """The thinking level for the stage the current call belongs to, "" for the default."""
+    return reasoning.get(current_task()) or reasoning.get("*", "")
 
 
 class LLM(Protocol):
@@ -46,19 +56,26 @@ def record_litellm_usage(ledger: UsageLedger, model: str, resp: object) -> None:
 
 class LiteLLM:
     def __init__(self, model: str, max_retries: int = 3, temperature: float = 0.0,
-                 max_tokens: int = 16_000, timeout: float = 300.0):
+                 max_tokens: int = 16_000, timeout: float = 300.0,
+                 reasoning: dict[str, str] | None = None):
         self.model = model
         self.max_retries = max_retries
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.reasoning = reasoning or {}
         self.ledger = UsageLedger()
         self._turn = itertools.count()
         self._dead_keys: set[str] = set()  # invalid or out of daily quota; skipped for the run
 
     @property
     def usage(self) -> dict:
-        return self.ledger.summary()
+        return {**self.ledger.summary(), **({"reasoning": dict(self.reasoning)} if self.reasoning else {})}
+
+    def route_key(self) -> str:
+        """Part of the answer-cache key: an answer given at one thinking level is not another's."""
+        level = stage_level(self.reasoning)
+        return f"reasoning={level}" if level else ""
 
     def complete(self, system: str, user: str, json_mode: bool = False) -> str:
         import litellm
@@ -68,6 +85,8 @@ class LiteLLM:
                   "max_tokens": self.max_tokens, "timeout": self.timeout}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if level := stage_level(self.reasoning):
+            kwargs["reasoning_effort"] = level
         # LiteLLM itself only reads GEMINI_API_KEY; use the same keys as the docreq chain,
         # so a GEMINI_API_KEYS pool works too (rotated, a retry gets the next key).
         pooled = self.model.startswith("gemini/") and bool(gemini_keys())
@@ -181,10 +200,11 @@ class FallbackLLM:
     """
 
     def __init__(self, models: list[_Model] | None = None, temperature: float = 0.0,
-                 max_tokens: int = 32_000, sleep=time.sleep):
+                 max_tokens: int = 32_000, sleep=time.sleep, reasoning: dict[str, str] | None = None):
         self.models = models or docreq_models()
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.reasoning = reasoning or {}
         self._sleep = sleep
         self.ledger = UsageLedger()
         self._lock = threading.Lock()
@@ -217,7 +237,12 @@ class FallbackLLM:
 
     @property
     def usage(self) -> dict:
-        return self.ledger.summary()
+        return {**self.ledger.summary(), **({"reasoning": dict(self.reasoning)} if self.reasoning else {})}
+
+    def route_key(self) -> str:
+        """Part of the answer-cache key: an answer given at one thinking level is not another's."""
+        level = stage_level(self.reasoning)
+        return f"reasoning={level}" if level else ""
 
     def _call_gemini(self, m: _Model, system: str, user: str, json_mode: bool) -> str:
         import litellm
@@ -230,6 +255,8 @@ class FallbackLLM:
                   "timeout": MAX_ATTEMPT_SECONDS}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if level := stage_level(self.reasoning):
+            kwargs["reasoning_effort"] = level
         try:
             resp = litellm.completion(**kwargs)
         except Exception as e:
@@ -251,6 +278,8 @@ class FallbackLLM:
                   "max_output_tokens": self.max_tokens}
         if json_mode:
             kwargs["text"] = {"format": {"type": "json_object"}}
+        if level := stage_level(self.reasoning):
+            kwargs["reasoning"] = {"effort": level}
         resp = client.responses.create(**kwargs)
         u = getattr(resp, "usage", None)
         # SysModeler's openai/cost.go bills all output tokens (reasoning included).
@@ -299,6 +328,51 @@ class FallbackLLM:
                 if attempt < m.max_retries:
                     self._sleep(retry_wait(err, attempt))
         raise RuntimeError(f"all models failed: {last_err}")
+
+
+class BudgetReached(RuntimeError):
+    """A paid call was refused because the run has spent its budget."""
+
+
+class BudgetLLM:
+    """Refuses new paid calls once the wrapped chain's provider cost reaches max_cost_usd.
+
+    Wrap the paying LLM and put the answer cache outside, so cached answers are still
+    returned after the cap. Calls already in flight finish, so a run with several
+    workers can end slightly above the cap.
+    """
+
+    def __init__(self, inner: LLM, max_cost_usd: float):
+        self.inner = inner
+        self.max_cost_usd = max_cost_usd
+        self._lock = threading.Lock()
+        self.refused = 0
+
+    def _spent(self) -> float:
+        return (getattr(self.inner, "usage", None) or {}).get("provider_cost_usd", 0.0)
+
+    def complete(self, system: str, user: str, json_mode: bool = False) -> str:
+        spent = self._spent()
+        if spent >= self.max_cost_usd:
+            with self._lock:
+                self.refused += 1
+            raise BudgetReached(f"budget ${self.max_cost_usd:.2f} reached (spent ${spent:.2f})")
+        return self.inner.complete(system, user, json_mode=json_mode)
+
+    @property
+    def usage(self) -> dict | None:
+        inner = getattr(self.inner, "usage", None)
+        if inner is None:
+            return None
+        return {**inner, "budget": {"max_cost_usd": self.max_cost_usd, "reached": self.refused > 0,
+                                    "refused_calls": self.refused}}
+
+    def __getattr__(self, name: str):  # ledger, ... of the wrapped LLM
+        return getattr(self.inner, name)
+
+
+def with_budget(llm: LLM, max_cost_usd: float | None) -> LLM:
+    return llm if max_cost_usd is None else BudgetLLM(llm, max_cost_usd)
 
 
 MAX_RATE_LIMIT_WAIT = 60.0

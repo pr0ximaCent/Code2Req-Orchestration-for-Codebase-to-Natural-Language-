@@ -51,7 +51,12 @@ class CachedLLM:
         self.saved_cost_usd = self.saved_provider_cost_usd = 0.0
 
     def _key(self, system: str, user: str, json_mode: bool) -> str:
-        raw = json.dumps([KEY_VERSION, self.label, system, user, json_mode], ensure_ascii=False)
+        # The inner LLM's route for this stage (its thinking level), when it sets one. Left out
+        # when empty, so answers cached before routing existed keep their keys.
+        route = getattr(self.inner, "route_key", None)
+        route = route() if callable(route) else ""
+        parts = [KEY_VERSION, self.label, system, user, json_mode] + ([route] if route else [])
+        raw = json.dumps(parts, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def complete(self, system: str, user: str, json_mode: bool = False) -> str:
