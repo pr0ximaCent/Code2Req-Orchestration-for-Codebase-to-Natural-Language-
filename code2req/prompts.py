@@ -98,7 +98,7 @@ SYSML_MODULE_SYSTEM = """You write the requirements a SysML v2 model of a softwa
 You are given one module of the codebase: its source code with line numbers, the surfaces found in it (routes, CLI commands and flags, env vars, constants, errors), and a BUDGET: the most requirements to write for it.
 
 A model generator turns every requirement into model elements, so write only requirements of these kinds:
-- interface: a route, command, group of flags, env var, message or file format the module accepts or produces. Name it exactly: HTTP method and path, command and flag names, env var names, status codes, field names.
+- interface: a route, command, group of flags, env var, message or file format the module accepts or produces. Name it exactly: HTTP method and path, command and flag names, env var names, status codes, field names. Every HTTP route listed under SURFACES gets a requirement of its own that names its method and path; the BUDGET always has room for one per route.
 - performance or constraint: a limit, default, size, timeout, retry count or set of allowed values, with "attributes".
 - functional: an end-to-end behaviour: what starts it, its steps in order, the decisions it makes and what happens on failure, and what it sends to or receives from other parts of the system or external systems. When the code has explicit states (a status with fixed values and the code that changes it), state the states and what moves between them.
 - safety: an authentication, authorization, input filtering, data protection or error-mapping rule.

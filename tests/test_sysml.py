@@ -5,7 +5,7 @@ import shutil
 
 from code2req.cli import main
 from code2req.dedup import dedup
-from code2req.eval import evaluate_sysml, limits_kept
+from code2req.eval import evaluate_sysml, limits_kept, named_in
 from code2req.pipeline import MAX_REQUIREMENTS, requirement_budgets, run
 from code2req.prompts import SYSML_ASSET_SYSTEM, SYSML_MODULE_SYSTEM
 from code2req.schema import Evidence, FlatRequirement
@@ -51,8 +51,8 @@ def test_sysml_profile_budgets_the_prompt_and_skips_followup_tests_and_report(tm
 
     assert len(llm.calls) == 1  # one module call, no follow-up
     prompt = llm.calls[0][1]
-    # 35 lines and two routes: the minimum of 2, which is also one per route.
-    assert prompt.startswith("MODULE: app\nBUDGET: at most 2 requirements")
+    # 35 lines and two routes: one per route plus the minimum of 2.
+    assert prompt.startswith("MODULE: app\nBUDGET: at most 4 requirements")
     assert "### F1 app/api.py (whole file, lines 1-35)" in prompt
     assert "TESTS THAT EXERCISE" not in prompt
     # F-ids resolve to the listed file; the restated limit is merged into the first one.
@@ -64,7 +64,7 @@ def test_sysml_profile_budgets_the_prompt_and_skips_followup_tests_and_report(tm
     assert sorted(e.note for r in report.rejected for e in r.evidence) == ["file not found",
                                                                           "start_line outside file"]
     st = report.stats
-    assert st["profile"] == "sysml" and st["budget_total"] == 2 and st["dedup_dropped"] == 1
+    assert st["profile"] == "sysml" and st["budget_total"] == 4 and st["dedup_dropped"] == 1
     with open(f"{FIXTURE}/app/api.py", encoding="utf-8") as f:
         assert st["code_lines"] == len(f.read().splitlines())
     assert (tmp_path / "requirements.json").is_file() and not (tmp_path / "requirements.pdf").exists()
@@ -133,7 +133,8 @@ def test_sections_name_whole_modules_as_short_as_stays_unique():
 
 def test_budgets_follow_prompt_size_and_routes_and_fit_the_repo_cap():
     assert requirement_budgets([0, 150, 640, 5000]) == [2, 2, 6, 10]
-    assert requirement_budgets([150, 900, 900], [7, 3, 15]) == [7, 9, 15]  # at least one per route
+    # one per route plus the minimum for the rest, when that is more than the size gives
+    assert requirement_budgets([150, 900, 900, 581], [7, 3, 15, 9]) == [9, 9, 17, 11]
     many = requirement_budgets([1000] * 100)
     assert set(many) == {4} and sum(many) <= MAX_REQUIREMENTS
 
@@ -157,15 +158,17 @@ def ev_req(text, file="app/api.py", section="app", attributes=()):
             "evidence": [{"file": file, "start_line": 1, "end_line": 5, "symbol": ""}]}
 
 
-def sysml_result(reqs, uncovered=(), budget=10, rejected=()):
+def sysml_result(reqs, budget=10, rejected=()):
+    """Ten routes, GET /r1 to GET /r10, which a requirement covers by naming them."""
     surfaces = [{"kind": "http_route", "name": f"GET /r{i}", "file": "app/api.py", "line": i, "end_line": i}
                 for i in range(1, 11)]
     surfaces.append({"kind": "test", "name": "test_x", "file": "tests/test_api.py", "line": 1, "end_line": 2})
     return {"requirements": list(reqs), "gaps": [], "rejected": list(rejected), "surfaces": surfaces,
             "stats": {"budget_total": budget, "code_lines": 2000, "only_files": ["app/*"],
                       "cost": {"provider_cost_usd": 0.5},
-                      "surface_coverage": {"uncovered": [f"[http_route] GET /r{i} - app/api.py:{i}"
-                                                         for i in uncovered]}}}
+                      # The run's own overlap-based coverage says every route is covered; the eval
+                      # goes by what the requirements name.
+                      "surface_coverage": {"uncovered": []}}}
 
 
 def test_limits_kept_counts_baseline_values_stated_for_the_same_file():
@@ -184,20 +187,31 @@ def test_limits_kept_counts_baseline_values_stated_for_the_same_file():
 def test_sysml_eval_checks_what_model_generation_needs():
     globs = ["app/*"]
     base = sysml_result([ev_req(f"R{i}", attributes=[("limit", i)]) for i in range(5)])
-    good = sysml_result([ev_req(f"Covers {i}", attributes=[("limit", i)]) for i in range(5)], uncovered=[3])
+    pairs = [(1, 2), (4, 5), (6, 7), (8, 9), (10, 10)]  # GET /r3 is named by no requirement
+    good = sysml_result([ev_req(f"The API shall answer GET /r{a} and GET /r{b}.", attributes=[("limit", i)])
+                         for i, (a, b) in enumerate(pairs)])
     ev = evaluate_sysml(base, good, globs)
     assert ev["passed"], ev["checks"]
     c = ev["candidate"]
     assert (c["surfaces_covered"], c["surfaces_total"], c["limits_kept"], c["usd_per_1k_lines"]) == (9, 10, 1.0, 0.25)
 
-    bad = sysml_result([ev_req(f"Part {i}", section="routes (part 1)") for i in range(31)], uncovered=[1, 2],
-                       budget=20)
+    bad = sysml_result([ev_req(f"Part {i}", section="routes (part 1)") for i in range(31)], budget=20)
     failed = {x["metric"] for x in evaluate_sysml(base, bad, globs)["checks"] if not x["ok"]}
     assert failed == {"surface_ratio", "limits_kept", "split_sections", "largest_section", "requirements"}
 
 
+def test_a_surface_counts_as_covered_only_when_a_requirement_names_it():
+    route = {"kind": "http_route", "name": "POST /forms/pdfengines/stamp"}
+    assert named_in(route, "The module shall provide a POST /forms/pdfengines/stamp route.")
+    assert not named_in(route, "The module shall provide a POST /forms/pdfengines/stamps route.")
+    assert not named_in({"kind": "http_route", "name": "GET /r1"}, "GET /r10")
+    flag = {"kind": "cli_command", "name": "--webhook-max-retry"}
+    assert named_in(flag, "retry up to `--webhook-max-retry` (default 4) times")
+    assert not named_in(flag, "retry up to --webhook-max-retry-wait times")
+
+
 def test_eval_command_with_sysml_needs_no_baseline(tmp_path, capsys):
-    cand = sysml_result([ev_req("The API shall answer GET /r1.")])
+    cand = sysml_result([ev_req("The API shall answer " + ", ".join(f"GET /r{i}" for i in range(1, 11)) + ".")])
     (tmp_path / "cand.json").write_text(json.dumps(cand), encoding="utf-8")
     code = main(["eval", ".", "--sysml", "--slice", "app/*", "--candidate", str(tmp_path / "cand.json"),
                  "--out", str(tmp_path / "ev")])

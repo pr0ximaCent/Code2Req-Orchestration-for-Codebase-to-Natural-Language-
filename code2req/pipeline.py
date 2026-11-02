@@ -431,10 +431,11 @@ def type_coverage(modules: list[Module], components: dict[str, Any], reqs: list[
 def requirement_budgets(lines: list[int], routes: list[int] | None = None) -> list[int]:
     """Most requirements to ask for, per prompt of the given number of lines, scaled down
     together when the repo would pass MAX_REQUIREMENTS. A prompt gets at least one per HTTP
-    route it declares: each route is a port of the model, and on gotenberg a size-only budget
-    left the last routes of a 15-route file without one."""
+    route it declares, plus MIN_BUDGET for the rest of its behaviour: each route is a port of
+    the model. On gotenberg a size-only budget left the last routes of a 15-route file without
+    one, and exactly one per route was spent partly on configuration, leaving two unnamed."""
     routes = routes or [0] * len(lines)
-    budgets = [max(r, min(MAX_BUDGET, max(MIN_BUDGET, round(n / LINES_PER_REQUIREMENT))))
+    budgets = [max(r + MIN_BUDGET if r else 0, min(MAX_BUDGET, max(MIN_BUDGET, round(n / LINES_PER_REQUIREMENT))))
                for n, r in zip(lines, routes)]
     total = sum(budgets)
     if total > MAX_REQUIREMENTS:

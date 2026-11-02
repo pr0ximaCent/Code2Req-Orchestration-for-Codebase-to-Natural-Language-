@@ -187,14 +187,35 @@ def limits_kept(baseline: list[dict], candidate: list[dict]) -> tuple[int, int]:
     return kept, len(limits)
 
 
+NAMED_SURFACE_KINDS = ("http_route", "cli_command", "env_var")
+
+
+def named_in(surface: dict, text: str) -> bool:
+    """Whether the text names the surface: a route by its path, a flag or env var by its name."""
+    if surface["kind"] == "cli_command":  # "--webhook-max-retry", with or without its dashes
+        name = surface["name"].lstrip("-")
+        pattern = rf"(?<![\w-])(?:--?)?{re.escape(name)}(?![\w-])"
+    else:
+        name = surface["name"].split(" ", 1)[-1] if surface["kind"] == "http_route" else surface["name"]
+        pattern = rf"(?<![\w/{{}}-]){re.escape(name)}(?![\w/{{}}-])"
+    return bool(name) and re.search(pattern, text) is not None
+
+
 def sysml_metrics(result: dict, globs: list[str], baseline: dict | None = None) -> dict:
     reqs = _slice_reqs(result, globs)
     st = result.get("stats", {})
     sections = Counter(r.get("section", "") for r in reqs)
     surfaces = [s for s in result.get("surfaces", [])
                 if s["kind"] in SYSML_SURFACE_KINDS and matches_globs(s["file"], globs)]
-    uncovered = [u for u in (st.get("surface_coverage") or {}).get("uncovered", [])
-                 if u[1:].split("]", 1)[0] in SYSML_SURFACE_KINDS and matches_globs(_uncovered_file(u), globs)]
+    # A route, flag or env var becomes a port or attribute only when a requirement names it. The
+    # run's own coverage also counts a citation that spans the route's lines, which a broad
+    # citation does for routes it never mentions (gotenberg: 15/15 "covered", 13 named).
+    texts = "\n".join(r.get("text", "") for r in reqs)
+    uncovered = [f"[{s['kind']}] {s['name']} - {s['file']}:{s['line']}" for s in surfaces
+                 if s["kind"] in NAMED_SURFACE_KINDS and not named_in(s, texts)]
+    uncovered += [u for u in (st.get("surface_coverage") or {}).get("uncovered", [])
+                  if u[1:].split("]", 1)[0] in SYSML_SURFACE_KINDS and u[1:].split("]", 1)[0] not in NAMED_SURFACE_KINDS
+                  and matches_globs(_uncovered_file(u), globs)]
     kept, limits = limits_kept(_slice_reqs(baseline, globs), reqs) if baseline else (0, 0)
     base = slice_metrics(result, globs)
     lines = st.get("code_lines")
