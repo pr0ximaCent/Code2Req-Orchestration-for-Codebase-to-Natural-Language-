@@ -25,9 +25,9 @@ from code2req.config import (
 )
 from code2req.cost import cost_lines
 from code2req.estimate import estimate
-from code2req.eval import eval_markdown, evaluate
+from code2req.eval import eval_markdown, evaluate, evaluate_sysml, sysml_markdown
 from code2req.llm import REASONING_LEVELS, with_budget
-from code2req.pipeline import run
+from code2req.pipeline import PROFILES, run
 from code2req.render_pdf import write_pdf
 from code2req.structure import DEFAULT_MODULE_CHARS
 
@@ -58,8 +58,11 @@ def add_run_args(a: argparse.ArgumentParser, out: str) -> None:
     a.add_argument("--exclude", action="append", default=None,
                    help="glob to exclude (repeatable)")
     a.add_argument("--max-module-chars", type=int, default=DEFAULT_MODULE_CHARS)
+    a.add_argument("--profile", choices=PROFILES, default="sysml",
+                   help="sysml: the requirements a SysML model is generated from (default); "
+                        "exhaustive: a requirement for every function's behaviour, with follow-up calls")
     a.add_argument("--no-followup", action="store_true",
-                   help="skip the second call per module for functions no requirement cites")
+                   help="exhaustive profile: skip the second call per module for functions no requirement cites")
     a.add_argument("--entry", action="append", default=None,
                    help="extra entry-point glob for dead-code detection, e.g. 'jobs/*.py' (repeatable)")
     a.add_argument("--no-assets", action="store_true",
@@ -89,8 +92,34 @@ def parse_reasoning(values: list[str] | None) -> dict[str, str]:
     return out
 
 
+def write_sysml_eval(args: argparse.Namespace, candidate: dict) -> int:
+    """Check a sysml-profile slice run against what model generation needs; exit code 1 when a check fails."""
+    baseline = None
+    if args.baseline:
+        with open(args.baseline, encoding="utf-8") as f:
+            baseline = json.load(f)
+    ev = evaluate_sysml(baseline, candidate, args.slice)
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "eval.json"), "w", encoding="utf-8") as f:
+        json.dump(ev, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(args.out, "eval.md"), "w", encoding="utf-8") as f:
+        f.write(sysml_markdown(ev))
+    c = ev["candidate"]
+    print(f"sysml eval {'passed' if ev['passed'] else 'FAILED'}: {c['requirements']} requirements "
+          f"(budget {c['budget']}), surfaces {c['surfaces_covered']}/{c['surfaces_total']}, "
+          f"limits kept {c['limits_kept_count']}/{c['limits_total']}, {c['rejected']} rejected; "
+          f"cost ${c['cost_usd'] or 0:.4f}")
+    for check in ev["checks"]:
+        if not check["ok"]:
+            print(f"  failed: {check['metric']} = {check['value']} (needed {check['needed']})")
+    print(f"wrote {os.path.join(args.out, 'eval.md')} and eval.json")
+    return 0 if ev["passed"] else 1
+
+
 def write_eval(args: argparse.Namespace, candidate: dict) -> int:
     """Compare a slice run with the baseline; exit code 1 when a check fails."""
+    if args.sysml:
+        return write_sysml_eval(args, candidate)
     with open(args.baseline, encoding="utf-8") as f:
         baseline = json.load(f)
     noise = None
@@ -128,7 +157,11 @@ def main(argv: list[str] | None = None) -> int:
 
     v = sub.add_parser("eval", help="run a slice of the code and compare it with a baseline run")
     add_run_args(v, out="code2req-eval")
-    v.add_argument("--baseline", required=True, help="requirements.json of the baseline run")
+    v.add_argument("--baseline", help="requirements.json of the baseline run (required without --sysml; "
+                                      "with it, an exhaustive run whose limits the slice must keep)")
+    v.add_argument("--sysml", action="store_true",
+                   help="judge a sysml-profile run by what model generation needs (surfaces covered, limits "
+                        "kept, package sizes) instead of recall against the baseline")
     v.add_argument("--slice", action="append", required=True, metavar="GLOB",
                    help="files of the slice, e.g. 'pkg/modules/exiftool/*' (repeatable)")
     v.add_argument("--candidate", help="compare this requirements.json instead of running the slice "
@@ -156,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("-v", "--verbose", action="store_true")
 
     args = p.parse_args(argv)
+    if args.cmd == "eval" and not args.sysml and not args.baseline:
+        p.error("eval needs --baseline (or --sysml)")
     setup_logging(args.verbose)
     if args.cmd == "pdf":  # no model needed
         with open(args.json, encoding="utf-8") as f:
@@ -210,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
                  target=args.target.strip().strip('"'),
                  followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets,
-                 only_files=args.slice if args.cmd == "eval" else None)
+                 only_files=args.slice if args.cmd == "eval" else None, profile=args.profile)
     if args.cmd == "eval":
         return write_eval(args, report.to_json())
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:

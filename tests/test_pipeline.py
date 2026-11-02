@@ -32,9 +32,10 @@ class FixtureLLM:
         self.prompts = []
 
     def complete(self, system, user, json_mode=False):
-        from code2req.prompts import FOLLOWUP_SYSTEM
+        from code2req.prompts import FOLLOWUP_SYSTEM, SYSML_MODULE_SYSTEM
         self.prompts.append((system, user))
-        assert system in (MODULE_SYSTEM, FOLLOWUP_SYSTEM), "small repo must not trigger LLM clustering"
+        assert system in (MODULE_SYSTEM, FOLLOWUP_SYSTEM, SYSML_MODULE_SYSTEM), \
+            "small repo must not trigger LLM clustering"
         if system == FOLLOWUP_SYSTEM:
             return json.dumps({"requirements": [], "internal": []})
         return json.dumps(CLAIMS)

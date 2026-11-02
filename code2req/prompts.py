@@ -83,6 +83,65 @@ Return ONLY valid JSON of this shape, compact as above:
 {"requirements":[ ... same item shape as above ... ],"covered":[{"function":"...","by":"R3"}],"internal":[{"function":"...","reason":"getter"}]}
 """
 
+SYSML_NAMING_RULES = """NAMING:
+- canonical_name: 2-6 Title Case words naming what the requirement is about (e.g. "Webhook Retry Policy", "PDF Merge Route"). Not the code symbol, not the module name.
+- subject_name: lowerCamelCase (<=3 words) for the part of the system or the entity being constrained (e.g. "webhookClient", "uploadRequest"). Never "system" alone.
+"""
+
+# The sysml profile: requirements are the input of SysML model generation (docreq pass-2, then
+# full_model_generation), which turns each into a port, an attribute, an action flow, a state
+# machine or a message. Only the fields it reads are asked for, and a BUDGET line in each prompt
+# keeps the count to what one component design can model. The prompt is the same for every
+# module, so the provider's cached copy of it serves the whole run.
+SYSML_MODULE_SYSTEM = """You write the requirements a SysML v2 model of a software system is built from.
+
+You are given one module of the codebase: its source code with line numbers, the surfaces found in it (routes, CLI commands and flags, env vars, constants, errors), and a BUDGET: the most requirements to write for it.
+
+A model generator turns every requirement into model elements, so write only requirements of these kinds:
+- interface: a route, command, group of flags, env var, message or file format the module accepts or produces. Name it exactly: HTTP method and path, command and flag names, env var names, status codes, field names.
+- performance or constraint: a limit, default, size, timeout, retry count or set of allowed values, with "attributes".
+- functional: an end-to-end behaviour: what starts it, its steps in order, the decisions it makes and what happens on failure, and what it sends to or receives from other parts of the system or external systems. When the code has explicit states (a status with fixed values and the code that changes it), state the states and what moves between them.
+- safety: an authentication, authorization, input filtering, data protection or error-mapping rule.
+
+RULES:
+- Phrase each as "The <module or part> shall ...", naming the part of the system it constrains.
+- One requirement per behaviour or interface, not per function. A function that is a step of a behaviour belongs in that behaviour's requirement; a thin entry point belongs in the requirement of what it reaches.
+- Flags or env vars that configure one feature share one requirement that names each of them with its default.
+- Every requirement, whatever its type, carries in "attributes" each limit, timeout, size, count or default its behaviour uses (max attempts, cooldowns, page sizes, cache lifetimes, retry counts), and cites the lines that set them. The model keeps these as values of the part, so they matter more than prose detail.
+- Start with what the module does end to end, then its interfaces, then its limits.
+- Stay within the BUDGET. Fewer is fine when they cover the module; covering every route, command and env var matters more than restating details.
+- Skip logging, metrics plumbing, formatting helpers, getters, constructors, registration and other boilerplate. Code listed under UNUSED CODE is never called: write nothing for it.
+- Do not describe implementation (internal function names, loops, libraries) unless it is the external contract. Do not invent behaviour the code does not implement.
+
+EVIDENCE (mandatory): every requirement cites 1-3 places as "<file id>:<first line>-<last line>", e.g. "F2:18-29". The file id is printed before the file's path in the listing (### F2 path/to/file.go ...). Use ONLY line numbers printed in the listing; the cited lines must contain the behaviour and any value in "attributes".
+
+""" + SYSML_NAMING_RULES + "\n" + ATTRIBUTE_RULES + """
+Return ONLY valid JSON of this shape. """ + COMPACT_JSON + """
+{"requirements":[{"text":"The ... shall ...","type":"functional","canonical_name":"...","subject_name":"...","evidence":["F1:18-29"]}]}
+"type" is one of functional, performance, interface, constraint, safety. Add "attributes" whenever the code sets a value for the behaviour.
+If the module implements nothing worth a requirement, return {"requirements":[]}.
+"""
+
+SYSML_ASSET_SYSTEM = """You write the requirements a SysML v2 model of a software system is built from, here from the non-code files that shape what the system does: LLM prompts, agent skills, message templates and configuration.
+
+You are given a group of such files with line numbers. Each file has a ROLE and the code lines that load it (LOADED BY), so you know which component uses it. A BUDGET gives the most requirements to write.
+
+Write the obligations the system meets because of these files. Phrase each as "The <component> shall ...", naming the component from LOADED BY (e.g. "The SysML v2 chatbot shall ...", "The system shall send ...").
+- prompt / skill: what the AI component must do: the steps it follows in order, its mandatory rules (MUST, ALWAYS, NEVER), the output it must produce, what it must refuse, and the inputs it is given. State the obligation, not the wording of the prompt. Rules about one behaviour share one requirement.
+- template: when the message is produced and what it must contain.
+- config: values the system is configured with and what they control, with "attributes" for numbers.
+Stay within the BUDGET; fewer is fine.
+
+EVIDENCE (mandatory): every requirement cites 1-2 entries {"file": "<path exactly as shown>", "start_line": N, "end_line": M, "symbol": "<anchor>"}. Use ONLY line numbers printed in the listing. symbol is checked: a short exact quote (3-8 words copied from the cited lines), or the heading the cited lines sit under.
+
+TYPE: functional (behaviour and steps), interface (output formats, message contents), constraint (MUST/NEVER rules), safety (refusals, secrets, data protection), performance (limits).
+
+""" + SYSML_NAMING_RULES + "\n" + ATTRIBUTE_RULES + """
+Return ONLY valid JSON of this shape. """ + COMPACT_JSON + """
+{"requirements":[{"text":"The ... shall ...","type":"constraint","canonical_name":"...","subject_name":"...","evidence":[{"file":"...","start_line":1,"end_line":5,"symbol":"..."}]}]}
+If the files hold nothing worth a requirement, return {"requirements":[]}.
+"""
+
 ASSET_SYSTEM = """You reverse-engineer requirements from the non-code files that shape a software system: LLM prompts, agent skills, message templates, reference material and CI/CD definitions.
 
 You are given a group of such files with line numbers. Each file has a ROLE and the code lines that load it (LOADED BY), so you know which component uses it.

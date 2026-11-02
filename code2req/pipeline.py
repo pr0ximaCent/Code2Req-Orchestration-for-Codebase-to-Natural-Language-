@@ -16,15 +16,25 @@ from typing import Any
 from code2req import assets as asset_files
 from code2req import reachability
 from code2req.agents.asset_agent import run_asset
-from code2req.agents.module_agent import FollowUp, ModuleInput, TestSnippet, run_followup, run_module
+from code2req.agents.module_agent import (
+    FollowUp,
+    ModuleInput,
+    TestSnippet,
+    code_blocks,
+    render_code,
+    run_followup,
+    run_module,
+    shown_ranges,
+)
 from code2req.cost import llm_task
 from code2req.dedup import assign_ids, dedup
 from code2req.llm import LLM, BudgetReached
+from code2req.prompts import ASSET_SYSTEM, MODULE_SYSTEM, SYSML_ASSET_SYSTEM, SYSML_MODULE_SYSTEM
 from code2req.render_md import render_markdown
 from code2req.render_pdf import write_pdf
 from code2req.repofiles import list_repo_files, matches_globs
 from code2req.schema import Evidence, FlatRequirement, RunReport, Surface
-from code2req.structure import DEFAULT_MODULE_CHARS, Module, build_structure
+from code2req.structure import DEFAULT_MODULE_CHARS, Module, build_structure, sysml_sections
 from code2req.surfaces import detect_surfaces
 from code2req.verify import (
     FileCache,
@@ -66,6 +76,19 @@ class _StopAware:
 
 MAX_TESTS_PER_MODULE = 12
 MAX_TEST_LINES = 60
+
+# Profiles. "sysml" writes the requirements a SysML model is generated from (docreq pass-2, then
+# full_model_generation in sysmodeler-backend-ai); "exhaustive" is the per-function requirements
+# report, kept until the sysml models are checked end to end.
+PROFILES = ("sysml", "exhaustive")
+# Non-code files whose requirements describe the running system. CI/CD is how the project is built
+# (model generation sets process requirements aside) and reference material is not an obligation.
+SYSML_ASSET_ROLES = ("prompt", "skill", "template", "config")
+# A requirement per ~100 lines shown, 2 to 10 per prompt, and at most 480 per repo: model generation
+# makes at most 16 components and designs one best with 30 requirements or fewer.
+LINES_PER_REQUIREMENT = 100
+MIN_BUDGET, MAX_BUDGET = 2, 10
+MAX_REQUIREMENTS = 480
 MIN_SYMBOL_LEN = 4
 MIN_ROUTE_LEN = 4  # shorter paths ("/", "/x") match too much text
 
@@ -405,6 +428,33 @@ def type_coverage(modules: list[Module], components: dict[str, Any], reqs: list[
             "ratio": round((total - len(uncited)) / total, 3) if total else None, "uncited": uncited}
 
 
+def requirement_budgets(lines: list[int], routes: list[int] | None = None) -> list[int]:
+    """Most requirements to ask for, per prompt of the given number of lines, scaled down
+    together when the repo would pass MAX_REQUIREMENTS. A prompt gets at least one per HTTP
+    route it declares: each route is a port of the model, and on gotenberg a size-only budget
+    left the last routes of a 15-route file without one."""
+    routes = routes or [0] * len(lines)
+    budgets = [max(r, min(MAX_BUDGET, max(MIN_BUDGET, round(n / LINES_PER_REQUIREMENT))))
+               for n, r in zip(lines, routes)]
+    total = sum(budgets)
+    if total > MAX_REQUIREMENTS:
+        budgets = [max(1, b * MAX_REQUIREMENTS // total) for b in budgets]
+    return budgets
+
+
+def label_asset_modules(asset_modules: list[asset_files.AssetModule], modules: list[Module],
+                        components: dict[str, Any]) -> None:
+    """Give each asset group the package of the code that loads its files, so a prompt's
+    requirements land with the component it drives; the folder name when no live code does."""
+    owner: dict[str, str] = {}
+    for m in modules:
+        for rel in [components[c].relative_path for c in m.component_ids] + m.extra_files:
+            owner.setdefault(rel, m.section)
+    for am in asset_modules:
+        loaders = Counter(owner[f] for a, _, _ in am.units for f, _, _ in a.loaded_by if f in owner)
+        am.label = loaders.most_common(1)[0][0] if loaders else (am.path[-1].rsplit("/", 1)[-1] or "assets")
+
+
 def asset_coverage(asset_set: asset_files.AssetSet, items: list[FlatRequirement]) -> dict:
     """Per role: files included and files cited by at least one requirement or reference."""
     cited = {e.file for r in items for e in r.evidence}
@@ -426,11 +476,17 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         progress: Progress | None = None, followup: bool = True,
         entries: list[str] | None = None, include_assets: bool = True,
         target: str | None = None, stop: threading.Event | None = None,
-        only_files: list[str] | None = None) -> RunReport:
+        only_files: list[str] | None = None, profile: str = "exhaustive") -> RunReport:
     """target: what the user asked to analyse (a git URL or folder) when repo_path is a clone of it.
     stop: once set, the run raises RunStopped at its next progress step or model call.
     only_files: globs; only code and asset modules with a file matching one are sent to the
-    model (an eval slice). Module prompts are unchanged, so their cached answers still apply."""
+    model (an eval slice). Module prompts are unchanged, so their cached answers still apply.
+    profile: "sysml" (what the CLI and web UI run) or "exhaustive" (see PROFILES). sysml runs no
+    follow-up, sends no tests, leaves out CI/CD and reference files, budgets each prompt and names
+    sections after whole modules."""
+    if profile not in PROFILES:
+        raise ValueError(f"profile must be one of {', '.join(PROFILES)}, not {profile!r}")
+    sysml = profile == "sysml"
 
     def report_progress(stage: str, done: int, total: int) -> None:
         _check_stop(stop)
@@ -448,6 +504,8 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     reach = reachability.analyze(repo_path, exclude, entries, files=source.files)
     asset_set = (asset_files.discover(repo_path, reach, exclude, files=source.files) if include_assets
                  else asset_files.AssetSet())
+    if sysml:
+        asset_set.assets = [a for a in asset_set.assets if a.role in SYSML_ASSET_ROLES]
     # Tests stay (they are attached to modules); routes, flags and constants of test code
     # (fake servers, fixtures) are not the system's.
     surfaces = [s for s in detect_surfaces(repo_path, source.files)
@@ -461,25 +519,50 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     structure = build_structure(repo_path, out_dir, llm, model, exclude, max_module_chars, files=source)
     components = structure.components
     modules = drop_dead_files(drop_test_components(structure.modules, components), components, reach)
+    files = build_file_cache(repo_path, components, surfaces)
+    asset_modules = asset_files.build_modules(asset_set.assets, max_module_chars)
+    budgets: dict[int, int] = {}  # id(module or asset group) -> most requirements to ask for
+    if sysml:
+        # Over the whole repo, before any slice is cut, so a slice's prompts (section names,
+        # budgets) match the full run's and their cached answers apply to both.
+        sysml_sections(modules)
+        label_asset_modules(asset_modules, modules, components)
+        sizes = ([len(render_code(m.component_ids, m.extra_files, components, files.lines).splitlines())
+                  for m in modules] + [sum(end - start + 1 for _, start, end in a.units) for a in asset_modules])
+        all_surfaces = assign_surfaces(modules, components, surfaces)
+        routes = ([sum(s.kind == "http_route" for s in all_surfaces.get(i, [])) for i in range(len(modules))]
+                  + [0] * len(asset_modules))
+        budgets = {id(j): b for j, b in zip([*modules, *asset_modules], requirement_budgets(sizes, routes))}
     if only_files:
         modules = [m for m in modules
                    if any(matches_globs(components[c].relative_path, only_files) for c in m.component_ids)
                    or any(matches_globs(f, only_files) for f in m.extra_files)]
+        asset_modules = [a for a in asset_modules
+                         if any(matches_globs(asset.file, only_files) for asset, _, _ in a.units)]
     dead = dead_components(modules, components, reach)
 
-    files = build_file_cache(repo_path, components, surfaces)
     surf_by_mod = assign_surfaces(modules, components, surfaces)
-    tests_by_mod = assign_tests(modules, components, surfaces, files, surf_by_mod)
+    # Tests only decide "confirmed", which a SysML model has no use for.
+    tests_by_mod = {} if sysml else assign_tests(modules, components, surfaces, files, surf_by_mod)
     inputs = [ModuleInput(module=m, surfaces=surf_by_mod.get(i, []), tests=tests_by_mod.get(i, []),
                           unused=[f"{components[c].name} ({components[c].relative_path}:"
                                   f"{components[c].start_line}-{components[c].end_line})"
-                                  for c in m.component_ids if c in dead])
+                                  for c in m.component_ids if c in dead],
+                          budget=budgets.get(id(m), 0), cite_ids=sysml)
               for i, m in enumerate(modules)]
-    asset_modules = asset_files.build_modules(asset_set.assets, max_module_chars)
-    if only_files:
-        asset_modules = [a for a in asset_modules
-                         if any(matches_globs(asset.file, only_files) for asset, _, _ in a.units)]
+    for a in asset_modules:
+        a.budget = budgets.get(id(a), 0)
+    if sysml:
+        files.shown = {}
+        for m in modules:
+            for rel, spans in shown_ranges(code_blocks(m.component_ids, m.extra_files, components,
+                                                       files.lines)).items():
+                files.shown.setdefault(rel, []).extend(spans)
     jobs: list[ModuleInput | asset_files.AssetModule] = [*inputs, *asset_modules]
+    module_system, asset_system = ((SYSML_MODULE_SYSTEM, SYSML_ASSET_SYSTEM) if sysml
+                                   else (MODULE_SYSTEM, ASSET_SYSTEM))
+    code_files = ({components[c].relative_path for m in modules for c in m.component_ids}
+                  | {f for m in modules for f in m.extra_files})
 
     done = 0
     done_lock = threading.Lock()
@@ -494,9 +577,9 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         try:
             if isinstance(job, ModuleInput):
                 with llm_task("module"):
-                    return run_module(llm, job, components, files.lines), []
+                    return run_module(llm, job, components, files.lines, system=module_system), []
             with llm_task("asset"):
-                return run_asset(llm, job)
+                return run_asset(llm, job, system=asset_system)
         except BudgetReached:
             budget_skipped.append(name)
             return [], []
@@ -541,7 +624,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     internal: dict[str, str] = {}  # "module::function" -> reason the model gave
     links: Counter = Counter()  # call_graph / same_type / unlinked
     followups_skipped = 0
-    if followup:
+    if followup and not sysml:  # accounting for every function serves the report, not the model
         by_file: dict[str, list[Any]] = {}
         for n in components.values():
             by_file.setdefault(n.relative_path, []).append(n)
@@ -598,7 +681,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     passed, dead_passed = split_dead(passed, reach)
     gaps, dead_gaps = split_dead(gaps, reach)
 
-    reqs, dup_dropped = dedup(passed)
+    reqs, dup_dropped = dedup(passed, fuzzy=sysml)
     gaps, gap_dup = dedup(gaps)
     references, ref_dup = dedup(references)
     dead_reqs, _ = dedup(dead_passed + dead_gaps)
@@ -615,7 +698,11 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         "repo": repo_path,
         "target": target or repo_path,
         "model": model,
+        "profile": profile,
         "only_files": only_files or [],
+        "budget_total": sum(budgets.get(id(j.module if isinstance(j, ModuleInput) else j), 0) for j in jobs)
+                        if sysml else None,
+        "code_lines": sum(len(files.lines(rel) or []) for rel in code_files),
         "components": len(components),
         "modules": len(modules),
         "asset_modules": len(asset_modules),
@@ -650,11 +737,14 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     with open(os.path.join(out_dir, "cost.json"), "w", encoding="utf-8") as f:
         json.dump({"repo": repo_path, "model": model, **(report.stats["cost"] or {})}, f, indent=2)
     pdf_path = os.path.join(out_dir, "requirements.pdf")
-    try:
-        write_pdf(report.to_json(), pdf_path)
-    except Exception as e:  # the JSON and Markdown are written; a missing PDF must not fail the run
-        logger.warning("requirements.pdf not written: %s", e)
-        if os.path.isfile(pdf_path):  # never leave an earlier run's PDF next to this run's JSON
-            os.remove(pdf_path)
+    if os.path.isfile(pdf_path):  # never leave an earlier run's PDF next to this run's JSON
+        os.remove(pdf_path)
+    if not sysml:  # the sysml profile's product is the model; it needs no report
+        try:
+            write_pdf(report.to_json(), pdf_path)
+        except Exception as e:  # the JSON and Markdown are written; a missing PDF must not fail the run
+            logger.warning("requirements.pdf not written: %s", e)
+            if os.path.isfile(pdf_path):
+                os.remove(pdf_path)
     report_progress("done", 0, 0)
     return report

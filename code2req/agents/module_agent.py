@@ -10,6 +10,7 @@ left uncited.
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -41,6 +42,8 @@ class ModuleInput:
     surfaces: list[Surface] = field(default_factory=list)
     tests: list[TestSnippet] = field(default_factory=list)
     unused: list[str] = field(default_factory=list)  # "name (file:start-end)" of dead functions
+    budget: int = 0  # most requirements to write (sysml profile); 0 = no limit
+    cite_ids: bool = False  # files listed with F-ids and cited as "F2:18-29" (sysml profile)
 
 
 def numbered(lines: list[str], start: int) -> str:
@@ -76,46 +79,77 @@ def _declaration_blocks(lines: list[str], ranges: list[tuple[int, int]]) -> list
     return blocks
 
 
-def render_code(component_ids: list[str], extra_files: list[str], components: dict[str, Any],
-                read_lines: ReadLines) -> str:
-    """Source for the given components, as whole files where possible."""
+CodeBlock = tuple[str, str, list[tuple[int, list[str]]]]  # (file, header after the path, [(first line, lines)])
+
+
+def code_blocks(component_ids: list[str], extra_files: list[str], components: dict[str, Any],
+                read_lines: ReadLines) -> list[CodeBlock]:
+    """The listing render_code prints, as blocks: whole files where possible."""
     by_file_all = _file_components(components)
     chosen: dict[str, list[Any]] = defaultdict(list)
     for cid in component_ids:
         n = components[cid]
         chosen[n.relative_path].append(n)
 
-    parts: list[str] = []
+    out: list[CodeBlock] = []
     for rel, nodes in chosen.items():
         lines = read_lines(rel)
         whole = lines is not None and len(nodes) == len(by_file_all[rel])
         if whole:
-            parts.append(f"\n### {rel} (whole file, lines 1-{len(lines)})")
-            parts.append(numbered(lines, 1))
+            out.append((rel, f" (whole file, lines 1-{len(lines)})", [(1, lines)]))
             continue
         if lines is not None:
             ranges = [(n.start_line, n.end_line) for n in by_file_all[rel]]
             blocks = _declaration_blocks(lines, ranges)
             if blocks:
-                parts.append(f"\n### {rel} :: top-level declarations")
-                parts.append("\n".join(numbered(b, s) for s, b in blocks))
+                out.append((rel, " :: top-level declarations", blocks))
         for n in sorted(nodes, key=lambda x: x.start_line):
             src = (n.source_code or "").splitlines()
             if src:
-                parts.append(f"\n### {rel} :: {n.name} (lines {n.start_line}-{n.end_line})")
-                parts.append(numbered(src, n.start_line))
+                out.append((rel, f" :: {n.name} (lines {n.start_line}-{n.end_line})", [(n.start_line, src)]))
 
     for rel in extra_files:
         lines = read_lines(rel)
         if lines:
-            parts.append(f"\n### {rel} (whole file, lines 1-{len(lines)})")
-            parts.append(numbered(lines, 1))
+            out.append((rel, f" (whole file, lines 1-{len(lines)})", [(1, lines)]))
+    return out
+
+
+def file_ids(blocks: list[CodeBlock]) -> dict[str, str]:
+    """F1, F2, ... per file in listing order: what the sysml profile cites instead of the path."""
+    ids: dict[str, str] = {}
+    for rel, _, _ in blocks:
+        ids.setdefault(rel, f"F{len(ids) + 1}")
+    return ids
+
+
+def shown_ranges(blocks: list[CodeBlock]) -> dict[str, list[tuple[int, int]]]:
+    """file -> the line ranges the listing shows of it."""
+    out: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for rel, _, runs in blocks:
+        out[rel] += [(start, start + len(lines) - 1) for start, lines in runs]
+    return dict(out)
+
+
+def render_code(component_ids: list[str], extra_files: list[str], components: dict[str, Any],
+                read_lines: ReadLines, with_ids: bool = False) -> str:
+    """Source for the given components, as whole files where possible. with_ids puts each file's
+    F-id before its path, for answers that cite "F2:18-29" instead of the path."""
+    blocks = code_blocks(component_ids, extra_files, components, read_lines)
+    ids = file_ids(blocks) if with_ids else {}
+    parts: list[str] = []
+    for rel, header, runs in blocks:
+        fid = f"{ids[rel]} " if with_ids else ""
+        parts.append(f"\n### {fid}{rel}{header}")
+        parts.append("\n".join(numbered(lines, start) for start, lines in runs))
     return "\n".join(parts)
 
 
 def build_module_prompt(inp: ModuleInput, components: dict[str, Any], read_lines: ReadLines) -> str:
     m = inp.module
     parts = [f"MODULE: {m.section}"]
+    if inp.budget:
+        parts.append(f"BUDGET: at most {inp.budget} requirements")
 
     if inp.surfaces:
         parts.append("\nSURFACES:")
@@ -124,7 +158,7 @@ def build_module_prompt(inp: ModuleInput, components: dict[str, Any], read_lines
             parts.append(f"- [{s.kind}] {s.name}{detail} - {s.file}:{s.line}")
 
     parts.append("\nSOURCE CODE:")
-    parts.append(render_code(m.component_ids, m.extra_files, components, read_lines))
+    parts.append(render_code(m.component_ids, m.extra_files, components, read_lines, with_ids=inp.cite_ids))
 
     if inp.unused:
         parts.append("\nUNUSED CODE (nothing in the running system calls these; write no requirements for them):")
@@ -140,17 +174,39 @@ def build_module_prompt(inp: ModuleInput, components: dict[str, Any], read_lines
     return "\n".join(parts)
 
 
-def parse_requirements(raw: str, module: Module) -> list[FlatRequirement]:
-    return _parse(raw, module).requirements
+def parse_requirements(raw: str, module: Module, ids: dict[str, str] | None = None) -> list[FlatRequirement]:
+    return _parse(raw, module, ids).requirements
 
 
-def parse_items(items: Any, module: Any) -> list[FlatRequirement]:
-    """Requirement items from a model reply, stamped with the module (anything with name and section)."""
+EVIDENCE_REF_RE = re.compile(r"(F\d+):(\d+)(?:-(\d+))?")
+
+
+def resolve_refs(evidence: Any, ids: dict[str, str]) -> list:
+    """"F2:18-29" -> {"file": <path listed as F2>, "start_line": 18, "end_line": 29}. Objects pass
+    through. A reference to no listed file keeps its text as the file, so verification rejects it."""
+    by_id = {fid: rel for rel, fid in ids.items()}
+    out: list = []
+    for e in evidence if isinstance(evidence, list) else []:
+        if not isinstance(e, str):
+            out.append(e)
+            continue
+        m = EVIDENCE_REF_RE.fullmatch(e.replace(" ", ""))
+        start = int(m.group(2)) if m else 1
+        out.append({"file": by_id.get(m.group(1), e) if m else e, "start_line": start,
+                    "end_line": int(m.group(3) or start) if m else start})
+    return out
+
+
+def parse_items(items: Any, module: Any, ids: dict[str, str] | None = None) -> list[FlatRequirement]:
+    """Requirement items from a model reply, stamped with the module (anything with name and section).
+    ids: the F-ids the listing gave each file, when evidence is cited as "F2:18-29"."""
     out: list[FlatRequirement] = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or not str(item.get("text", "")).strip():
             continue
         item.pop("id", None)
+        if ids is not None:
+            item["evidence"] = resolve_refs(item.get("evidence"), ids)
         item["section"] = module.section
         item["module"] = module.name
         if str(item.get("type", "")).lower() not in REQUIREMENT_TYPES:
@@ -177,13 +233,13 @@ class FollowUp:
     internal: list[tuple[str, str]] = field(default_factory=list)  # (function, reason)
 
 
-def _parse(raw: str, module: Module) -> FollowUp:
+def _parse(raw: str, module: Module, ids: dict[str, str] | None = None) -> FollowUp:
     try:
         data = parse_json_object(raw)
     except ValueError as e:
         logger.warning("module %s: unparsable reply: %s", module.name, e)
         return FollowUp()
-    out = FollowUp(requirements=parse_items(data.get("requirements"), module))
+    out = FollowUp(requirements=parse_items(data.get("requirements"), module, ids))
     for item in data.get("covered") or []:
         if not isinstance(item, dict):
             continue
@@ -206,10 +262,12 @@ def _parse(raw: str, module: Module) -> FollowUp:
 
 
 def run_module(llm: LLM, inp: ModuleInput, components: dict[str, Any],
-               read_lines: ReadLines) -> list[FlatRequirement]:
+               read_lines: ReadLines, system: str = MODULE_SYSTEM) -> list[FlatRequirement]:
     prompt = build_module_prompt(inp, components, read_lines)
-    raw = llm.complete(MODULE_SYSTEM, prompt, json_mode=True)
-    reqs = parse_requirements(raw, inp.module)
+    raw = llm.complete(system, prompt, json_mode=True)
+    m = inp.module
+    ids = file_ids(code_blocks(m.component_ids, m.extra_files, components, read_lines)) if inp.cite_ids else None
+    reqs = parse_requirements(raw, m, ids)
     logger.info("module %s: %d requirement(s)", inp.module.name, len(reqs))
     return reqs
 

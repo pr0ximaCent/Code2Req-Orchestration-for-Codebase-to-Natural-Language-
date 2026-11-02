@@ -47,7 +47,8 @@ class RunRequest(BaseModel):
     exclude: list[str] = Field(default_factory=list)
     workers: int = Field(default=4, ge=1, le=16)
     max_module_chars: int = Field(default=DEFAULT_MODULE_CHARS, ge=5_000, le=400_000)
-    followup: bool = True
+    profile: str = Field(default="sysml", pattern="^(sysml|exhaustive)$")  # see pipeline.PROFILES
+    followup: bool = True  # exhaustive profile only
     entries: list[str] = Field(default_factory=list)  # extra entry-point globs for dead-code detection
     assets: bool = True  # include prompts, templates, reference files and CI/CD
     cache: bool = True  # reuse answers for modules whose code is unchanged
@@ -225,7 +226,7 @@ class RunManager:
                                   req.exclude or None, req.max_module_chars, progress=progress,
                                   followup=req.followup, entries=req.entries or None,
                                   include_assets=req.assets, target=meta["target"],
-                                  stop=self.stops[run_id])
+                                  stop=self.stops[run_id], profile=req.profile)
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)

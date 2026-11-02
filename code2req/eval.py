@@ -14,16 +14,20 @@ every other metric.
 
 from __future__ import annotations
 
+import os
 import re
+from collections import Counter
 
+from code2req.assets import classify
+from code2req.dedup import similarity
+from code2req.pipeline import SYSML_ASSET_ROLES
 from code2req.repofiles import matches_globs
+from code2req.surfaces import CODE_EXTS
+from code2req.verify import is_test_code
 
 RECALL_TO_PASS = 0.95
 TEXT_OVERLAP = 0.3  # word overlap (Jaccard) for two requirements to say the same thing
 LINE_SLACK = 3
-STOPWORDS = frozenset("""a an and are as at be by for from has have if in into is it its of on or
-shall should than that the their them then there these this to via when where which while
-with within without system""".split())
 
 # metric -> True when higher is better
 METRICS = {"requirements": True, "confirmed": True, "surfaces_covered": True,
@@ -32,15 +36,6 @@ METRICS = {"requirements": True, "confirmed": True, "surfaces_covered": True,
 # 0, and one more rejection would then fail a candidate on chance alone.
 MIN_BAND = {"requirements": 2, "confirmed": 2, "surfaces_covered": 2,
             "rejected_rate": 0.02, "unexplained_functions": 2}
-
-
-def _words(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9_]+", text.lower()) if len(w) > 1 and w not in STOPWORDS}
-
-
-def similarity(a: str, b: str) -> float:
-    wa, wb = _words(a), _words(b)
-    return len(wa & wb) / len(wa | wb) if wa and wb else 0.0
 
 
 def _cites_overlap(a: dict, b: dict) -> bool:
@@ -153,6 +148,130 @@ def evaluate(baseline: dict, candidate: dict, globs: list[str], noise: dict | No
 
 def _cites(r: dict) -> str:
     return ", ".join(f"{e['file']}:{e['start_line']}-{e['end_line']}" for e in r.get("evidence", []))
+
+
+# The sysml profile writes far fewer requirements on purpose, so recall against the
+# exhaustive run says nothing about it. It is judged by what model generation needs:
+# the interfaces covered, the limits kept, packages that read as components, and no
+# package too big for one component design (model generation splits a design above 30).
+SYSML_SURFACE_KINDS = ("http_route", "cli_command", "env_var", "constant", "error")
+SPLIT_LABEL_RE = re.compile(r"\(part \d+\)|\+\d+ more")
+SYSML_MIN = {"surface_ratio": 0.90, "limits_kept": 0.80}
+SYSML_MAX = {"split_sections": 0, "largest_section": 30}
+REJECTED_RATE = 0.05  # at least one rejection is always allowed: 1 of 18 is not a trend
+
+
+def _slice_reqs(result: dict, globs: list[str]) -> list[dict]:
+    return [r for r in result.get("requirements", []) + result.get("gaps", []) if in_slice(r, globs)]
+
+
+def read_by_sysml(rel: str) -> bool:
+    """Whether the sysml profile reads the file: code that is not a test, or a non-code file of
+    a role it analyses. A limit only an exhaustive run can find (a Makefile timeout, a compose
+    port) is not one the sysml run lost."""
+    if os.path.splitext(rel)[1].lower() in CODE_EXTS:
+        return not is_test_code(rel)
+    return classify(rel) in SYSML_ASSET_ROLES
+
+
+def limits_kept(baseline: list[dict], candidate: list[dict]) -> tuple[int, int]:
+    """(kept, total) of the baseline's distinct limits in files the sysml profile reads: a value one
+    of its requirements states for an attribute, kept when a candidate requirement states the
+    same value citing the same file."""
+    stated = {(e["file"], round(float(a.get("value", 0)), 6))
+              for r in candidate for a in r.get("attributes") or [] for e in r.get("evidence") or []}
+    limits = {(tuple(sorted({e["file"] for e in r.get("evidence") or []})), round(float(a.get("value", 0)), 6))
+              for r in baseline for a in r.get("attributes") or []}
+    limits = {(files, v) for files, v in limits if any(read_by_sysml(f) for f in files)}
+    kept = sum(any((f, v) in stated for f in files) for files, v in limits)
+    return kept, len(limits)
+
+
+def sysml_metrics(result: dict, globs: list[str], baseline: dict | None = None) -> dict:
+    reqs = _slice_reqs(result, globs)
+    st = result.get("stats", {})
+    sections = Counter(r.get("section", "") for r in reqs)
+    surfaces = [s for s in result.get("surfaces", [])
+                if s["kind"] in SYSML_SURFACE_KINDS and matches_globs(s["file"], globs)]
+    uncovered = [u for u in (st.get("surface_coverage") or {}).get("uncovered", [])
+                 if u[1:].split("]", 1)[0] in SYSML_SURFACE_KINDS and matches_globs(_uncovered_file(u), globs)]
+    kept, limits = limits_kept(_slice_reqs(baseline, globs), reqs) if baseline else (0, 0)
+    base = slice_metrics(result, globs)
+    lines = st.get("code_lines")
+    return {
+        "requirements": len(reqs),
+        "budget": st.get("budget_total"),
+        "sections": len(sections),
+        "largest_section": max(sections.values(), default=0),
+        "largest_section_name": sections.most_common(1)[0][0] if sections else "",
+        "split_sections": sum(bool(SPLIT_LABEL_RE.search(s)) for s in sections),
+        "surfaces_total": len(surfaces),
+        "surfaces_covered": len(surfaces) - len(uncovered),
+        "surface_ratio": round((len(surfaces) - len(uncovered)) / len(surfaces), 3) if surfaces else None,
+        "limits_total": limits,
+        "limits_kept_count": kept,
+        "limits_kept": round(kept / limits, 3) if limits else None,
+        "rejected": base["rejected"],
+        "rejected_rate": base["rejected_rate"],
+        "with_attributes": sum(bool(r.get("attributes")) for r in reqs),
+        "code_lines": lines,
+        "cost_usd": base["cost_usd"],
+        "usd_per_1k_lines": round(base["cost_usd"] / lines * 1000, 4) if base["cost_usd"] and lines else None,
+        "tokens": base["tokens"],
+        "by_task": base["by_task"],
+        "uncovered": uncovered,
+    }
+
+
+def evaluate_sysml(baseline: dict | None, candidate: dict, globs: list[str]) -> dict:
+    """Check a sysml-profile run against what model generation needs. The baseline (an exhaustive
+    run of the same code) is only used for the limits it found and for comparing counts and cost."""
+    m = sysml_metrics(candidate, globs, baseline)
+    checks = []
+    for metric, bar in SYSML_MIN.items():
+        if m[metric] is not None:  # no surfaces or no limits in the slice: nothing to keep
+            checks.append({"metric": metric, "value": m[metric], "needed": f">= {bar}", "ok": m[metric] >= bar})
+    for metric, bar in SYSML_MAX.items():
+        checks.append({"metric": metric, "value": m[metric], "needed": f"<= {bar}", "ok": m[metric] <= bar})
+    allowed = max(1, int(REJECTED_RATE * (m["requirements"] + m["rejected"])))
+    checks.append({"metric": "rejected", "value": m["rejected"], "needed": f"<= {allowed}",
+                   "ok": m["rejected"] <= allowed})
+    if m["budget"] is not None:
+        checks.append({"metric": "requirements", "value": m["requirements"], "needed": f"<= {m['budget']}",
+                       "ok": m["requirements"] <= m["budget"]})
+    return {
+        "profile": "sysml",
+        "slice": globs,
+        "candidate": m,
+        "baseline": slice_metrics(baseline, globs) if baseline else None,
+        "baseline_is_slice_run": bool(baseline and baseline.get("stats", {}).get("only_files")),
+        "checks": checks,
+        "passed": all(c["ok"] for c in checks),
+    }
+
+
+def sysml_markdown(ev: dict) -> str:
+    c, b = ev["candidate"], ev["baseline"]
+    lines = [f"# SysML eval {'PASSED' if ev['passed'] else 'FAILED'}", "", f"Slice: {', '.join(ev['slice'])}", "",
+             "| Check | Value | Needed | OK |", "|---|---|---|---|"]
+    lines += [f"| {x['metric']} | {x['value']} | {x['needed']} | {'yes' if x['ok'] else 'NO'} |" for x in ev["checks"]]
+    whole = " (whole run)" if b and not ev["baseline_is_slice_run"] else ""
+    lines += ["", "| Metric | Candidate | Baseline |", "|---|---|---|",
+              f"| requirements | {c['requirements']} (budget {c['budget']}) | {b['requirements'] if b else '-'} |",
+              f"| sections | {c['sections']} (largest: {c['largest_section_name']}, {c['largest_section']}) | - |",
+              f"| surfaces covered | {c['surfaces_covered']}/{c['surfaces_total']} | - |",
+              f"| limits kept | {c['limits_kept_count']}/{c['limits_total']} | - |",
+              f"| with attributes | {c['with_attributes']} | - |",
+              f"| rejected | {c['rejected']} | {b['rejected'] if b else '-'} |",
+              f"| cost_usd | {c['cost_usd']} | {(b['cost_usd'] if b else '-')}{whole} |",
+              f"| usd per 1,000 lines | {c['usd_per_1k_lines']} ({c['code_lines']} lines) | - |"]
+    for k in ("input", "output", "thinking"):
+        lines.append(f"| {k} tokens | {c['tokens'][k]:,} | {(format(b['tokens'][k], ',') if b else '-')}{whole} |")
+    lines += ["", "## Cost by stage", "", "| Stage | Cost | Input | Output | Thinking |", "|---|---|---|---|---|"]
+    lines += [f"| {k} | {v['cost_usd']} | {v['input']} | {v['output']} | {v['thinking']} |"
+              for k, v in c["by_task"].items()]
+    lines += ["", "## Surfaces no requirement covers", ""] + ([f"- {u}" for u in c["uncovered"]] or ["- none"])
+    return "\n".join(lines) + "\n"
 
 
 def eval_markdown(ev: dict) -> str:

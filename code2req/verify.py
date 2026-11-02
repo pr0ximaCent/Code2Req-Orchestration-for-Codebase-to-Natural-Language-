@@ -70,6 +70,9 @@ class FileCache:
       citation inside a function body still matches that function's name.
     constants: constant name -> numeric value (from surfaces), so a limit cited
       by name ("len(cart) >= MAX_CART_ITEMS") still verifies its value.
+    shown: file -> line ranges the module prompts listed (sysml profile), or None. Its
+      citations name no symbol, so a code citation must instead start inside lines the
+      model was shown.
     """
 
     def __init__(self, repo_path: str,
@@ -78,6 +81,7 @@ class FileCache:
         self.repo_path = os.path.abspath(repo_path)
         self.symbols = symbols or {}
         self.constants = constants or {}
+        self.shown: dict[str, list[tuple[int, int]]] | None = None
         self._lines: dict[str, list[str] | None] = {}
 
     def enclosing_symbols(self, rel: str, start: int, end: int) -> set[str]:
@@ -234,6 +238,10 @@ def check_evidence(ev: Evidence, files: FileCache) -> Evidence:
             ev.ok, ev.note = False, f"quote '{ev.symbol.strip()[:60]}' not in cited lines"
             return ev
         ev.ok, ev.note = True, ""
+        return ev
+    if files.shown is not None and not any(lo - SYMBOL_SLACK <= ev.start_line <= hi + SYMBOL_SLACK
+                                           for lo, hi in files.shown.get(ev.file, [])):
+        ev.ok, ev.note = False, "lines not shown to the model"
         return ev
     symbol = ev.symbol.strip().rsplit(".", 1)[-1].strip("()")
     if symbol:
