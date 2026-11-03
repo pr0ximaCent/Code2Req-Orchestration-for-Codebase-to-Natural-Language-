@@ -20,7 +20,7 @@ from collections import Counter
 
 from code2req.assets import classify
 from code2req.dedup import similarity
-from code2req.pipeline import SYSML_ASSET_ROLES
+from code2req.pipeline import SYSML_ASSET_ROLES, named_in
 from code2req.repofiles import matches_globs
 from code2req.surfaces import CODE_EXTS
 from code2req.verify import is_test_code
@@ -188,17 +188,6 @@ def limits_kept(baseline: list[dict], candidate: list[dict]) -> tuple[int, int]:
 
 
 NAMED_SURFACE_KINDS = ("http_route", "cli_command", "env_var")
-
-
-def named_in(surface: dict, text: str) -> bool:
-    """Whether the text names the surface: a route by its path, a flag or env var by its name."""
-    if surface["kind"] == "cli_command":  # "--webhook-max-retry", with or without its dashes
-        name = surface["name"].lstrip("-")
-        pattern = rf"(?<![\w-])(?:--?)?{re.escape(name)}(?![\w-])"
-    else:
-        name = surface["name"].split(" ", 1)[-1] if surface["kind"] == "http_route" else surface["name"]
-        pattern = rf"(?<![\w/{{}}-]){re.escape(name)}(?![\w/{{}}-])"
-    return bool(name) and re.search(pattern, text) is not None
 
 
 def sysml_metrics(result: dict, globs: list[str], baseline: dict | None = None) -> dict:

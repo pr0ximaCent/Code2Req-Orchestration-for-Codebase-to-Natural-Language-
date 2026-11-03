@@ -33,7 +33,7 @@ from code2req.prompts import ASSET_SYSTEM, MODULE_SYSTEM, SYSML_ASSET_SYSTEM, SY
 from code2req.render_md import render_markdown
 from code2req.render_pdf import write_pdf
 from code2req.repofiles import list_repo_files, matches_globs
-from code2req.schema import Evidence, FlatRequirement, RunReport, Surface
+from code2req.schema import Attribute, Evidence, FlatRequirement, RunReport, Surface
 from code2req.structure import DEFAULT_MODULE_CHARS, Module, build_structure, sysml_sections
 from code2req.surfaces import detect_surfaces
 from code2req.verify import (
@@ -443,6 +443,113 @@ def requirement_budgets(lines: list[int], routes: list[int] | None = None) -> li
     return budgets
 
 
+def named_in(surface: Surface | dict, text: str) -> bool:
+    """Whether the text names the surface: a route by its path, a flag or env var by its name."""
+    kind, full = (surface["kind"], surface["name"]) if isinstance(surface, dict) else (surface.kind, surface.name)
+    if kind == "cli_command":  # "--webhook-max-retry", with or without its dashes
+        name = full.lstrip("-")
+        pattern = rf"(?<![\w-])(?:--?)?{re.escape(name)}(?![\w-])"
+    else:
+        name = full.split(" ", 1)[-1] if kind == "http_route" else full
+        pattern = rf"(?<![\w/{{}}-]){re.escape(name)}(?![\w/{{}}-])"
+    return bool(name) and re.search(pattern, text) is not None
+
+
+def route_requirements(modules: list[Module], surf_by_mod: dict[int, list[Surface]],
+                       reqs: list[FlatRequirement]) -> list[FlatRequirement]:
+    """An interface requirement, written by code, for every HTTP route no requirement names.
+
+    Each route is a port of the model, so one the model builder never hears of is a missing
+    interface. Asked to give every route its own requirement, Gemini and DeepSeek both still
+    folded gotenberg's bookmarks/write into bookmarks/read and stamp into watermark."""
+    text = "\n".join(r.text for r in reqs)
+    out: list[FlatRequirement] = []
+    for i, m in enumerate(modules):
+        for s in surf_by_mod.get(i, []):
+            if s.kind != "http_route" or named_in(s, text):
+                continue
+            method, _, path = s.name.partition(" ")
+            # Named after the path's last two fixed segments: /forms/pdfengines/stamp -> "Pdfengines
+            # Stamp Route", pdfenginesStampRequest; parameters like {order_id} are left out.
+            segments = [g for g in path.split("/") if g and g[0] not in "{:"][-2:] or ["root"]
+            words = [w for g in segments for w in re.split(r"[_\-.]+", g) if w]
+            out.append(FlatRequirement(
+                text=f"The {m.section} module shall accept {method} {path}.",
+                type="interface", canonical_name=" ".join(w.capitalize() for w in words) + " Route",
+                subject_name=words[0].lower() + "".join(w.capitalize() for w in words[1:]) + "Request",
+                section=m.section, module=m.name,
+                evidence=[Evidence(file=s.file, start_line=s.line, end_line=s.end_line, symbol="", ok=True)],
+                source_file=s.file))
+    return out
+
+
+DURATION_UNITS = {"Nanosecond": 1e-9, "Microsecond": 1e-6, "Millisecond": 1e-3, "Second": 1.0,
+                  "Minute": 60.0, "Hour": 3600.0}
+NUMBER_RE = r"-?\d+(?:\.\d+)?"
+
+
+def default_value(s: Surface) -> tuple[float, str, str] | None:
+    """A flag's or constant's numeric default as (value in SI units, ISQ type, unit literal), read
+    from what the surface detector found: "flag int default 4" -> (4, Integer, ""), "flag duration
+    default time.Duration(30)*time.Second" -> (30, DurationValue, "[s]"), a constant "50" -> 50.
+    None for booleans, strings, lists and defaults that are names."""
+    detail = s.detail.strip().replace("_", "") if s.kind == "constant" else s.detail.strip()
+    if s.kind == "constant":
+        if not re.fullmatch(NUMBER_RE, detail):
+            return None
+        return float(detail), "ScalarValues::Real" if "." in detail else "ScalarValues::Integer", ""
+    if s.kind != "cli_command":
+        return None
+    if m := re.fullmatch(rf"flag u?int\d* default ({NUMBER_RE})", detail):
+        return float(m.group(1)), "ScalarValues::Integer", ""
+    if m := re.fullmatch(rf"flag float\d* default ({NUMBER_RE})", detail):
+        return float(m.group(1)), "ScalarValues::Real", ""
+    if detail.startswith("flag duration default "):
+        expr = detail.removeprefix("flag duration default ").replace(" ", "")
+        units = [u for u in re.findall(r"time\.(\w+)", expr) if u in DURATION_UNITS]
+        rest = re.sub(r"time\.\w+", "", expr)
+        if not re.fullmatch(r"[\d.()*-]*", rest):  # a named default: no value to read
+            return None
+        numbers = re.findall(NUMBER_RE, rest)
+        if len(units) == 1 and len(numbers) <= 1:  # 30*time.Second, time.Duration(30)*time.Second
+            return (float(numbers[0]) if numbers else 1.0) * DURATION_UNITS[units[0]], "ISQ::DurationValue", "[s]"
+        if not units and len(numbers) == 1:  # a bare Duration counts nanoseconds
+            return float(numbers[0]) * 1e-9, "ISQ::DurationValue", "[s]"
+    return None
+
+
+def attribute_name(name: str) -> str:
+    """--webhook-max-retry -> webhookMaxRetry, MAX_CART_ITEMS -> maxCartItems; a camelCase name stays."""
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", name) if w]
+    if len(words) == 1 and not words[0].isupper():
+        return words[0][:1].lower() + words[0][1:]
+    return words[0].lower() + "".join(w[:1].upper() + w[1:].lower() for w in words[1:])
+
+
+def default_attributes(reqs: list[FlatRequirement], modules: list[Module],
+                       surf_by_mod: dict[int, list[Surface]]) -> int:
+    """Attach the default of every flag or constant a requirement names as one of its attributes,
+    citing the line that sets it; returns how many were added. The model keeps attributes as values
+    of the part, and the surface detector already read them from the code: DeepSeek-V4-Flash wrote
+    "--gotenberg-graceful-shutdown-duration (default 30s)" into the text and no attribute."""
+    index = {m.name: i for i, m in enumerate(modules)}
+    added = 0
+    for r in reqs:
+        have = {round(a.value, 6) for a in r.attributes}
+        for s in surf_by_mod.get(index.get(r.module, -1), []):
+            parsed = default_value(s) if s.kind in ("cli_command", "constant") else None
+            if parsed is None or round(parsed[0], 6) in have or not named_in(s, r.text):
+                continue
+            value, isq_type, unit = parsed
+            r.attributes.append(Attribute(name=attribute_name(s.name), isq_type=isq_type, operator="==",
+                                          value=value, unit_literal=unit))
+            if not any(e.file == s.file and e.start_line <= s.line <= e.end_line for e in r.evidence):
+                r.evidence.append(Evidence(file=s.file, start_line=s.line, end_line=s.end_line, symbol="", ok=True))
+            have.add(round(value, 6))
+            added += 1
+    return added
+
+
 def label_asset_modules(asset_modules: list[asset_files.AssetModule], modules: list[Module],
                         components: dict[str, Any]) -> None:
     """Give each asset group the package of the code that loads its files, so a prompt's
@@ -683,6 +790,9 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     gaps, dead_gaps = split_dead(gaps, reach)
 
     reqs, dup_dropped = dedup(passed, fuzzy=sysml)
+    routes_filled = route_requirements(modules, surf_by_mod, reqs) if sysml else []
+    reqs += routes_filled
+    attributes_filled = default_attributes(reqs, modules, surf_by_mod) if sysml else 0
     gaps, gap_dup = dedup(gaps)
     references, ref_dup = dedup(references)
     dead_reqs, _ = dedup(dead_passed + dead_gaps)
@@ -700,6 +810,8 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         "target": target or repo_path,
         "model": model,
         "profile": profile,
+        "routes_filled_by_code": len(routes_filled),
+        "attributes_filled_by_code": attributes_filled,
         "only_files": only_files or [],
         "budget_total": sum(budgets.get(id(j.module if isinstance(j, ModuleInput) else j), 0) for j in jobs)
                         if sysml else None,

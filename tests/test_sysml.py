@@ -6,9 +6,10 @@ import shutil
 from code2req.cli import main
 from code2req.dedup import dedup
 from code2req.eval import evaluate_sysml, limits_kept, named_in
-from code2req.pipeline import MAX_REQUIREMENTS, requirement_budgets, run
+from code2req.pipeline import (MAX_REQUIREMENTS, attribute_name, default_attributes, default_value,
+                               requirement_budgets, run)
 from code2req.prompts import SYSML_ASSET_SYSTEM, SYSML_MODULE_SYSTEM
-from code2req.schema import Evidence, FlatRequirement
+from code2req.schema import Evidence, FlatRequirement, Surface
 from code2req.structure import Module, split_large_modules, sysml_sections
 from code2req.verify import FileCache, check_evidence
 from tests.test_pipeline import FIXTURE
@@ -55,8 +56,13 @@ def test_sysml_profile_budgets_the_prompt_and_skips_followup_tests_and_report(tm
     assert prompt.startswith("MODULE: app\nBUDGET: at most 4 requirements")
     assert "### F1 app/api.py (whole file, lines 1-35)" in prompt
     assert "TESTS THAT EXERCISE" not in prompt
-    # F-ids resolve to the listed file; the restated limit is merged into the first one.
-    assert [r.text for r in report.requirements] == [c["text"] for c in SYSML_CLAIMS["requirements"][:2]]
+    # F-ids resolve to the listed file; the restated limit is merged into the first one. GET
+    # /orders/{order_id}, which no claim names, gets an interface requirement written by code.
+    assert [r.text for r in report.requirements] == [c["text"] for c in SYSML_CLAIMS["requirements"][:2]] + [
+        "The app module shall accept GET /orders/{order_id}."]
+    filled = report.requirements[2]
+    assert (filled.type, filled.canonical_name, filled.subject_name) == ("interface", "Orders Route", "ordersRequest")
+    assert [(e.file, e.start_line) for e in filled.evidence] == [("app/api.py", 33)]
     assert [(e.file, e.start_line, e.end_line) for e in report.requirements[0].evidence] == [("app/api.py", 18, 29)]
     limit = report.requirements[1]
     assert [a.value for a in limit.attributes] == [50] and len(limit.evidence) == 2
@@ -65,6 +71,7 @@ def test_sysml_profile_budgets_the_prompt_and_skips_followup_tests_and_report(tm
                                                                           "start_line outside file"]
     st = report.stats
     assert st["profile"] == "sysml" and st["budget_total"] == 4 and st["dedup_dropped"] == 1
+    assert st["routes_filled_by_code"] == 1
     with open(f"{FIXTURE}/app/api.py", encoding="utf-8") as f:
         assert st["code_lines"] == len(f.read().splitlines())
     assert (tmp_path / "requirements.json").is_file() and not (tmp_path / "requirements.pdf").exists()
@@ -96,8 +103,9 @@ def test_sysml_profile_keeps_prompts_with_their_loader_and_drops_cicd_and_refere
     asset_prompts = [u for s, u in llm.calls if s == SYSML_ASSET_SYSTEM]
     assert len(asset_prompts) == 1  # the knowledge folder (reference) and the Dockerfile (CI/CD) are not sent
     assert asset_prompts[0].startswith("ASSET GROUP: app\nBUDGET: at most 2 requirements")
-    assert [(r.text, r.section, r.asset_role) for r in report.requirements] == [
+    assert [(r.text, r.section, r.asset_role) for r in report.requirements if r.asset_role] == [
         ("The receipt assistant shall list each item with its quantity.", "app", "prompt")]
+    assert report.stats["routes_filled_by_code"] == 2  # the module answered nothing; both routes are filled
     assert report.references == []
     assert report.stats["asset_coverage"]["by_role"] == {"prompt": {"files": 1, "cited": 1}}
 
@@ -218,3 +226,41 @@ def test_eval_command_with_sysml_needs_no_baseline(tmp_path, capsys):
     assert code == 0
     assert "sysml eval passed: 1 requirements (budget 10)" in capsys.readouterr().out
     assert (tmp_path / "ev" / "eval.md").read_text(encoding="utf-8").startswith("# SysML eval PASSED")
+
+
+def test_flag_and_constant_defaults_are_read_from_what_the_detector_found():
+    def flag(detail, name="--x"):
+        return Surface(kind="cli_command", name=name, file="a.go", line=1, end_line=1, detail=detail)
+
+    assert default_value(flag("flag int default 4")) == (4.0, "ScalarValues::Integer", "")
+    assert default_value(flag("flag duration default time.Duration(30)*time.Second")) == (30.0, "ISQ::DurationValue", "[s]")
+    assert default_value(flag("flag duration default 500*time.Millisecond")) == (0.5, "ISQ::DurationValue", "[s]")
+    assert default_value(flag("flag duration default time.Minute")) == (60.0, "ISQ::DurationValue", "[s]")
+    for no_number in ("flag bool default false", 'flag string default ""', "flag duration default defaultTimeout",
+                      "flag stringslice default []string{}"):
+        assert default_value(flag(no_number)) is None
+    const = Surface(kind="constant", name="MAX_CART_ITEMS", file="a.py", line=6, end_line=6, detail="50")
+    assert default_value(const) == (50.0, "ScalarValues::Integer", "")
+    assert [attribute_name(n) for n in ("--webhook-max-retry", "MAX_CART_ITEMS", "defaultImageQuality")] == [
+        "webhookMaxRetry", "maxCartItems", "defaultImageQuality"]
+
+
+def test_a_requirement_naming_a_flag_gets_its_default_as_an_attribute():
+    m = Module(name="pkg/modules/webhook", path=["pkg/modules/webhook"])
+    flags = [Surface(kind="cli_command", name="--webhook-max-retry", file="webhook.go", line=50, end_line=50,
+                     detail="flag int default 4"),
+             Surface(kind="cli_command", name="--webhook-retry-max-wait", file="webhook.go", line=64, end_line=64,
+                     detail="flag duration default time.Duration(30)*time.Second"),
+             Surface(kind="cli_command", name="--webhook-disable", file="webhook.go", line=66, end_line=66,
+                     detail="flag bool default false")]
+    named = FlatRequirement(text="The webhook client shall retry up to --webhook-max-retry times, waiting at most "
+                                 "--webhook-retry-max-wait; --webhook-disable turns it off.",
+                            module=m.name, evidence=[Evidence(file="middleware.go", start_line=227, end_line=238)])
+    unnamed = FlatRequirement(text="The webhook client shall send the file.", module=m.name)
+    assert default_attributes([named, unnamed], [m], {0: flags}) == 2
+    assert [(a.name, a.value, a.unit_literal) for a in named.attributes] == [
+        ("webhookMaxRetry", 4.0, ""), ("webhookRetryMaxWait", 30.0, "[s]")]
+    assert [(e.file, e.start_line) for e in named.evidence] == [("middleware.go", 227), ("webhook.go", 50),
+                                                                ("webhook.go", 64)]
+    assert unnamed.attributes == []
+    assert default_attributes([named], [m], {0: flags}) == 0  # a value already stated is not added twice
