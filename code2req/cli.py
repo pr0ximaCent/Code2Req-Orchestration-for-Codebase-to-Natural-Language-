@@ -51,8 +51,9 @@ def add_run_args(a: argparse.ArgumentParser, out: str) -> None:
     a.add_argument("target", help="local path or git URL")
     a.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=ENV_HELP)
     a.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"),
-                   help="single LiteLLM model instead of the docreq fallback chain "
-                        "(env CODE2REQ_MODEL)")
+                   help="model to run on (env CODE2REQ_MODEL). Default: DeepSeek-V4-Flash on "
+                        "$DEEPSEEK_API_BASE; DeepSeek-V4-Pro (or any DeepSeek-…) uses the same endpoint; "
+                        "gemini-chain is the old Gemini > Azure GPT chain; anything else is a LiteLLM model string")
     a.add_argument("--out", default=out)
     a.add_argument("--workers", type=int, default=4)
     a.add_argument("--exclude", action="append", default=None,

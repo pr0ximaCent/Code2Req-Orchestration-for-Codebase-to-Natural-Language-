@@ -57,8 +57,11 @@ def record_litellm_usage(ledger: UsageLedger, model: str, resp: object) -> None:
 class LiteLLM:
     def __init__(self, model: str, max_retries: int = 3, temperature: float = 0.0,
                  max_tokens: int = 16_000, timeout: float = 300.0,
-                 reasoning: dict[str, str] | None = None):
+                 reasoning: dict[str, str] | None = None,
+                 api_base: str | None = None, api_key: str | None = None):
         self.model = model
+        self.api_base = api_base  # an OpenAI-compatible endpoint (DeepSeek on Azure); None = LiteLLM's default
+        self.api_key = api_key
         self.max_retries = max_retries
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -87,6 +90,10 @@ class LiteLLM:
             kwargs["response_format"] = {"type": "json_object"}
         if level := stage_level(self.reasoning):
             kwargs["reasoning_effort"] = level
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
         # LiteLLM itself only reads GEMINI_API_KEY; use the same keys as the docreq chain,
         # so a GEMINI_API_KEYS pool works too (rotated, a retry gets the next key).
         pooled = self.model.startswith("gemini/") and bool(gemini_keys())
