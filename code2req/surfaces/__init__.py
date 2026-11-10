@@ -9,10 +9,12 @@ from code2req.schema import Surface
 from code2req.surfaces.gherkin import detect_gherkin
 from code2req.surfaces.go import detect_go
 from code2req.surfaces.python import detect_python
+from code2req.surfaces.typescript import TS_LANGS, detect_typescript
 
 logger = logging.getLogger(__name__)
 
-DETECTORS = {".py": detect_python, ".go": detect_go, ".feature": detect_gherkin}
+DETECTORS = ({".py": detect_python, ".go": detect_go, ".feature": detect_gherkin}
+             | dict.fromkeys(TS_LANGS, detect_typescript))
 
 # Folders that never hold the system's own source, tracked or not.
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist",
@@ -43,7 +45,11 @@ def detect_surfaces(repo_path: str, files: list[str] | None = None) -> list[Surf
             continue
         try:
             with open(os.path.join(repo_path, rel), encoding="utf-8", errors="replace") as f:
-                out.extend(detector(f.read(), rel))
+                source = f.read()
+            # A Next.js route's path comes from where its file sits in the project, which only the
+            # full path shows when the run is on a subfolder.
+            out.extend(detector(source, rel, repo_path) if detector is detect_typescript
+                       else detector(source, rel))
         except OSError as e:
             logger.warning("cannot read %s: %s", rel, e)
     return out

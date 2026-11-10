@@ -249,9 +249,9 @@ CodeWiki also honours `.gitignore`.
 
 ## 6. Stage 2: Surfaces (deterministic detectors)
 
-**Files:** `code2req/surfaces/__init__.py` (repo walk), `code2req/surfaces/python.py`, `code2req/surfaces/go.py`, `code2req/surfaces/gherkin.py` (detectors)
+**Files:** `code2req/surfaces/__init__.py` (repo walk), `code2req/surfaces/python.py`, `code2req/surfaces/go.py`, `code2req/surfaces/typescript.py`, `code2req/surfaces/gherkin.py` (detectors)
 
-A *surface* is something the system exposes or enforces that a requirement should cover. Detection is exact and uses no LLM: Python's own `ast` module for `.py`, tree-sitter (the parser CodeWiki already uses) for `.go`, and a line scan for Gherkin `.feature` files. Every stage skips `.git`, `.venv`, `venv`, `node_modules`, `__pycache__`, `dist`, `vendor`, `.tox`, caches and `site-packages`. A `build/` folder is skipped only when walking a folder outside git: a git-tracked `build/` holds hand-written source such as Dockerfiles and packaging scripts.
+A *surface* is something the system exposes or enforces that a requirement should cover. Detection is exact and uses no LLM: Python's own `ast` module for `.py`, tree-sitter (the parser CodeWiki already uses) for `.go` and TypeScript/JavaScript, and a line scan for Gherkin `.feature` files. Every stage skips `.git`, `.venv`, `venv`, `node_modules`, `__pycache__`, `dist`, `vendor`, `.tox`, caches and `site-packages`. A `build/` folder is skipped only when walking a folder outside git: a git-tracked `build/` holds hand-written source such as Dockerfiles and packaging scripts.
 
 | Kind | Detected when | `name` / `detail` |
 |---|---|---|
@@ -270,6 +270,7 @@ A *surface* is something the system exposes or enforces that a requirement shoul
 | Go `constant` | Package-level numeric `const` | name / value |
 | Go `error` | Package-level `ErrX = errors.New(...)` / `fmt.Errorf(...)` (any call), and exported `*Error` struct types | name / message or `"error type"` |
 | Go `test` | `func TestXxx(t *testing.T)` / `FuzzXxx(f *testing.F)` in `_test.go` | test name |
+| TS/JS `http_route` | Next.js App Router `app/**/route.ts` exporting `GET`, `POST`, ... (function, const or `export { handler as GET }`), path from the folders (`[id]` → `{id}`, `[...slug]` → `{slug}`, `(group)` and `@slot` left out, `_private` not routed); Pages Router `pages/api/**` (`ANY`); `app.get("/x", h)` / `router.post("/x", h)` on a receiver named like a server or router (Express, Fastify, Hono, Koa Router). A run on a subfolder finds the `app/` folder through the full path (the one next to a `package.json`). Router prefixes are not joined | `"GET /api/projects/{projectId}/export"` |
 | Gherkin `test` | Each `Scenario:` / `Scenario Outline:` / `Example:` block of a `.feature` file | scenario title / feature title |
 | `asset_section` | A `#`–`###` heading of an included Markdown file (not reference material) | heading / role |
 
@@ -279,7 +280,7 @@ Surfaces have three jobs:
 2. Constants feed the verifier's value check (§8).
 3. They are the denominator of the **surface coverage** metric (§10).
 
-Python and Go have code detectors. Other languages still get requirements from the module agent, but no surfaces or coverage numbers. Surfaces in dead files (§6.2) are dropped, and so are routes, flags and constants declared in test code (fake servers, fixtures); tests themselves stay.
+Python and Go have code detectors, and TypeScript/JavaScript has a route detector. Other languages still get requirements from the module agent, but no surfaces or coverage numbers. Surfaces in dead files (§6.2) are dropped, and so are routes, flags and constants declared in test code (fake servers, fixtures); tests themselves stay.
 
 Tests and test doubles are not part of the system: test files (`test_*.py`, `*_test.go`, `*.feature`, `tests/`) and mocks (`mocks.go`, `*_mock.go`, `mock_*.py`, `mocks/`, `__mocks__/`) never enter a module or the function totals. Only real tests can confirm a requirement.
 
