@@ -40,6 +40,10 @@ class Tier:
 # Same models and rates as sysmodeler-backend-ai providers/gemini/cost.go (PricingRegistry)
 # and providers/openai/cost.go (pricingByModel). Keys are SysModeler's model IDs.
 PRICING: dict[str, list[Tier]] = {
+    # DeepSeek on SysModeler's Azure AI Foundry deployment, which code2req runs on. Azure retail
+    # rates as mirrored by third-party trackers on 2026-11-03 (no cached-input discount assumed);
+    # check them against the Azure bill. DeepSeek-V4-Pro is not priced yet.
+    "DeepSeek-V4-Flash": [Tier(None, 0.19, 0.19, 0.51)],
     "gemini-3.1-pro-preview": [Tier(200_000, 2.00, 0.20, 12.00), Tier(None, 4.00, 0.40, 18.00)],
     "gemini-3.8-flash": [Tier(None, 0.75, 0.075, 3.75, until=FLASH_INTRO_ENDS),
                          Tier(None, 1.50, 0.15, 7.50)],
@@ -115,6 +119,10 @@ def llm_task(name: str):
         yield
     finally:
         _task.name = prev
+
+
+def current_task() -> str:
+    return getattr(_task, "name", None) or "other"
 
 
 @dataclass
@@ -197,6 +205,10 @@ def cost_lines(c: dict | None) -> list[str]:
     if c.get("unpriced_models"):
         lines.append("Not priced (no rate in SysModeler's tables, counted as $0): "
                      + ", ".join(c["unpriced_models"]))
+    budget = c.get("budget") or {}
+    if budget.get("reached"):
+        lines.append(f"Budget cap ${budget['max_cost_usd']:.2f} reached: {budget['refused_calls']} paid call(s) "
+                     f"refused, so part of the code was not analysed (cached answers were still used)")
     if reused:
         lines.append(reused)
     return lines

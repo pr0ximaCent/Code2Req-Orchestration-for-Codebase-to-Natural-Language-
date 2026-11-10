@@ -27,11 +27,31 @@ def load_env(env_file: str | None) -> str | None:
     return None
 
 
-def build_llm(model: str | None) -> tuple[LLM, str]:
-    """A single LiteLLM model when given, else docreq's fallback chain. Returns (llm, label)."""
-    if model:
-        return LiteLLM(model), model
-    llm = FallbackLLM()
+DEFAULT_DEEPSEEK_MODEL = "DeepSeek-V4-Flash"
+GEMINI_CHAIN = "gemini-chain"
+
+
+def build_llm(model: str | None, reasoning: dict[str, str] | None = None) -> tuple[LLM, str]:
+    """The LLM a run calls, and its label. Returns (llm, label).
+
+    - No model: DeepSeek ($DEEPSEEK_MODEL, else DeepSeek-V4-Flash) on the OpenAI-compatible
+      endpoint in $DEEPSEEK_API_BASE. code2req runs on DeepSeek only; there is no quiet
+      fallback to another provider.
+    - "DeepSeek-…" (e.g. DeepSeek-V4-Pro): that DeepSeek model on the same endpoint.
+    - "gemini-chain": docreq's Gemini > Azure GPT fallback chain, for comparison runs.
+    - Anything else: that LiteLLM model string.
+    reasoning: thinking level per stage (see llm.REASONING_LEVELS); empty means provider defaults."""
+    if not model or model.lower().startswith("deepseek"):
+        base = os.getenv("DEEPSEEK_API_BASE", "").strip()
+        key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if not base or not key:
+            raise ValueError("no LLM credentials: set DEEPSEEK_API_KEY and DEEPSEEK_API_BASE "
+                             "(pass --env-file), or name another model with --model")
+        label = "openai/" + (model or os.getenv("DEEPSEEK_MODEL", "").strip() or DEFAULT_DEEPSEEK_MODEL)
+        return LiteLLM(label, reasoning=reasoning, api_base=base, api_key=key), label
+    if model != GEMINI_CHAIN:
+        return LiteLLM(model, reasoning=reasoning), model
+    llm = FallbackLLM(reasoning=reasoning)
     usable = [str(m) for m in llm.models if m.configured()]
     if not usable:
         raise ValueError("no LLM credentials: set GEMINI_API_KEY / GEMINI_API_KEYS or "

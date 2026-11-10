@@ -96,10 +96,12 @@ class AssetModule:
     name: str
     path: list[str]
     units: list[tuple[Asset, int, int]]  # (asset, first line, last line)
+    budget: int = 0  # most requirements to write (sysml profile); 0 = no limit
+    label: str = ""  # sysml profile: the package of the code that loads these files; "" = the path
 
     @property
     def section(self) -> str:
-        return " > ".join(self.path)
+        return self.label or " > ".join(self.path)
 
 
 def _list_files(repo_path: str) -> list[str]:

@@ -62,10 +62,15 @@ class Module:
     # Files with no CodeWiki component (only constants, prompts, type aliases),
     # sent to the agent whole. CodeWiki extracts functions/classes only.
     extra_files: list[str] = field(default_factory=list)
+    # The module this one is a part of, when it was cut to fit one prompt: every part of
+    # it shares one SysML package. Empty when path is already the whole module.
+    base_path: list[str] = field(default_factory=list)
+    # Package name the sysml profile gives the module (see sysml_sections); "" = the path.
+    label: str = ""
 
     @property
     def section(self) -> str:
-        return " > ".join(self.path)
+        return self.label or " > ".join(self.path)
 
 
 @dataclass
@@ -118,8 +123,40 @@ def _dir_of(node: Any) -> str:
 def _rename_root(modules: list[Module], repo_name: str) -> None:
     for m in modules:
         m.path = [repo_name if p == ROOT_DIR else p for p in m.path]
+        m.base_path = [repo_name if p == ROOT_DIR else p for p in m.base_path]
         if m.name == ROOT_DIR:
             m.name = repo_name
+
+
+def short_names(paths: list[tuple[str, ...]]) -> dict[tuple[str, ...], str]:
+    """Each path's shortest tail of segments that no other path ends with, joined by "/":
+    ("pkg", "modules", "webhook") -> "webhook" unless another path also ends in "webhook"."""
+    distinct = set(paths)
+    out: dict[tuple[str, ...], str] = {}
+    for p in distinct:
+        for k in range(1, len(p) + 1):
+            tail = p[-k:]
+            if k == len(p) or not any(q != p and q[-k:] == tail for q in distinct):
+                out[p] = "/".join(tail)
+                break
+    return out
+
+
+def module_key(m: Module) -> tuple[str, ...]:
+    """The whole module a module or part belongs to, as path segments ("a/b > c" -> a, b, c)."""
+    return tuple(seg for p in (m.base_path or m.path) for seg in p.split("/") if seg)
+
+
+def sysml_sections(modules: list[Module]) -> None:
+    """Name every module after the whole module it belongs to, as short as stays unique.
+
+    docreq pass-2 turns each section into a SysML package, and model generation follows
+    packages when it breaks the system into components, so the parts of one module must
+    share a package and the name must read as a component (webhook, chatbot/hooks), not
+    as a prompt-sized slice of it (pkg/modules/pdfengines > routes (part 1))."""
+    names = short_names([module_key(m) for m in modules])
+    for m in modules:
+        m.label = names[module_key(m)]
 
 
 def assign_all_components(modules: list[Module], components: dict[str, Any]) -> list[Module]:
@@ -206,7 +243,8 @@ def split_large_modules(modules: list[Module], components: dict[str, Any],
 
         for files, ids in groups:
             label = _files_label(files)
-            out.append(Module(name=label, path=m.path + [label], component_ids=ids))
+            out.append(Module(name=label, path=m.path + [label], component_ids=ids,
+                              base_path=m.base_path or m.path))
     return out
 
 
@@ -273,7 +311,7 @@ def attach_declaration_files(modules: list[Module], components: dict[str, Any], 
             target = min(fits, key=lambda m: module_size[id(m)])
         else:
             stem = os.path.splitext(name)[0]
-            target = Module(name=stem, path=[d or ROOT_DIR, stem])
+            target = Module(name=stem, path=[d or ROOT_DIR, stem], base_path=[d or ROOT_DIR])
             module_size[id(target)] = 0
             by_dir[d].append(target)
             out.append(target)

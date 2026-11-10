@@ -206,6 +206,7 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
     <label class="sr" for="target">Source folder or git URL</label>
     <input class="field" id="target" placeholder="Folder path or git URL, e.g. d:\work\shop-api" required>
     <button class="btn" type="button" id="optBtn" aria-expanded="false" aria-controls="options">Options</button>
+    <button class="btn" type="button" id="estBtn" title="What a first run would cost, from the code size; no model calls">Estimate cost</button>
     <button class="btn primary" type="submit" id="runBtn">Analyze</button>
   </form>
   <label class="sr" for="runSelect">Open run</label>
@@ -222,6 +223,9 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
     <input class="field" id="workers" type="number" value="4" min="1" max="16"></label>
   <label for="chars">Module size (characters)
     <input class="field" id="chars" type="number" value="40000" min="5000" step="5000"></label>
+  <label for="maxCost">Max API cost (USD)
+    <input class="field" id="maxCost" type="number" min="0" step="0.5" placeholder="no limit"
+      title="Stop making paid model calls once the run has cost this much; the run finishes with what it has"></label>
   <label class="grow" for="entries">Extra entry points for dead-code detection (comma-separated globs)
     <input class="field" id="entries" placeholder="jobs/*.py, worker.py"></label>
   <label for="assets"><input id="assets" type="checkbox" checked> Prompts, templates, reference files and CI/CD</label>
@@ -349,6 +353,20 @@ $("#optBtn").onclick = () => {
   $("#optBtn").setAttribute("aria-expanded", String(!o.hidden));
 };
 
+$("#estBtn").onclick = async () => {
+  const target = $("#target").value.trim();
+  if (!target) { $("#target").focus(); return; }
+  $("#estBtn").disabled = true;
+  $("#status").innerHTML = "<span>Estimating from the code size…</span>";
+  try {
+    const est = await api("/api/estimate", {method: "POST", body: JSON.stringify({
+      target, exclude: $("#exclude").value.split(",").map(s => s.trim()).filter(Boolean)})});
+    $("#status").innerHTML = `<span>${est.lines_of_text.map(esc).join(" · ")}</span>`;
+  } catch (err) {
+    $("#status").innerHTML = `<span class="err">Could not estimate: ${esc(err.message)}</span>`;
+  } finally { $("#estBtn").disabled = false; }
+};
+
 $("#runForm").onsubmit = async e => {
   e.preventDefault();
   const body = {
@@ -360,6 +378,7 @@ $("#runForm").onsubmit = async e => {
     assets: $("#assets").checked,
     cache: $("#cache").checked,
     keep_clone: $("#keepClone").checked,
+    max_cost: +$("#maxCost").value > 0 ? +$("#maxCost").value : null,
   };
   $("#runBtn").disabled = true;
   try {
@@ -431,6 +450,7 @@ function renderStatus() {
       ? ` · API cost <b title="What the providers bill for ${c.calls} call(s): ${c.input_tokens.toLocaleString()} in, ${c.output_tokens.toLocaleString()} out, ${c.thinking_tokens.toLocaleString()} thinking (at the output rate)">$${c.provider_cost_usd.toFixed(2)}</b>`
         + ` · SysModeler <b title="sysmodeler-backend-ai formula: thinking not billed; $${c.cost_usd.toFixed(4)} × 10,000, rounded half up, once per run">${c.credits.toLocaleString()}</b> credits ($${c.cost_usd.toFixed(2)})`
         + (c.cache?.hits ? ` · <b title="Answers reused from earlier runs for unchanged code, saving $${c.cache.saved_provider_cost_usd.toFixed(2)}">${c.cache.hits}</b> reused` : "")
+        + (c.budget?.reached ? ` · <span class="err" title="${c.budget.refused_calls} paid call(s) refused; re-run with a higher cap to finish (answers so far are cached)">budget cap $${c.budget.max_cost_usd.toFixed(2)} reached</span>` : "")
       : "";
     const refs = (S.result.references || []).length, dead = (S.result.dead_code || []).length;
     right = `<span class="nums"><b>${S.result.requirements.length}</b> requirements · <b>${st.confidence?.confirmed ?? 0}</b> confirmed by tests${refs ? ` · <b>${refs}</b> reference` : ""} · <b>${S.result.gaps.length}</b> gaps${dead ? ` · <b>${dead}</b> dead` : ""} · <b>${S.result.rejected.length}</b> rejected${funcs}${cov.total ? ` · surfaces <b>${cov.covered}/${cov.total}</b>` : ""}${credits} · reviewed <b>${rv.length}</b>${wrong ? `, ${wrong} wrong` : ""}</span>`;

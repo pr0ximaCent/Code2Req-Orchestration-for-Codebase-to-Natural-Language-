@@ -89,7 +89,8 @@ def is_generated(repo_path: str, rel: str) -> bool:
     return any(GENERATED_HEADER_RE.search(line) for line in head)
 
 
-def _excluded(rel: str, patterns: list[str] | None) -> bool:
+def matches_globs(rel: str, patterns: list[str] | None) -> bool:
+    """rel (or its file name) matches one of the globs; `*` also crosses folders."""
     base = rel.rsplit("/", 1)[-1]
     return any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(base, p) for p in patterns or [])
 
@@ -100,7 +101,7 @@ def list_repo_files(repo_path: str, exclude: list[str] | None = None) -> RepoFil
     git = tracked is not None
     files = tracked if git else _walk(repo_path)
     files = [f for f in files if os.path.isfile(os.path.join(repo_path, f))
-             and not any(p in SKIP_DIRS for p in f.split("/")[:-1]) and not _excluded(f, exclude)]
+             and not any(p in SKIP_DIRS for p in f.split("/")[:-1]) and not matches_globs(f, exclude)]
     generated = [f for f in files if is_generated(repo_path, f)]
     gen = set(generated)
     untracked = 0

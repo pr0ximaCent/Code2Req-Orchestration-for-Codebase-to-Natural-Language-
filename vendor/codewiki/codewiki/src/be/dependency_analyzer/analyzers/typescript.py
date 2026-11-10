@@ -27,7 +27,12 @@ class TreeSitterTSAnalyzer:
         self.top_level_nodes = {}
 
         try:
-            language_capsule = tree_sitter_typescript.language_typescript()
+            # The plain TypeScript grammar cannot parse JSX: a .tsx component becomes an
+            # ERROR node and yields no entities, so .tsx/.jsx need the TSX grammar.
+            if self.file_path.suffix.lower() in (".tsx", ".jsx"):
+                language_capsule = tree_sitter_typescript.language_tsx()
+            else:
+                language_capsule = tree_sitter_typescript.language_typescript()
             self.ts_language = Language(language_capsule)
             self.parser = Parser(self.ts_language)
 

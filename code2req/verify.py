@@ -70,6 +70,9 @@ class FileCache:
       citation inside a function body still matches that function's name.
     constants: constant name -> numeric value (from surfaces), so a limit cited
       by name ("len(cart) >= MAX_CART_ITEMS") still verifies its value.
+    shown: file -> line ranges the module prompts listed (sysml profile), or None. Its
+      citations name no symbol, so a code citation must instead start inside lines the
+      model was shown.
     """
 
     def __init__(self, repo_path: str,
@@ -78,6 +81,7 @@ class FileCache:
         self.repo_path = os.path.abspath(repo_path)
         self.symbols = symbols or {}
         self.constants = constants or {}
+        self.shown: dict[str, list[tuple[int, int]]] | None = None
         self._lines: dict[str, list[str] | None] = {}
 
     def enclosing_symbols(self, rel: str, start: int, end: int) -> set[str]:
@@ -108,26 +112,83 @@ class FileCache:
         return self._lines[rel]
 
 
-# A top-level declaration starting at column 0: a keyword (func/var/const/def/...)
+# A top-level declaration starting at column 0: a keyword (func/function/var/const/def/...)
 # or a module-level assignment (NAME = ..., NAME: T = ...).
 TOP_DECL_RE = re.compile(
-    r"^(?:(?:export|public|private|protected|static|async|pub)\s+)*"
-    r"(?:func|var|const|let|type|def|class|fn|struct|enum|interface|impl)\b"
+    r"^(?:(?:export|default|public|private|protected|static|async|pub)\s+)*"
+    r"(?:func|function|var|const|let|type|def|class|fn|struct|enum|interface|impl)\b"
     r"|^[A-Za-z_]\w*\s*(?::[^=\n]+)?=(?!=)")
+# The same at any indentation, plus method shorthand ("name(args) {"), for walking out
+# through nested scopes. Control statements open scopes but declare nothing.
+SCOPE_DECL_RE = re.compile(
+    r"^\s*(?:(?:export|default|public|private|protected|static|async|pub|readonly|override)\s+)*"
+    r"(?:func|function|var|const|let|type|def|class|fn|struct|enum|interface|impl)\b"
+    r"|^\s*[A-Za-z_][\w.]*\s*(?::[^=\n]+)?=(?!=)"
+    r"|^\s*(?:(?:public|private|protected|static|async|get|set|override)\s+)*"
+    r"(?!(?:if|for|while|switch|catch|with|return|else)\b)[A-Za-z_]\w*\s*\([^)]*\)\s*(?::[^{]+)?\{")
 DECL_SCAN_LINES = 800
+GO_RECEIVER_RE = re.compile(r"^\s*func\s*\(\s*\w*\s*\*?\s*([A-Za-z_]\w*)[^)]*\)\s*")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _declaration_head(line: str) -> str:
+    """The part of a declaration line that names what it declares: everything before the
+    parameter list, the type annotation or the value, so parameter and return types
+    (`AddEmailDialog({ ... }: AddEmailDialogProps)`) do not count. A Go method's
+    receiver type counts."""
+    m = GO_RECEIVER_RE.match(line)
+    receiver = ""
+    if m:
+        receiver, line = m.group(1) + " ", line[m.end():]
+    return receiver + re.split(r"[(=:]", line, maxsplit=1)[0]
+
+
+def _nearest_top_level_names(lines: list[str], sym: re.Pattern, start_line: int) -> bool:
+    for i in range(start_line - 1, max(-1, start_line - 1 - DECL_SCAN_LINES), -1):
+        if i < len(lines) and TOP_DECL_RE.match(lines[i]):
+            return sym.search(_declaration_head(lines[i])) is not None
+    return False
+
+
+def _enclosing_scope_names(lines: list[str], sym: re.Pattern, start_line: int) -> bool:
+    """Walk outward: each line above that is less indented than everything seen so far
+    opens an enclosing scope. Closer lines (`) => {`, `} else {`, `}: Props) {`) continue
+    the opener above them, so they do not narrow the walk."""
+    first = min(start_line, len(lines)) - 1
+    if first < 0:
+        return False
+    bound = _indent(lines[first])
+    for i in range(first - 1, max(-1, first - DECL_SCAN_LINES), -1):
+        line = lines[i]
+        text = line.strip()
+        if not text or _indent(line) >= bound:
+            continue
+        if SCOPE_DECL_RE.match(line):
+            if sym.search(_declaration_head(line)):
+                return True
+        elif text[0] in ")]}":
+            continue
+        bound = _indent(line)
+        if bound == 0:
+            return False
+    return False
 
 
 def declared_above(lines: list[str], symbol: str, start_line: int) -> bool:
-    """True when the nearest top-level declaration at or above start_line names symbol.
+    """True when a declaration enclosing start_line names symbol.
 
-    Covers citations inside a long constant (a prompt string, a table) or a
-    method body, where the symbol sits on the declaration line far above.
+    Covers citations far below the line that names the symbol: inside a long
+    constant (a prompt string, a table) whose lines sit at column 0, where the
+    nearest top-level declaration counts; and inside a method body or a nested
+    function (`const handleX = () => {` in a React component), found by walking
+    out through the enclosing scopes.
     """
     sym = re.compile(rf"\b{re.escape(symbol)}\b")
-    for i in range(start_line - 1, max(-1, start_line - 1 - DECL_SCAN_LINES), -1):
-        if i < len(lines) and TOP_DECL_RE.match(lines[i]):
-            return sym.search(lines[i]) is not None
-    return False
+    return (_nearest_top_level_names(lines, sym, start_line)
+            or _enclosing_scope_names(lines, sym, start_line))
 
 
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$")
@@ -177,6 +238,10 @@ def check_evidence(ev: Evidence, files: FileCache) -> Evidence:
             ev.ok, ev.note = False, f"quote '{ev.symbol.strip()[:60]}' not in cited lines"
             return ev
         ev.ok, ev.note = True, ""
+        return ev
+    if files.shown is not None and not any(lo - SYMBOL_SLACK <= ev.start_line <= hi + SYMBOL_SLACK
+                                           for lo, hi in files.shown.get(ev.file, [])):
+        ev.ok, ev.note = False, "lines not shown to the model"
         return ev
     symbol = ev.symbol.strip().rsplit(".", 1)[-1].strip("()")
     if symbol:

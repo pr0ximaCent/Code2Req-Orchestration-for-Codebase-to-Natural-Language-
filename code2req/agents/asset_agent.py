@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 def build_asset_prompt(am: AssetModule) -> str:
     parts = [f"ASSET GROUP: {am.section}"]
+    if am.budget:
+        parts.append(f"BUDGET: at most {am.budget} requirements")
     for asset, start, end in am.units:
         span = f"lines {start}-{end}" if (start, end) != (1, len(asset.lines)) else f"whole file, lines 1-{end}"
         shape = "OUTLINE, " if is_outlined(asset, start, end) else ""
@@ -36,9 +38,10 @@ def build_asset_prompt(am: AssetModule) -> str:
     return "\n".join(parts)
 
 
-def run_asset(llm: LLM, am: AssetModule) -> tuple[list[FlatRequirement], list[FlatRequirement]]:
+def run_asset(llm: LLM, am: AssetModule,
+              system: str = ASSET_SYSTEM) -> tuple[list[FlatRequirement], list[FlatRequirement]]:
     """(requirements, references) for one asset group, before verification."""
-    raw = llm.complete(ASSET_SYSTEM, build_asset_prompt(am), json_mode=True)
+    raw = llm.complete(system, build_asset_prompt(am), json_mode=True)
     try:
         data = parse_json_object(raw)
     except ValueError as e:

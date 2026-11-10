@@ -38,7 +38,8 @@ def test_run_browse_review_export(tmp_path):
     meta = client.post("/api/runs", json={"target": FIXTURE, "workers": 1}).json()
     done = wait_done(client, meta["id"])
     assert done["status"] == "done", done.get("error")
-    assert done["summary"]["requirements"] == 2
+    # 2 claims, plus an interface requirement for each route they do not name (sysml profile)
+    assert done["summary"]["requirements"] == 4
     assert done["progress"]["stage"] == "done"
     assert [m["id"] for m in client.get("/api/runs").json()] == [meta["id"]]
 

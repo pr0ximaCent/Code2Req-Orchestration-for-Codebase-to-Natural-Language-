@@ -111,6 +111,44 @@ def test_single_model_gemini_uses_the_key_pool(monkeypatch):
     assert seen == ["k1", "k2", None]
 
 
+def test_thinking_level_is_set_per_stage_and_keys_the_cache(monkeypatch, tmp_path):
+    import types
+
+    import litellm
+    import pytest
+
+    from code2req.cache import CachedLLM
+    from code2req.cli import parse_reasoning
+    from code2req.cost import llm_task
+    from code2req.llm import FallbackLLM, _Model
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    sent = []
+
+    def fake_completion(**kw):
+        sent.append(kw.get("reasoning_effort"))
+        msg = types.SimpleNamespace(content='{"requirements": []}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)], usage=None)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    assert parse_reasoning(["low", "module=high"]) == {"*": "low", "module": "high"}
+    with pytest.raises(ValueError):
+        parse_reasoning(["module=turbo"])
+
+    chain = [_Model("gemini", "gemini-3.1-pro-preview", 1)]
+    llm = CachedLLM(FallbackLLM(models=chain, reasoning={"followup": "low"}), "chain", str(tmp_path / "c.sqlite"))
+    for task in ("module", "followup"):
+        with llm_task(task):
+            llm.complete("sys", "same prompt", json_mode=True)
+    assert sent == [None, "low"]  # the module stage keeps the provider default
+    assert llm.usage["reasoning"] == {"followup": "low"}
+
+    # Without routing the key is unchanged, so answers cached before routing still hit.
+    plain = CachedLLM(FallbackLLM(models=chain), "chain", str(tmp_path / "c.sqlite"))
+    with llm_task("followup"):
+        plain.complete("sys", "same prompt", json_mode=True)
+    assert len(sent) == 2 and plain.hits == 1
+
+
 def test_single_model_parks_an_invalid_key_and_waits_out_overload(monkeypatch):
     import types
 

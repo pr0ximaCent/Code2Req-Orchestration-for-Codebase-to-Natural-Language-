@@ -33,6 +33,20 @@ def test_parse_requirements_sets_section_and_repairs_fields():
         ("shop > cart", "cart", "functional", "inferred", "")
 
 
+def test_compact_answer_without_empty_fields_still_yields_every_docreq_key():
+    from code2req.prompts import ASSET_SYSTEM, FOLLOWUP_SYSTEM, MODULE_SYSTEM
+    for system in (MODULE_SYSTEM, FOLLOWUP_SYSTEM, ASSET_SYSTEM):
+        assert "without indentation or line breaks" in system
+    raw = ('{"requirements":[{"text":"The API shall reject zero quantities.","type":"constraint",'
+           '"canonical_name":"Cart Quantity Check","group_id":"cart_quantity",'
+           '"evidence":[{"file":"a.py","start_line":1,"end_line":2,"symbol":"check"}]}]}')
+    r = parse_requirements(raw, Module(name="cart", path=["cart"]))[0]
+    data = r.to_json()
+    assert DOCREQ_KEYS <= set(data)
+    assert (data["subject_name"], data["actors"], data["attributes"], data["claim_value"]) == ("", [], [], "")
+    assert data["canonical_name"] == "Cart Quantity Check"
+
+
 def test_parse_requirements_bad_json_returns_empty():
     assert parse_requirements("not json", Module(name="m", path=["m"])) == []
 
