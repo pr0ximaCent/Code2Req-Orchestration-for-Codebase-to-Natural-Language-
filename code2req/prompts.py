@@ -106,6 +106,8 @@ A model generator turns every requirement into model elements, so write only req
 RULES:
 - Phrase each as "The <module or part> shall ...", naming the part of the system it constrains.
 - One requirement per behaviour or interface, not per function. A function that is a step of a behaviour belongs in that behaviour's requirement; a thin entry point belongs in the requirement of what it reaches.
+- A functional requirement states every outcome its behaviour can end in, including rejected input, errors and crashes, and the status or reply each one gives.
+- An interface requirement names each request, response or message it covers and lists its fields.
 - Flags or env vars that configure one feature share one requirement that names each of them with its default.
 - Every requirement, whatever its type, carries in "attributes" each limit, timeout, size, count or default its behaviour uses (max attempts, cooldowns, page sizes, cache lifetimes, retry counts), and cites the lines that set them. The model keeps these as values of the part, so they matter more than prose detail.
 - Start with what the module does end to end, then its interfaces, then its limits.

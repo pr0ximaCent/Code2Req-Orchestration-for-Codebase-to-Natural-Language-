@@ -12,6 +12,7 @@ import itertools
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -384,6 +385,10 @@ def with_budget(llm: LLM, max_cost_usd: float | None) -> LLM:
 
 MAX_RATE_LIMIT_WAIT = 60.0
 OVERLOAD_WAIT = 15.0
+# Azure's tokens-per-minute limit (DeepSeek): 20 s then 40 s spans the minute it resets in.
+# The jitter keeps workers that hit the limit together from all retrying in the same second.
+RATE_LIMIT_WAIT = 20.0
+RATE_LIMIT_JITTER = 5.0
 _RETRY_DELAY_RE = re.compile(r'retryDelay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)s')
 
 
@@ -398,6 +403,8 @@ def retry_wait(err: Exception | None, attempt: int) -> float:
 
     docreq's 2^n backoff, except for a per-minute rate limit: then wait the
     delay Gemini asks for (capped), since retrying sooner just fails again.
+    Any other rate limit (Azure's tokens per minute) waits for the Retry-After
+    the response carried, else 20 s per attempt, plus jitter.
     A daily-quota error is not worth waiting for; the key is parked instead.
     "Model overloaded" (503, high demand) clears in tens of seconds, not two.
     """
@@ -409,9 +416,26 @@ def retry_wait(err: Exception | None, attempt: int) -> float:
         m = _RETRY_DELAY_RE.search(text)
         if m:
             return min(max(base, float(m.group(1))), MAX_RATE_LIMIT_WAIT)
+    if "RateLimitError" in text or "rate limit" in text.lower():
+        after = _retry_after(err)
+        wait = after if after is not None else RATE_LIMIT_WAIT * attempt
+        return min(wait, MAX_RATE_LIMIT_WAIT) + random.uniform(0, RATE_LIMIT_JITTER)
     if "ServiceUnavailable" in text or "high demand" in text or "overloaded" in text.lower():
         return min(OVERLOAD_WAIT * attempt, MAX_RATE_LIMIT_WAIT)
     return base
+
+
+def _retry_after(err: Exception | None) -> float | None:
+    """Seconds from the Retry-After header of a 429 (LiteLLM keeps the response's headers), if any."""
+    for headers in (getattr(err, "headers", None), getattr(getattr(err, "response", None), "headers", None)):
+        if not headers:
+            continue
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        try:
+            return max(0.0, float(value)) if value is not None else None
+        except (TypeError, ValueError):  # an HTTP date instead of seconds
+            return None
+    return None
 
 
 def _short_error(err: Exception) -> str:

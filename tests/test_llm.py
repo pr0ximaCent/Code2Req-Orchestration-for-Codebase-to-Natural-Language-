@@ -195,6 +195,24 @@ def test_retry_wait_honours_per_minute_delay_not_daily():
     assert (retry_wait(overloaded, 1), retry_wait(overloaded, 2), retry_wait(overloaded, 9)) == (15.0, 30.0, 60.0)
 
 
+def test_retry_wait_spans_azures_token_rate_limit_minute():
+    from code2req.llm import RATE_LIMIT_JITTER, retry_wait
+
+    class RateLimitError(Exception):
+        def __init__(self, message, headers=None):
+            super().__init__(message)
+            self.headers = headers
+
+    azure = RateLimitError("Your requests to DeepSeek-V4-Flash in eastus2 have exceeded token rate limit.")
+    assert 20.0 <= retry_wait(azure, 1) <= 20.0 + RATE_LIMIT_JITTER  # not docreq's 2 s, which just fails again
+    assert 40.0 <= retry_wait(azure, 2) <= 40.0 + RATE_LIMIT_JITTER
+    assert 60.0 <= retry_wait(azure, 5) <= 60.0 + RATE_LIMIT_JITTER  # capped
+    told = RateLimitError("exceeded token rate limit", headers={"retry-after": "7"})
+    assert 7.0 <= retry_wait(told, 1) <= 7.0 + RATE_LIMIT_JITTER  # the server's own Retry-After wins
+    dated = RateLimitError("exceeded token rate limit", headers={"retry-after": "Wed, 05 Nov 2026 10:00:00 GMT"})
+    assert 20.0 <= retry_wait(dated, 1) <= 20.0 + RATE_LIMIT_JITTER
+
+
 def test_invalid_and_daily_quota_keys_are_parked(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("GEMINI_API_KEYS", "good,bad,spent")
