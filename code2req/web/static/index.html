@@ -220,11 +220,12 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
     <input class="field" id="exclude" placeholder="*_test.go, migrations/*"></label>
   <label for="workers">Parallel modules
-    <input class="field" id="workers" type="number" value="4" min="1" max="16"></label>
+    <input class="field" id="workers" type="number" value="2" min="1" max="16"
+      title="More than 2 can hit the DeepSeek rate limit on Azure; a module that fails is left out of the result"></label>
   <label for="chars">Module size (characters)
     <input class="field" id="chars" type="number" value="40000" min="5000" step="5000"></label>
   <label for="maxCost">Max API cost (USD)
-    <input class="field" id="maxCost" type="number" min="0" step="0.5" placeholder="no limit"
+    <input class="field" id="maxCost" type="number" value="6" min="0" step="0.5" placeholder="no limit"
       title="Stop making paid model calls once the run has cost this much; the run finishes with what it has"></label>
   <label class="grow" for="entries">Extra entry points for dead-code detection (comma-separated globs)
     <input class="field" id="entries" placeholder="jobs/*.py, worker.py"></label>

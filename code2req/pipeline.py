@@ -584,14 +584,18 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         progress: Progress | None = None, followup: bool = True,
         entries: list[str] | None = None, include_assets: bool = True,
         target: str | None = None, stop: threading.Event | None = None,
-        only_files: list[str] | None = None, profile: str = "exhaustive") -> RunReport:
+        only_files: list[str] | None = None, profile: str = "exhaustive",
+        surface_hints: bool = True) -> RunReport:
     """target: what the user asked to analyse (a git URL or folder) when repo_path is a clone of it.
     stop: once set, the run raises RunStopped at its next progress step or model call.
     only_files: globs; only code and asset modules with a file matching one are sent to the
     model (an eval slice). Module prompts are unchanged, so their cached answers still apply.
     profile: "sysml" (what the CLI and web UI run) or "exhaustive" (see PROFILES). sysml runs no
     follow-up, sends no tests, leaves out CI/CD and reference files, budgets each prompt and names
-    sections after whole modules."""
+    sections after whole modules.
+    surface_hints: False runs as if the language had no surface detector (an experiment): surfaces
+    are still detected and scored, but the model doesn't see them, budgets leave no room per route
+    and no requirement or attribute is filled in from them."""
     if profile not in PROFILES:
         raise ValueError(f"profile must be one of {', '.join(PROFILES)}, not {profile!r}")
     sysml = profile == "sysml"
@@ -640,7 +644,8 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         all_surfaces = assign_surfaces(modules, components, surfaces)
         routes = ([sum(s.kind == "http_route" for s in all_surfaces.get(i, [])) for i in range(len(modules))]
                   + [0] * len(asset_modules))
-        budgets = {id(j): b for j, b in zip([*modules, *asset_modules], requirement_budgets(sizes, routes))}
+        budgets = {id(j): b for j, b in zip([*modules, *asset_modules],
+                                            requirement_budgets(sizes, routes if surface_hints else None))}
     if only_files:
         modules = [m for m in modules
                    if any(matches_globs(components[c].relative_path, only_files) for c in m.component_ids)
@@ -652,7 +657,8 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     surf_by_mod = assign_surfaces(modules, components, surfaces)
     # Tests only decide "confirmed", which a SysML model has no use for.
     tests_by_mod = {} if sysml else assign_tests(modules, components, surfaces, files, surf_by_mod)
-    inputs = [ModuleInput(module=m, surfaces=surf_by_mod.get(i, []), tests=tests_by_mod.get(i, []),
+    inputs = [ModuleInput(module=m, surfaces=surf_by_mod.get(i, []) if surface_hints else [],
+                          tests=tests_by_mod.get(i, []),
                           unused=[f"{components[c].name} ({components[c].relative_path}:"
                                   f"{components[c].start_line}-{components[c].end_line})"
                                   for c in m.component_ids if c in dead],
@@ -790,9 +796,10 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
     gaps, dead_gaps = split_dead(gaps, reach)
 
     reqs, dup_dropped = dedup(passed, fuzzy=sysml)
-    routes_filled = route_requirements(modules, surf_by_mod, reqs) if sysml else []
+    fill = sysml and surface_hints
+    routes_filled = route_requirements(modules, surf_by_mod, reqs) if fill else []
     reqs += routes_filled
-    attributes_filled = default_attributes(reqs, modules, surf_by_mod) if sysml else 0
+    attributes_filled = default_attributes(reqs, modules, surf_by_mod) if fill else 0
     gaps, gap_dup = dedup(gaps)
     references, ref_dup = dedup(references)
     dead_reqs, _ = dedup(dead_passed + dead_gaps)
@@ -810,6 +817,7 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         "target": target or repo_path,
         "model": model,
         "profile": profile,
+        "surface_hints": surface_hints,
         "routes_filled_by_code": len(routes_filled),
         "attributes_filled_by_code": attributes_filled,
         "only_files": only_files or [],

@@ -24,6 +24,7 @@ from code2req.config import (
     rmtree,
 )
 from code2req.cost import cost_lines
+from code2req.estimate import MODEL as ESTIMATED_MODEL
 from code2req.estimate import estimate
 from code2req.eval import eval_markdown, evaluate, evaluate_sysml, sysml_markdown
 from code2req.llm import REASONING_LEVELS, with_budget
@@ -78,6 +79,9 @@ def add_run_args(a: argparse.ArgumentParser, out: str) -> None:
                    help=f"thinking level ({', '.join(REASONING_LEVELS)}) for every stage, or for one "
                         "stage (module, followup, asset, cluster) as STAGE=LEVEL (repeatable); "
                         "default: the provider's own (high for Gemini 3)")
+    a.add_argument("--no-surface-hints", action="store_true",
+                   help="experiment: run as if the language had no surface detector (surfaces are still "
+                        "scored, but not shown to the model, budgeted for or filled in by code)")
     a.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -238,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         repo = resolve_repo(args.target, args.out)
     except (ValueError, subprocess.CalledProcessError) as e:
         p.error(str(e))
-    if args.cmd == "analyze":
+    if args.cmd == "analyze" and args.profile == "sysml" and label.endswith(ESTIMATED_MODEL):  # what it measures
         for line in estimate(repo, args.exclude).lines_of_text()[:2]:
             print(line)
     # The budget sits below the cache, so answers for unchanged code stay free after the cap.
@@ -246,7 +250,8 @@ def main(argv: list[str] | None = None) -> int:
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
                  target=args.target.strip().strip('"'),
                  followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets,
-                 only_files=args.slice if args.cmd == "eval" else None, profile=args.profile)
+                 only_files=args.slice if args.cmd == "eval" else None, profile=args.profile,
+                 surface_hints=not args.no_surface_hints)
     if args.cmd == "eval":
         return write_eval(args, report.to_json())
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
