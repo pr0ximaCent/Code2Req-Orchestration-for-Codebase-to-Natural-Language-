@@ -47,6 +47,14 @@ def test_compact_answer_without_empty_fields_still_yields_every_docreq_key():
     assert data["canonical_name"] == "Cart Quantity Check"
 
 
+def test_parse_requirements_takes_actors_as_names_or_objects_without_blanks_or_repeats():
+    raw = ('{"requirements":[{"text":"The session shall send the charging rate to the vehicle.",'
+           '"actors":["Vehicle",{"name":"cable","type":"Part"},"",{"name":" vehicle "},{"type":"x"},7]}]}')
+    r = parse_requirements(raw, Module(name="station", path=["station"]))[0]
+    assert [(a.name, a.type) for a in r.actors] == [("Vehicle", ""), ("cable", "Part")]
+    assert r.to_json()["actors"] == [{"name": "Vehicle", "type": ""}, {"name": "cable", "type": "Part"}]
+
+
 def test_parse_requirements_bad_json_returns_empty():
     assert parse_requirements("not json", Module(name="m", path=["m"])) == []
 

@@ -26,6 +26,26 @@ def test_fastapi_routes_env_constants_models():
     assert tests["test_validate_quantity_rejects_zero"].file == "tests/test_api.py"
 
 
+def test_constants_held_as_decimal_or_timedelta_are_read():
+    src = '''
+from datetime import timedelta
+from decimal import Decimal
+MAX_SPEED_KMH = Decimal("25")
+MIN_BALANCE = Decimal("3.00")
+MIN_TEMP_C = Decimal(-20)
+LOW_BATTERY_PCT = 5
+RATE = float("0.25")
+HOLD = timedelta(minutes=10)
+GRACE = datetime.timedelta(1, 30)
+NAME = Decimal("abc")
+WINDOW = timedelta(minutes=LIMIT)
+DEBUG = True
+'''
+    consts = {s.name: s.detail for s in detect_python(src, "config.py") if s.kind == "constant"}
+    assert consts == {"MAX_SPEED_KMH": "25", "MIN_BALANCE": "3.00", "MIN_TEMP_C": "-20", "LOW_BATTERY_PCT": "5",
+                      "RATE": "0.25", "HOLD": "timedelta(minutes=10)", "GRACE": "datetime.timedelta(1, 30)"}
+
+
 def test_flask_route_methods_and_click_commands():
     src = '''
 import click

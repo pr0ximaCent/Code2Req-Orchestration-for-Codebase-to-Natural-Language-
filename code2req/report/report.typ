@@ -159,6 +159,8 @@
   let attrs = val(r, "attributes", default: ()).map(a => text(font: mono, size: 7.5pt, fill: fg2, (
     val(a, "name"), val(a, "operator"), str(val(a, "value", default: 0)), val(a, "unit_literal"),
   ).filter(s => s != "").join(" ")))
+  let actors = val(r, "actors", default: ()).map(a => val(a, "name")).filter(s => s != "")
+  if actors.len() > 0 { attrs.push(text(size: 7.5pt, fill: fg2, "Actors: " + actors.join(", "))) }
   let notes = if rejected {
     evidence.filter(e => val(e, "note") != "").map(e => text(size: 7.5pt, fill: bad,
       brk(val(e, "file")) + ":" + str(val(e, "start_line", default: 1)) + " — " + val(e, "note")))

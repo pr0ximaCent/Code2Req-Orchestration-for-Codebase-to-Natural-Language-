@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -17,6 +18,7 @@ from code2req import assets as asset_files
 from code2req import reachability
 from code2req.agents.asset_agent import run_asset
 from code2req.agents.module_agent import (
+    CodeBlock,
     FollowUp,
     ModuleInput,
     TestSnippet,
@@ -84,10 +86,13 @@ PROFILES = ("sysml", "exhaustive")
 # Non-code files whose requirements describe the running system. CI/CD is how the project is built
 # (model generation sets process requirements aside) and reference material is not an obligation.
 SYSML_ASSET_ROLES = ("prompt", "skill", "template", "config")
-# A requirement per ~100 lines shown, 2 to 10 per prompt, and at most 480 per repo: model generation
-# makes at most 16 components and designs one best with 30 requirements or fewer.
+# A requirement per ~100 lines shown, 2 to 10 per prompt, and never fewer than one per route and per
+# rule: one per named constant (each is a limit or value of its own) and one per 2 refusal or state
+# lines (a check and its outcome). 480 per repo, since model generation makes at most 16 components
+# and designs one best with 30 requirements or fewer; that cap trims only what size adds, never a rule.
 LINES_PER_REQUIREMENT = 100
 MIN_BUDGET, MAX_BUDGET = 2, 10
+RULE_LINES_PER_REQUIREMENT = 2
 MAX_REQUIREMENTS = 480
 MIN_SYMBOL_LEN = 4
 MIN_ROUTE_LEN = 4  # shorter paths ("/", "/x") match too much text
@@ -135,7 +140,8 @@ def split_dead(reqs: list[FlatRequirement],
 def assign_surfaces(modules: list[Module], components: dict[str, Any],
                     surfaces: list[Surface]) -> dict[int, list[Surface]]:
     """A surface goes to the module whose component contains its line, else the
-    first module holding any component of that file."""
+    first module holding any component of that file, else the module that holds the
+    whole file (a file of constants only, like a config.py, has no components)."""
     ranges: dict[str, list[tuple[int, int, int]]] = {}
     file_owner: dict[str, int] = {}
     for i, m in enumerate(modules):
@@ -143,6 +149,9 @@ def assign_surfaces(modules: list[Module], components: dict[str, Any],
             n = components[cid]
             ranges.setdefault(n.relative_path, []).append((n.start_line, n.end_line, i))
             file_owner.setdefault(n.relative_path, i)
+    for i, m in enumerate(modules):
+        for rel in m.extra_files:
+            file_owner.setdefault(rel, i)
     out: dict[int, list[Surface]] = {}
     for s in surfaces:
         if s.kind == "test":
@@ -222,8 +231,9 @@ def build_file_cache(repo_path: str, components: dict[str, Any],
     constants: dict[str, float] = {}
     for s in surfaces:
         if s.kind == "constant":
+            parsed = default_value(s)  # also reads timedelta(...) constants, in seconds
             try:
-                constants.setdefault(s.name, float(s.detail))
+                constants.setdefault(s.name, parsed[0] if parsed else float(s.detail))
             except ValueError:
                 pass
     return FileCache(repo_path, symbols=symbols, constants=constants)
@@ -428,18 +438,59 @@ def type_coverage(modules: list[Module], components: dict[str, Any], reqs: list[
             "ratio": round((total - len(uncited)) / total, 3) if total else None, "uncited": uncited}
 
 
-def requirement_budgets(lines: list[int], routes: list[int] | None = None) -> list[int]:
-    """Most requirements to ask for, per prompt of the given number of lines, scaled down
-    together when the repo would pass MAX_REQUIREMENTS. A prompt gets at least one per HTTP
-    route it declares, plus MIN_BUDGET for the rest of its behaviour: each route is a port of
-    the model. On gotenberg a size-only budget left the last routes of a 15-route file without
-    one, and exactly one per route was spent partly on configuration, leaving two unnamed."""
+# Lines that hold a rule: an error raised or returned, a 4xx/5xx reply, or a change of status or
+# state. An error passed on (a bare raise, Go's %w wrap, return err) is not a rule of its own, and
+# neither is a stub (raise NotImplementedError, which abstract base classes are full of).
+REFUSAL_RE = re.compile(
+    r"^\s*raise\s+(?!NotImplementedError\b)\w"  # Python
+    r"|\bthrow\s+new\s+\w"  # TypeScript, JavaScript
+    r"|\berrors\.New\("  # Go: a new error
+    r'|\bfmt\.Errorf\("(?:[^"\\%]|\\.|%[^w])*"'  # Go: a new message, not a %w wrap
+    r"|\breturn\b.*\b(?:Err[A-Z]\w*|\w*Error\{)"  # Go: a sentinel error or an error type
+    r"|\bhttp\.Status(?:BadRequest|Unauthorized|PaymentRequired|Forbidden|NotFound|MethodNotAllowed|Conflict"
+    r"|Gone|PreconditionFailed|RequestEntityTooLarge|UnsupportedMediaType|UnprocessableEntity|TooManyRequests"
+    r"|InternalServerError|NotImplemented|BadGateway|ServiceUnavailable|GatewayTimeout)\b"
+    r"|(?i:status(?:_?code)?)\s*[:=(]\s*[45]\d\d\b")  # status_code=404, { status: 400 }, .status(403)
+STATE_RE = re.compile(r"\.\w*(?:[sS]tatus|[sS]tate)\s*=(?!=)")  # scooter.status = ..., o.State = ...
+COMMENT_PREFIXES = ("#", "//", "/*", "*")
+
+
+def rule_lines(blocks: list[CodeBlock]) -> int:
+    """Lines of a prompt's code listing that hold a rule (REFUSAL_RE, STATE_RE)."""
+    return sum(1 for _, _, runs in blocks for _, lines in runs for line in lines
+               if not line.lstrip().startswith(COMMENT_PREFIXES)
+               and (REFUSAL_RE.search(line) or STATE_RE.search(line)))
+
+
+def rule_count(constants: int, refusal_or_state_lines: int) -> int:
+    """Requirements a prompt's rules need: one per named constant, one per
+    RULE_LINES_PER_REQUIREMENT rule_lines."""
+    return constants + math.ceil(refusal_or_state_lines / RULE_LINES_PER_REQUIREMENT)
+
+
+def requirement_budgets(lines: list[int], routes: list[int] | None = None,
+                        rules: list[int] | None = None) -> list[int]:
+    """Most requirements to ask for, per prompt of the given number of lines. A prompt gets at
+    least one per HTTP route it declares, plus MIN_BUDGET for the rest of its behaviour: each
+    route is a port of the model. On gotenberg a size-only budget left the last routes of a
+    15-route file without one, and exactly one per route was spent partly on configuration,
+    leaving two unnamed.
+
+    rules (rule_count) raise that when the code is denser in rules than its size shows: one per
+    route plus one per rule. By size alone scooter-sharing's 403-line service got 4 for 39 rules
+    and dropped the fare and the fault handling, RealWorld's articles got 15 for 13 routes, leaving
+    2 for 1,038 lines of behaviour, and a 29-line EV charger with four limits got 2 and dropped one.
+
+    Routes and rules are a floor nothing cuts: when the repo would pass MAX_REQUIREMENTS, only what
+    size adds above it is scaled down, and a repo whose floors alone pass the cap keeps them all."""
     routes = routes or [0] * len(lines)
-    budgets = [max(r + MIN_BUDGET if r else 0, min(MAX_BUDGET, max(MIN_BUDGET, round(n / LINES_PER_REQUIREMENT))))
-               for n, r in zip(lines, routes)]
-    total = sum(budgets)
-    if total > MAX_REQUIREMENTS:
-        budgets = [max(1, b * MAX_REQUIREMENTS // total) for b in budgets]
+    rules = rules or [0] * len(lines)
+    floors = [r + k for r, k in zip(routes, rules)]
+    budgets = [max(r + MIN_BUDGET if r else 0, min(MAX_BUDGET, max(MIN_BUDGET, round(n / LINES_PER_REQUIREMENT))), f)
+               for n, r, f in zip(lines, routes, floors)]
+    extra, room = sum(budgets) - sum(floors), MAX_REQUIREMENTS - sum(floors)
+    if extra > max(room, 0):
+        budgets = [max(1, f + (b - f) * max(room, 0) // extra) for b, f in zip(budgets, floors)]
     return budgets
 
 
@@ -485,16 +536,35 @@ def route_requirements(modules: list[Module], surf_by_mod: dict[int, list[Surfac
 
 DURATION_UNITS = {"Nanosecond": 1e-9, "Microsecond": 1e-6, "Millisecond": 1e-3, "Second": 1.0,
                   "Minute": 60.0, "Hour": 3600.0}
+# Python timedelta's arguments, in positional order, in seconds.
+TIMEDELTA_UNITS = {"days": 86400.0, "seconds": 1.0, "microseconds": 1e-6, "milliseconds": 1e-3,
+                   "minutes": 60.0, "hours": 3600.0, "weeks": 604800.0}
 NUMBER_RE = r"-?\d+(?:\.\d+)?"
+
+
+def timedelta_seconds(args: str) -> float | None:
+    """"minutes=10" -> 600, "1, 30" (days, seconds) -> 86430; None unless every argument is a number."""
+    total = 0.0
+    for i, arg in enumerate(a.strip() for a in args.split(",") if a.strip()):
+        unit, _, number = arg.rpartition("=")
+        unit = unit.strip() or (list(TIMEDELTA_UNITS)[i] if i < len(TIMEDELTA_UNITS) else "")
+        if unit not in TIMEDELTA_UNITS or not re.fullmatch(NUMBER_RE, number.strip()):
+            return None
+        total += float(number) * TIMEDELTA_UNITS[unit]
+    return total
 
 
 def default_value(s: Surface) -> tuple[float, str, str] | None:
     """A flag's or constant's numeric default as (value in SI units, ISQ type, unit literal), read
     from what the surface detector found: "flag int default 4" -> (4, Integer, ""), "flag duration
-    default time.Duration(30)*time.Second" -> (30, DurationValue, "[s]"), a constant "50" -> 50.
+    default time.Duration(30)*time.Second" -> (30, DurationValue, "[s]"), a constant "50" -> 50,
+    a constant "timedelta(minutes=10)" -> (600, DurationValue, "[s]").
     None for booleans, strings, lists and defaults that are names."""
     detail = s.detail.strip().replace("_", "") if s.kind == "constant" else s.detail.strip()
     if s.kind == "constant":
+        if m := re.fullmatch(r"(?:\w+\.)?timedelta\((.*)\)", detail):
+            seconds = timedelta_seconds(m.group(1))
+            return None if seconds is None else (seconds, "ISQ::DurationValue", "[s]")
         if not re.fullmatch(NUMBER_RE, detail):
             return None
         return float(detail), "ScalarValues::Real" if "." in detail else "ScalarValues::Integer", ""
@@ -644,8 +714,11 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         all_surfaces = assign_surfaces(modules, components, surfaces)
         routes = ([sum(s.kind == "http_route" for s in all_surfaces.get(i, [])) for i in range(len(modules))]
                   + [0] * len(asset_modules))
+        rules = ([rule_count(sum(s.kind == "constant" for s in all_surfaces.get(i, [])) if surface_hints else 0,
+                             rule_lines(code_blocks(m.component_ids, m.extra_files, components, files.lines)))
+                  for i, m in enumerate(modules)] + [0] * len(asset_modules))
         budgets = {id(j): b for j, b in zip([*modules, *asset_modules],
-                                            requirement_budgets(sizes, routes if surface_hints else None))}
+                                            requirement_budgets(sizes, routes if surface_hints else None, rules))}
     if only_files:
         modules = [m for m in modules
                    if any(matches_globs(components[c].relative_path, only_files) for c in m.component_ids)

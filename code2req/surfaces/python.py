@@ -5,7 +5,7 @@ concrete anchors and the run can report surface coverage:
   - HTTP routes: FastAPI/APIRouter (@x.get/post/...), Flask (@x.route)
   - CLI commands: click / typer (@x.command, @click.group)
   - env vars: os.getenv / os.environ.get / os.environ[...]
-  - module-level numeric constants (UPPER_CASE = number)
+  - module-level numeric constants (UPPER_CASE = number, Decimal("3.00"), timedelta(minutes=10))
   - pytest tests (test_* functions)
   - data models: classes based on BaseModel / Base / models.Model / dataclass
   - enums (Enum / IntEnum / StrEnum / Flag) and error types (*Error / *Exception bases)
@@ -95,6 +95,45 @@ def _env_name(node: ast.AST) -> str:
     return ""
 
 
+NUMBER_TYPES = {"Decimal", "float", "int", "Fraction"}
+TIMEDELTA_ARGS = {"weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds"}
+
+
+def _number(node: ast.AST) -> str | None:
+    """A numeric literal as written: 25, -20, 0.25 (bools are not numbers)."""
+    sign = ""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        sign, node = "-", node.operand
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return sign + ast.unparse(node)
+    return None
+
+
+def _constant_value(node: ast.AST) -> str | None:
+    """A module-level constant's value when it is a number: 25 -> "25", Decimal("3.00") -> "3.00",
+    timedelta(minutes=10) -> "timedelta(minutes=10)". Limits held as Decimal or timedelta were
+    missed before: scooter-sharing's config.py has 13 limits and only 5 are plain numbers."""
+    if (value := _number(node)) is not None:
+        return value
+    if not isinstance(node, ast.Call):
+        return None
+    fn = _dotted(node.func).rsplit(".", 1)[-1]
+    if fn in NUMBER_TYPES and len(node.args) == 1 and not node.keywords:
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            try:
+                float(arg.value)
+            except ValueError:
+                return None
+            return arg.value.strip()
+        return _number(arg)
+    if (fn == "timedelta" and (node.args or node.keywords)
+            and all(_number(a) is not None for a in node.args)
+            and all(kw.arg in TIMEDELTA_ARGS and _number(kw.value) is not None for kw in node.keywords)):
+        return ast.unparse(node)
+    return None
+
+
 def detect_python(source: str, rel: str) -> list[Surface]:
     try:
         tree = ast.parse(source)
@@ -141,17 +180,13 @@ def detect_python(source: str, rel: str) -> list[Surface]:
         if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             continue
         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-        value = stmt.value
-        if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub):
-            value = value.operand
-        if not (isinstance(value, ast.Constant) and isinstance(value.value, (int, float))
-                and not isinstance(value.value, bool)):
+        value = _constant_value(stmt.value) if stmt.value is not None else None
+        if value is None:
             continue
         for t in targets:
             if isinstance(t, ast.Name) and t.id.isupper() and len(t.id) > 1:
                 out.append(Surface(kind="constant", name=t.id, file=rel, line=stmt.lineno,
-                                   end_line=stmt.end_lineno or stmt.lineno,
-                                   detail=ast.unparse(stmt.value)))
+                                   end_line=stmt.end_lineno or stmt.lineno, detail=value))
 
     out.sort(key=lambda s: (s.line, s.kind, s.name))
     return out

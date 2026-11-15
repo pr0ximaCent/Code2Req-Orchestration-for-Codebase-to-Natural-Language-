@@ -258,7 +258,7 @@ A *surface* is something the system exposes or enforces that a requirement shoul
 | `http_route` | Decorator `@<x>.get/post/put/patch/delete/head/options/websocket(...)` (FastAPI, APIRouter); `@<x>.route(..., methods=[...])` (Flask; default GET) | `"POST /cart/items"` / handler function name |
 | `cli_command` | Decorator `@<x>.command(...)` or `@<x>.group(...)` (click, typer) | `name=` argument or function name / decorator |
 | `env_var` | `os.getenv("X")`, `getenv("X")`, `os.environ.get("X")`, `os.environ["X"]` | variable name (once per file) |
-| `constant` | Module-level `UPPER_CASE = <int or float>` (including negative), not booleans | name / literal value, e.g. `"50"` |
+| `constant` | Module-level `UPPER_CASE = <int or float>` (including negative), not booleans; also a number held as `Decimal("3.00")`, `float("0.25")` or `int(...)`, and `timedelta(minutes=10)` with number arguments. A file of constants only (a `config.py` with no functions) belongs to the module that holds it whole | name / value, e.g. `"50"`, `"3.00"`, `"timedelta(minutes=10)"` (read as 600 s) |
 | `model` | Class based on `BaseModel`, `Base`, `Model`, `SQLModel`, `Document`, `TypedDict`, or decorated `@dataclass` | class name / bases |
 | `enum` | Class based on `Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag` | class name / bases |
 | `error` | Class based on `Exception`, `BaseException`, or any `*Error` / `*Exception` class | class name / bases |
@@ -800,11 +800,11 @@ code2req/
 
 ## 16. Tests
 
-103 tests, all offline (`pytest`). They take about 30 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
+152 tests, all offline (`pytest`). They take about 70 seconds. `test_cost.py` reuses the expected values from SysModeler's own Go cost tests, plus credits rounding (0.00015 USD → 2 credits), run-total rounding, the stage/model breakdown, and the LiteLLM split between answer and thinking tokens.
 
 | File | Covers |
 |---|---|
-| `test_surfaces.py` | FastAPI routes with exact line, Flask `methods=`, click/typer commands, env var forms, constants, models, enums, error types, tests, unparsable files |
+| `test_surfaces.py` | FastAPI routes with exact line, Flask `methods=`, click/typer commands, env var forms, constants (plain, `Decimal`, `timedelta`), models, enums, error types, tests, unparsable files |
 | `test_verify.py` | Valid evidence; missing file, wrong line and wrong symbol; one good citation is enough; confirmed downgrade; attribute values with unit scaling; enclosing-symbol match; constant-name resolution (the last two reproduce real-run false rejections); quote and heading anchors in non-code files |
 | `test_repofiles.py` | Tracked files only; ignored and untracked files skipped; generated files by name and header; `--exclude`; no-git walk; components and component-less files outside the list dropped |
 | `test_reachability.py` | Entry points (app object, `__main__`, Dockerfile, `pyproject` scripts, `--entry`); string imports; tests not counted; dead files; dead functions vs. called, named in strings, decorated, framework methods; no entry point → nothing dead |

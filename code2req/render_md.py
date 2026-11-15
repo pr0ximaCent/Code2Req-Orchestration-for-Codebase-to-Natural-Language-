@@ -30,6 +30,8 @@ def _section(title: str, reqs: list[FlatRequirement], intro: str = "") -> list[s
             lines.append(f"  - {r.type} · {BADGE[r.confidence]}{role}{dead} · {_evidence(r)}")
             for a in r.attributes:
                 lines.append(f"  - `{a.name} {a.operator} {a.value:g} {a.unit_literal}`".rstrip())
+            if r.actors:
+                lines.append(f"  - actors: {', '.join(a.name for a in r.actors)}")
         lines.append("")
     return lines
 
