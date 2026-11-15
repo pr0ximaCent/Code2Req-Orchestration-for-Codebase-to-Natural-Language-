@@ -6,10 +6,11 @@ import shutil
 from code2req.cli import main
 from code2req.dedup import dedup
 from code2req.eval import evaluate_sysml, limits_kept, named_in
-from code2req.pipeline import (MAX_REQUIREMENTS, attribute_name, default_attributes, default_value,
-                               requirement_budgets, run)
+from code2req.pipeline import (MAX_REQUIREMENTS, assign_surfaces, attribute_name, default_attributes,
+                               default_value, requirement_budgets, rule_count, rule_lines, run)
 from code2req.prompts import SYSML_ASSET_SYSTEM, SYSML_MODULE_SYSTEM
-from code2req.schema import Evidence, FlatRequirement, Surface
+from code2req.render_md import render_markdown
+from code2req.schema import Evidence, FlatRequirement, RunReport, Surface
 from code2req.structure import Module, split_large_modules, sysml_sections
 from code2req.verify import FileCache, check_evidence
 from tests.test_pipeline import FIXTURE
@@ -52,8 +53,9 @@ def test_sysml_profile_budgets_the_prompt_and_skips_followup_tests_and_report(tm
 
     assert len(llm.calls) == 1  # one module call, no follow-up
     prompt = llm.calls[0][1]
-    # 35 lines and two routes: one per route plus the minimum of 2.
-    assert prompt.startswith("MODULE: app\nBUDGET: at most 4 requirements")
+    # 35 lines, two routes, two constants and two refusals: one per route, one per constant and
+    # one for the two refusals.
+    assert prompt.startswith("MODULE: app\nBUDGET: at most 5 requirements")
     assert "### F1 app/api.py (whole file, lines 1-35)" in prompt
     assert "TESTS THAT EXERCISE" not in prompt
     # F-ids resolve to the listed file; the restated limit is merged into the first one. GET
@@ -70,7 +72,7 @@ def test_sysml_profile_budgets_the_prompt_and_skips_followup_tests_and_report(tm
     assert sorted(e.note for r in report.rejected for e in r.evidence) == ["file not found",
                                                                           "start_line outside file"]
     st = report.stats
-    assert st["profile"] == "sysml" and st["budget_total"] == 4 and st["dedup_dropped"] == 1
+    assert st["profile"] == "sysml" and st["budget_total"] == 5 and st["dedup_dropped"] == 1
     assert st["routes_filled_by_code"] == 1
     with open(f"{FIXTURE}/app/api.py", encoding="utf-8") as f:
         assert st["code_lines"] == len(f.read().splitlines())
@@ -145,6 +147,80 @@ def test_budgets_follow_prompt_size_and_routes_and_fit_the_repo_cap():
     assert requirement_budgets([150, 900, 900, 581], [7, 3, 15, 9]) == [9, 9, 17, 11]
     many = requirement_budgets([1000] * 100)
     assert set(many) == {4} and sum(many) <= MAX_REQUIREMENTS
+
+
+def test_budgets_grow_with_the_rules_the_code_holds():
+    # no rules: the size budget is unchanged
+    assert requirement_budgets([150, 900], [0, 7], [0, 0]) == [2, 9]
+    # scooter-sharing's service: 403 lines, 14 constants + 25 rule lines -> 27, not 4
+    assert requirement_budgets([403], [0], [rule_count(14, 25)]) == [27]
+    # RealWorld's articles: one per route plus one per rule, not 2 left after 13 routes
+    assert requirement_budgets([1038], [13], [rule_count(0, 30)]) == [28]
+    # a 29-line EV charger with four limits and no refusals: one per limit, not 2
+    assert requirement_budgets([29], [0], [rule_count(4, 0)]) == [4]
+    # few rules never lower the size budget, and many are never capped
+    assert requirement_budgets([900, 3000], [0, 0], [3, 200]) == [9, 200]
+
+
+def test_sysml_module_prompt_asks_where_inputs_come_from_and_for_actors():
+    assert "where each input of its behaviour comes from and where each result goes" in SYSML_MODULE_SYSTEM
+    assert "never as a requirement of its own" in SYSML_MODULE_SYSTEM
+    assert '"actors":[{"name":"..."}]' in SYSML_MODULE_SYSTEM
+    assert "actors" not in SYSML_ASSET_SYSTEM  # asset prompts, and their cached answers, are unchanged
+
+
+def test_markdown_report_lists_actors():
+    r = FlatRequirement(id="CODE-SRC-001", text="The session shall send the charging rate to the vehicle.",
+                        section="src", actors=[{"name": "Vehicle"}, {"name": "Cable"}])
+    assert "  - actors: Vehicle, Cable" in render_markdown(RunReport(requirements=[r]))
+
+
+def test_rule_count_takes_each_constant_and_a_check_with_its_outcome():
+    assert rule_count(0, 0) == 0
+    assert rule_count(4, 0) == 4
+    assert rule_count(0, 3) == 2
+    assert rule_count(14, 25) == 27
+
+
+def test_repo_cap_trims_only_what_size_adds_never_routes_or_rules():
+    # 60 prompts of 10 by size, 5 of them rules: the cap of 480 takes 3 of the 5 size adds
+    trimmed = requirement_budgets([1000] * 60, [0] * 60, [5] * 60)
+    assert set(trimmed) == {8} and sum(trimmed) == MAX_REQUIREMENTS
+    # floors alone past the cap: every route and rule keeps its requirement
+    floors = requirement_budgets([1000] * 100, [1] * 100, [5] * 100)
+    assert set(floors) == {6} and sum(floors) > MAX_REQUIREMENTS
+
+
+def test_rule_lines_count_refusals_and_state_changes_not_passed_on_errors():
+    code = [
+        'raise NotAllowed("account balance is below $3.00")',
+        "raise",
+        "    raise NotImplementedError",
+        "    scooter.status = ScooterStatus.IN_USE",
+        "if scooter.status == ScooterStatus.IN_USE:",
+        "# raise ValueError('commented out')",
+        'return nil, errors.New("invalid slug")',
+        'return fmt.Errorf("convert %s: %w", name, err)',
+        'return fmt.Errorf("unknown engine %q", name)',
+        "return nil, ErrNotFound",
+        "return nil, err",
+        "c.JSON(http.StatusUnprocessableEntity, NewValidatorError(err))",
+        "c.JSON(http.StatusOK, res)",
+        'throw new Error("not signed in")',
+        "return NextResponse.json({ error }, { status: 403 })",
+        "raise HTTPException(status_code=404)",
+        "o.State = StateDone",
+    ]
+    counted = [line for line in code if rule_lines([("f", "", [(1, [line])])])]
+    assert counted == [code[0], code[3], code[6], code[8], code[9], code[11], code[13], code[14], code[15], code[16]]
+
+
+def test_constants_of_a_file_without_functions_go_to_the_module_holding_it():
+    comps = {"svc": node("pkg/service.py", 1, 10, name="svc")}
+    mods = [Module(name="demo", path=["demo"], extra_files=["demo.py"]),
+            Module(name="pkg", path=["pkg"], component_ids=["svc"], extra_files=["pkg/config.py"])]
+    limit = Surface(kind="constant", name="MIN_RIDER_AGE", file="pkg/config.py", line=3, end_line=3, detail="18")
+    assert assign_surfaces(mods, comps, [limit]) == {1: [limit]}
 
 
 def test_fuzzy_dedup_merges_restatements_within_one_section_only():
@@ -241,6 +317,11 @@ def test_flag_and_constant_defaults_are_read_from_what_the_detector_found():
         assert default_value(flag(no_number)) is None
     const = Surface(kind="constant", name="MAX_CART_ITEMS", file="a.py", line=6, end_line=6, detail="50")
     assert default_value(const) == (50.0, "ScalarValues::Integer", "")
+    hold = const.model_copy(update={"name": "RESERVATION_HOLD", "detail": "timedelta(minutes=10)"})
+    assert default_value(hold) == (600.0, "ISQ::DurationValue", "[s]")
+    grace = hold.model_copy(update={"detail": "datetime.timedelta(1, 30)"})
+    assert default_value(grace) == (86430.0, "ISQ::DurationValue", "[s]")
+    assert default_value(hold.model_copy(update={"detail": "timedelta(minutes=LIMIT)"})) is None
     assert [attribute_name(n) for n in ("--webhook-max-retry", "MAX_CART_ITEMS", "defaultImageQuality")] == [
         "webhookMaxRetry", "maxCartItems", "defaultImageQuality"]
 

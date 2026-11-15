@@ -197,6 +197,19 @@ def resolve_refs(evidence: Any, ids: dict[str, str]) -> list:
     return out
 
 
+def actor_items(actors: Any) -> list[dict]:
+    """Actors as {"name": ...} objects, from objects or bare names, without blanks or repeats."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for a in actors if isinstance(actors, list) else []:
+        item = {"name": a} if isinstance(a, str) else a
+        name = str(item.get("name", "")).strip() if isinstance(item, dict) else ""
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append({**item, "name": name})
+    return out
+
+
 def parse_items(items: Any, module: Any, ids: dict[str, str] | None = None) -> list[FlatRequirement]:
     """Requirement items from a model reply, stamped with the module (anything with name and section).
     ids: the F-ids the listing gave each file, when evidence is cited as "F2:18-29"."""
@@ -213,6 +226,7 @@ def parse_items(items: Any, module: Any, ids: dict[str, str] | None = None) -> l
             item["type"] = "functional"
         if item.get("confidence") not in ("confirmed", "inferred", "gap"):
             item["confidence"] = "inferred"
+        item["actors"] = actor_items(item.get("actors"))
         try:
             out.append(FlatRequirement.model_validate(item))
         except ValidationError as e:

@@ -88,11 +88,15 @@ SYSML_NAMING_RULES = """NAMING:
 - subject_name: lowerCamelCase (<=3 words) for the part of the system or the entity being constrained (e.g. "webhookClient", "uploadRequest"). Never "system" alone.
 """
 
+SYSML_ACTOR_RULES = """- actors: who or what the behaviour exchanges with: supplies its inputs, sends its requests or receives its results. A person (user, operator, administrator), a device (vehicle, sensor, scooter) or another system (client, payment gateway), as {"name": "<as the code names it>"}. Not the subject itself, never "system". Leave it out when there is none.
+"""
+
 # The sysml profile: requirements are the input of SysML model generation (docreq pass-2, then
 # full_model_generation), which turns each into a port, an attribute, an action flow, a state
-# machine or a message. Only the fields it reads are asked for, and a BUDGET line in each prompt
-# keeps the count to what one component design can model. The prompt is the same for every
-# module, so the provider's cached copy of it serves the whole run.
+# machine or a message, and each actor into a part it connects to. Only the fields it reads are
+# asked for, and a BUDGET line in each prompt keeps the count to what one component design can
+# model. The prompt is the same for every module, so the provider's cached copy of it serves the
+# whole run.
 SYSML_MODULE_SYSTEM = """You write the requirements a SysML v2 model of a software system is built from.
 
 You are given one module of the codebase: its source code with line numbers, the surfaces found in it (routes, CLI commands and flags, env vars, constants, errors), and a BUDGET: the most requirements to write for it.
@@ -110,6 +114,7 @@ RULES:
 - An interface requirement names each request, response or message it covers and lists its fields.
 - Flags or env vars that configure one feature share one requirement that names each of them with its default.
 - Every requirement, whatever its type, carries in "attributes" each limit, timeout, size, count or default its behaviour uses (max attempts, cooldowns, page sizes, cache lifetimes, retry counts), and cites the lines that set them. The model keeps these as values of the part, so they matter more than prose detail.
+- A requirement says where each input of its behaviour comes from and where each result goes, naming the participant or part that supplies or receives it ("reads the battery temperature the vehicle reports and sends the charging rate to the vehicle", "accepts the order a client sends"), and lists the outside ones in "actors". A route is called by a client, a command or env var is set by an operator, a reading is reported by the device or feed it comes from. Write this into the requirement of the behaviour, never as a requirement of its own. The model connects its parts from these, so a behaviour that names no source and no recipient is drawn unconnected.
 - Start with what the module does end to end, then its interfaces, then its limits.
 - Stay within the BUDGET. Fewer is fine when they cover the module; covering every route, command and env var matters more than restating details.
 - Skip logging, metrics plumbing, formatting helpers, getters, constructors, registration and other boilerplate. Code listed under UNUSED CODE is never called: write nothing for it.
@@ -117,10 +122,10 @@ RULES:
 
 EVIDENCE (mandatory): every requirement cites 1-3 places as "<file id>:<first line>-<last line>", e.g. "F2:18-29". The file id is printed before the file's path in the listing (### F2 path/to/file.go ...). Use ONLY line numbers printed in the listing; the cited lines must contain the behaviour and any value in "attributes".
 
-""" + SYSML_NAMING_RULES + "\n" + ATTRIBUTE_RULES + """
+""" + SYSML_NAMING_RULES + SYSML_ACTOR_RULES + "\n" + ATTRIBUTE_RULES + """
 Return ONLY valid JSON of this shape. """ + COMPACT_JSON + """
-{"requirements":[{"text":"The ... shall ...","type":"functional","canonical_name":"...","subject_name":"...","evidence":["F1:18-29"]}]}
-"type" is one of functional, performance, interface, constraint, safety. Add "attributes" whenever the code sets a value for the behaviour.
+{"requirements":[{"text":"The ... shall ...","type":"functional","canonical_name":"...","subject_name":"...","actors":[{"name":"..."}],"evidence":["F1:18-29"]}]}
+"type" is one of functional, performance, interface, constraint, safety. Add "attributes" whenever the code sets a value for the behaviour, and "actors" whenever it exchanges with a participant outside its part.
 If the module implements nothing worth a requirement, return {"requirements":[]}.
 """
 

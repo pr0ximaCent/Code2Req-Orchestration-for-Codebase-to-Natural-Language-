@@ -19,6 +19,7 @@ def full_result():
     return {
         "requirements": [req(1, "The API shall hold at most 50 items in a `Cart`.",
                              attributes=[{"name": "cartItems", "operator": "<=", "value": 50}],
+                             actors=[{"name": "client"}, {"name": ""}],
                              review={"verdict": "accepted", "note": "checked"}),
                          req(2, "The receipt prompt shall list items.", asset_role="prompt")],
         "references": [req(3, "The knowledge base shall describe carts.", asset_role="reference")],
@@ -72,5 +73,5 @@ def test_text_is_never_read_as_typst_markup():
     # Read as markup, #panic would stop the build and @nowhere would be an unknown reference.
     hostile = '#panic("markup was evaluated") @nowhere <x> $x^2$ *bold* ] [ \\ ` unbalanced'
     r = req(1, hostile, canonical_name="#panic(1)", section="#panic(2)",
-            evidence=[{"file": "#panic(3)", "start_line": 1, "end_line": 1}])
+            evidence=[{"file": "#panic(3)", "start_line": 1, "end_line": 1}], actors=[{"name": "#panic(5)"}])
     assert render_pdf({"requirements": [r], "stats": {"repo": "#panic(4)", "model": "$"}}).startswith(b"%PDF")
