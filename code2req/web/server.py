@@ -30,9 +30,12 @@ from code2req.cache import with_cache
 from code2req.config import is_git_url, prune_clone, referenced_files, resolve_repo, rmtree
 from code2req.estimate import estimate
 from code2req.llm import LLM, with_budget
+from code2req.model.schema import SystemModel
+from code2req.model.spec import build_spec
 from code2req.pipeline import RunStopped
 from code2req.pipeline import run as run_pipeline
-from code2req.render_pdf import render_pdf
+from code2req.render_pdf import render_pdf, render_spec_pdf
+from code2req.schema import FlatRequirement
 from code2req.structure import DEFAULT_MODULE_CHARS
 
 logger = logging.getLogger(__name__)
@@ -437,6 +440,24 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
         except Exception as e:
             raise HTTPException(500, f"PDF rendering failed: {e}") from e
         headers = {"Content-Disposition": f'attachment; filename="code2req-{run_id}.pdf"'}
+        return Response(pdf, media_type="application/pdf", headers=headers)
+
+    @app.get("/api/runs/{run_id}/model_spec.pdf")
+    def model_spec_pdf(run_id: str) -> Response:
+        """The model spec to upload to SysModeler, from the run's model and requirements. Rendered
+        on request, so a requirement marked wrong in the UI is left out of it."""
+        path = os.path.join(mgr._dir(run_id), "model.json")
+        model = SystemModel.model_validate(_read_json(path, {})) if os.path.isfile(path) else SystemModel()
+        if not model.parts and not model.states:
+            raise HTTPException(404, "this run has no model: run it again, or its code is in a language "
+                                     "code2req does not read a model from yet")
+        reqs = [FlatRequirement.model_validate(r) for r in reviewed(run_id).get("requirements", [])
+                if (r.get("review") or {}).get("verdict") != "wrong"]
+        try:
+            pdf = render_spec_pdf(build_spec(model, reqs, model.description))
+        except Exception as e:
+            raise HTTPException(500, f"PDF rendering failed: {e}") from e
+        headers = {"Content-Disposition": f'attachment; filename="model-spec-{run_id}.pdf"'}
         return Response(pdf, media_type="application/pdf", headers=headers)
 
     @app.get("/api/health")

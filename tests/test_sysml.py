@@ -210,9 +210,16 @@ def test_rule_lines_count_refusals_and_state_changes_not_passed_on_errors():
         "return NextResponse.json({ error }, { status: 403 })",
         "raise HTTPException(status_code=404)",
         "o.State = StateDone",
+        "        self._enter(State.LOCKED)",  # a change made through a helper
+        "this.setState(OrderState.Paid)",
+        "        self.state: State = State.IDLE",
+        "        if self.state is State.IDLE:",  # checks, not changes
+        "        if state in (State.AWAITING_PIN, State.MENU):",
+        "    if order.status != OrderStatus.PAID:",
     ]
     counted = [line for line in code if rule_lines([("f", "", [(1, [line])])])]
-    assert counted == [code[0], code[3], code[6], code[8], code[9], code[11], code[13], code[14], code[15], code[16]]
+    assert counted == [code[0], code[3], code[6], code[8], code[9], code[11], code[13], code[14], code[15], code[16],
+                       code[17], code[18], code[19]]
 
 
 def test_constants_of_a_file_without_functions_go_to_the_module_holding_it():

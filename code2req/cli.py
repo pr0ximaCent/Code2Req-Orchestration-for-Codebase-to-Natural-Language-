@@ -28,8 +28,11 @@ from code2req.estimate import MODEL as ESTIMATED_MODEL
 from code2req.estimate import estimate
 from code2req.eval import eval_markdown, evaluate, evaluate_sysml, sysml_markdown
 from code2req.llm import REASONING_LEVELS, with_budget
+from code2req.model.schema import SystemModel
+from code2req.model.spec import write_spec
 from code2req.pipeline import PROFILES, run
 from code2req.render_pdf import write_pdf
+from code2req.schema import FlatRequirement
 from code2req.structure import DEFAULT_MODULE_CHARS
 
 NOISY_LOGGERS = ("LiteLLM", "litellm", "httpx", "openai", "uvicorn.access")
@@ -150,6 +153,29 @@ def write_eval(args: argparse.Namespace, candidate: dict) -> int:
     return 0 if ev["passed"] else 1
 
 
+def write_run_spec(run_dir: str) -> int:
+    """The model spec for a finished run: what `code2req spec` and the end of every run write."""
+    with open(os.path.join(run_dir, "requirements.json"), encoding="utf-8") as f:
+        reqs = [FlatRequirement.model_validate(r) for r in json.load(f).get("requirements", [])]
+    model_path = os.path.join(run_dir, "model.json")
+    if not os.path.isfile(model_path):
+        print(f"no model.json in {run_dir}: run code2req analyze again to read the model from the code")
+        return 1
+    with open(model_path, encoding="utf-8") as f:
+        model = SystemModel.model_validate(json.load(f))
+    spec = write_spec(run_dir, model, reqs)
+    if spec is None:
+        print("the model has no part and no state: no spec written")
+        return 1
+    if spec["left_out"]:
+        print(f"left out (cite no element of the model): {', '.join(spec['left_out'])}")
+    for note in spec["sysml_notes"]:
+        print(f"not in the SysML text: {note}")
+    print(f"wrote {os.path.join(run_dir, 'model_spec.md')}, model_spec.pdf and {len(spec['sysml'])} SysML file(s) "
+          f"under {os.path.join(run_dir, 'sysml')}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="code2req")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -193,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("-o", "--out", help="PDF path (default: next to the JSON, same name)")
     d.add_argument("-v", "--verbose", action="store_true")
 
+    m = sub.add_parser("spec", help="write the model spec (model_spec.md and .pdf) and its SysML text (sysml/) "
+                                    "for a finished run, from its requirements.json and model.json, without "
+                                    "model calls")
+    m.add_argument("run", help="the run's output folder (--out)")
+    m.add_argument("-v", "--verbose", action="store_true")
+
     args = p.parse_args(argv)
     if args.cmd == "eval" and not args.sysml and not args.baseline:
         p.error("eval needs --baseline (or --sysml)")
@@ -202,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
             result = json.load(f)
         print(f"wrote {write_pdf(result, args.out or os.path.splitext(args.json)[0] + '.pdf')}")
         return 0
+    if args.cmd == "spec":  # no model needed
+        return write_run_spec(args.run)
     if args.cmd == "estimate":  # no model needed
         target = args.target.strip().strip('"')
         tmp = tempfile.mkdtemp(prefix="code2req-estimate-") if is_git_url(target) else None
@@ -280,7 +314,11 @@ def main(argv: list[str] | None = None) -> int:
     for line in cost_lines(st.get("cost")):
         print(line)
     pdf = "requirements.pdf, " if os.path.isfile(os.path.join(args.out, "requirements.pdf")) else ""
-    print(f"wrote {os.path.join(args.out, 'requirements.json')}, requirements.md, {pdf}cost.json")
+    model = "model.json, " if os.path.isfile(os.path.join(args.out, "model.json")) else ""
+    spec = ("model_spec.md, model_spec.pdf, " if os.path.isfile(os.path.join(args.out, "model_spec.pdf"))
+            else "model_spec.md, " if os.path.isfile(os.path.join(args.out, "model_spec.md")) else "")
+    spec += "sysml/, " if os.path.isdir(os.path.join(args.out, "sysml")) else ""
+    print(f"wrote {os.path.join(args.out, 'requirements.json')}, requirements.md, {pdf}{model}{spec}cost.json")
     return 0
 
 

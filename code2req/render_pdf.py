@@ -18,6 +18,7 @@ from datetime import datetime
 
 HERE = os.path.dirname(__file__)
 TEMPLATE = os.path.join(HERE, "report", "report.typ")
+SPEC_TEMPLATE = os.path.join(HERE, "report", "spec.typ")
 FONTS = os.path.join(HERE, "report", "fonts")
 
 # the PDF lists uncovered surfaces from stats, never the surfaces themselves
@@ -38,4 +39,17 @@ def render_pdf(result: dict, generated: str | None = None, details: bool = False
 def write_pdf(result: dict, path: str, details: bool = False) -> str:
     with open(path, "wb") as f:
         f.write(render_pdf(result, details=details))
+    return path
+
+
+def render_spec_pdf(spec: dict) -> bytes:
+    """The model spec (model/spec.py) as the PDF uploaded to SysModeler."""
+    import typst
+
+    return typst.compile(SPEC_TEMPLATE, font_paths=[FONTS], sys_inputs={"data": json.dumps(spec, ensure_ascii=False)})
+
+
+def write_spec_pdf(spec: dict, path: str) -> str:
+    with open(path, "wb") as f:
+        f.write(render_spec_pdf(spec))
     return path

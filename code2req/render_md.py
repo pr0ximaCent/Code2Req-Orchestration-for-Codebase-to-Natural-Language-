@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 
 from code2req.cost import cost_lines
+from code2req.model.report import markdown as model_markdown
+from code2req.model.schema import SystemModel
 from code2req.schema import FlatRequirement, RunReport
 
 BADGE = {"confirmed": "confirmed (test)", "inferred": "inferred", "gap": "gap"}
@@ -40,7 +42,7 @@ def _ratio(d: dict, num: str = "cited", den: str = "total") -> str:
     return f"{d.get(num, 0)}/{d.get(den, 0)}"
 
 
-def render_markdown(report: RunReport) -> str:
+def render_markdown(report: RunReport, model: SystemModel | None = None) -> str:
     st = report.stats
     cov = st.get("surface_coverage", {})
     ac = st.get("asset_coverage", {})
@@ -87,6 +89,8 @@ def render_markdown(report: RunReport) -> str:
                       "Examples, libraries and knowledge-base content the system provides to its AI "
                       "components. These are not obligations on the system.")
     lines += _section("Gaps (intended but not implemented)", report.gaps)
+    if model is not None:
+        lines += model_markdown(model)
     if cov.get("uncovered"):
         lines += ["## Surfaces with no requirement", ""]
         lines += [f"- {u}" for u in cov["uncovered"]] + [""]

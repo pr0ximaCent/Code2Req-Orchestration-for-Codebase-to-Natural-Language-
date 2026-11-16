@@ -178,7 +178,7 @@ flowchart TD
   GAP --> OUT
   REJ --> OUT
   DR --> OUT
-  OUT["Stage 6 · coverage + requirements.json / .md / .pdf / module_tree.json"]
+  OUT["Stage 6 · coverage + requirements.json / .md / .pdf / model.json / module_tree.json"]
 ```
 
 The orchestrator is `code2req/pipeline.py` → `run()`. Reachability, asset discovery and surface detection run first because they are cheap and need no CodeWiki state. The numbered stages below follow the logical order.
@@ -511,6 +511,9 @@ Files written to `--out`:
 | `requirements.json` | Full result (§12) |
 | `requirements.md` | Review report: summary with function, type and non-code coverage; requirements grouped by section with type, confidence, role, `file:lines` and attributes; reference material; gaps; uncovered surfaces; rejected claims with reasons; dead code (entry points, files, functions, non-code files) with reasons; claims about dead code that were set aside |
 | `requirements.pdf` | The requirements as a document styled like the web UI. Page 1 holds the repository name (`owner/repo` for a git URL) and date, tiles for requirements, confirmed by tests, read from code and areas, bars of requirements by type and by area (top 10), a key to the confidence tags ("How to read this report"), and the start of the contents (page numbers and PDF bookmarks). Then one entry per requirement with tags for type, confidence, role and review verdict. For now it leaves out the run overview, coverage, reference material, gaps, rejected claims, uncovered surfaces, dead code and cost; `render_pdf(..., details=True)` puts them back. Rendered from the JSON by Typst (`render_pdf.py`, `report/report.typ`) with the UI's IBM Plex fonts bundled, so it looks the same on any machine; about 4 seconds for 1,500 requirements. If rendering fails the run still succeeds and logs a warning |
+| `model.json` | The behaviour model read from the code, with no model call (Python so far; empty for other languages): the system and its parts with values (limits with their units, starting values), operations, state machines (states with their on-entry calls, transitions with trigger and guard, `after(...)` for timers, `when(...)` for change events), activities (fork/join for parallel work) and sequences stitched from the calls the parts make. Every element cites its lines; a fact whose names are not on its lines is dropped into `rejected`. `links` ties each requirement to the elements whose lines it cites, and `coverage` lists the elements no requirement states on its own, the catch-all requirements and the requirements that cite no element (often a demo script). IDs follow the code, so the same code gives the same file. `requirements.md` shows it under "Behaviour model" |
+| `model_spec.pdf`, `model_spec.md` | The model spec to upload to SysModeler: the behaviour model and the requirements laid out like the deterministic specs SysModeler generates the same model from every time. Every element has a fixed ID to store as its short name (`BLK_`, `OP_`, `REL_`, `ST_`, `TR_`, `ACT_`, `MSG_`); each requirement says which elements implement it; blocks with typed values, operations, part relationships, state machines (a state set without checking the state becomes one transition from each other state), activity nodes with what each leads to, sequences with their messages in order; decisions, what not to add (no ports, interfaces, use cases or other diagrams) and a count check. It ends with the exact SysML v2 text (`sysml/`), and its first line asks the generator to copy that text: the deterministic ATM spec was copied the same way in every run, while tables alone left the generator the SysML to write. Requirements that cite no element are left out, since the generator would model them. No date is printed, so the same code gives the same document. `code2req spec <run folder>` writes it again for a finished run |
+| `sysml/model/...` | The behaviour model as SysML v2 text, written with no model call, in the layout of the deterministic ATM spec: `types.sysml` for named value types, one package and file per part (its action defs and part def), `system.sysml` with the system's action defs, its state machine and part def, the system part, the requirement usages and satisfy links, and `requirements/system_requirements.sysml` with each requirement that cites an element. Every element carries its ID as a short name, numbered as the spec numbers it (`TR_00` is the initial transition, then state by state). Operations become action defs with typed parameters; one whose code is only steps (`dispense_cash`) or that runs an activity gets those steps (fork/join for parallel work). Transitions are written in full: `accept InsertCard` for a call, `accept when ...` and `accept after ...` for change and time events, `if ...` for the guard, `do action ...` for the effect. The event's data is read from the operation the machine performs (`machine.pin_result.valid`), or through its def (`Rental::Start::rider_id`) when the machine cannot reach it: SysModeler's parser does not resolve a payload name (`accept ev : PinResult` ... `ev.valid`) and drops it from guards and effects. What SysML cannot say (a guard condition on a local variable, a call to a private function) is left out with a `// left out:` line and listed in the spec, never guessed; sequences and actors are left out. On the ATM, smartphone and scooter test repos it compiles with the Java parser with 0 errors, serializes to XMI and draws every view; the ATM and smartphone with 0 warnings |
 | `cost.json` | `stats.cost` with the repo and model (§11.1) |
 | `module_tree.json` | CodeWiki's module tree (`{}` when clustering was skipped) |
 | `temp/dependency_graphs/*.json` | CodeWiki's dependency graph |
@@ -783,10 +786,19 @@ code2req/
 │   ├── dedup.py            # exact-text and claim-key dedup, ID assignment
 │   ├── llm.py              # FallbackLLM (docreq chain), LiteLLM, JSON parsing/recovery
 │   ├── schema.py           # pydantic models matching docreq JSON tags
+│   ├── model/              # model.json: the behaviour model and its links to the requirements
+│   │   ├── python.py       # facts from Python's syntax tree (parts, values, states, transitions, calls)
+│   │   ├── checks.py       # each fact against its cited lines, any language
+│   │   ├── sequences.py    # calls stitched into sequences from the actors' entry points
+│   │   ├── mapping.py      # requirement ↔ element links and coverage
+│   │   ├── report.py       # the "Behaviour model" section of requirements.md
+│   │   ├── sysml.py        # sysml/: the model as SysML v2 text, and the IDs the spec shares
+│   │   └── spec.py         # model_spec.md / .pdf: the spec SysModeler generates the model from
 │   ├── render_md.py        # requirements.md
 │   ├── render_pdf.py       # requirements.pdf: passes the JSON to the Typst template
 │   └── report/
 │       ├── report.typ      # PDF layout; reads the JSON itself, so no text is ever read as markup
+│       ├── spec.typ        # model_spec.pdf layout, the same way
 │       └── fonts/          # IBM Plex Sans, Sans Condensed and Mono (OFL, license included)
 ├── tests/
 │   ├── fixtures/shop/      # tiny FastAPI app + one pytest test, used end to end
