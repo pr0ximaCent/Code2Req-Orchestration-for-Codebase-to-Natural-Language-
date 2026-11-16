@@ -1,0 +1,28 @@
+{
+  "name": "atm",
+  "source": "ATM -- Deterministic Design Spec (BLK_01-BLK_06, REL_01-REL_05, ST_01-ST_07, TR_00-TR_17); code in tests/fixtures/atm",
+  "language": "python",
+  "repo": "tests/fixtures/atm",
+  "components": [
+    {"name": "Atm", "aliases": ["atm_controller", "automated_teller_machine"]},
+    {"name": "CardReader"},
+    {"name": "CashDispenser"},
+    {"name": "ReceiptPrinter"},
+    {"name": "Display"},
+    {"name": "BankNetwork", "aliases": ["bank"]}
+  ],
+  "connections": [
+    ["Atm", "CardReader"],
+    ["Atm", "CashDispenser"],
+    ["Atm", "ReceiptPrinter"],
+    ["Atm", "Display"],
+    ["Atm", "BankNetwork"]
+  ],
+  "state_machines": [
+    {
+      "owner": "Atm",
+      "states": ["IDLE", "AWAITING_PIN", "VERIFYING_PIN", "MENU", "AUTHORIZING", "AWAITING_BALANCE", "OUT_OF_SERVICE"],
+      "transitions": 18
+    }
+  ]
+}

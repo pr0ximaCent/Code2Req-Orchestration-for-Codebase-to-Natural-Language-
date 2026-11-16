@@ -1,0 +1,30 @@
+{
+  "name": "realworld",
+  "source": "RealWorld (Conduit) API spec, https://realworld-docs.netlify.app/specifications/backend/endpoints/ — the same backend in every language, so one key scores them all",
+  "components": [
+    {"name": "Users", "aliases": ["user", "auth", "authentication", "account", "accounts", "identity", "security"]},
+    {"name": "Profiles", "aliases": ["profile", "follow", "follows", "following"]},
+    {"name": "Articles", "aliases": ["article", "post", "posts"]},
+    {"name": "Comments", "aliases": ["comment"]},
+    {"name": "Tags", "aliases": ["tag"]}
+  ],
+  "connections": [
+    ["Articles", "Users"],
+    ["Articles", "Profiles"],
+    ["Articles", "Tags"],
+    ["Profiles", "Users"],
+    ["Comments", "Articles"],
+    ["Comments", "Users"]
+  ],
+  "state_machines": [],
+  "endpoints": [
+    "POST /api/users/login", "POST /api/users", "GET /api/user", "PUT /api/user",
+    "GET /api/profiles/:username", "POST /api/profiles/:username/follow", "DELETE /api/profiles/:username/follow",
+    "GET /api/articles", "GET /api/articles/feed", "GET /api/articles/:slug", "POST /api/articles",
+    "PUT /api/articles/:slug", "DELETE /api/articles/:slug",
+    "POST /api/articles/:slug/comments", "GET /api/articles/:slug/comments", "DELETE /api/articles/:slug/comments/:id",
+    "POST /api/articles/:slug/favorite", "DELETE /api/articles/:slug/favorite",
+    "GET /api/tags"
+  ],
+  "actors": ["API client", "Database"]
+}

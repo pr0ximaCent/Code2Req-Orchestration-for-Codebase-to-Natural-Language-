@@ -13,8 +13,10 @@ import os
 import subprocess
 import tempfile
 
+from code2req.bench import SUMMARY, load_suite, run_entry, summary
 from code2req.cache import with_cache
 from code2req.config import (
+    DEFAULT_DEEPSEEK_MODEL,
     build_llm,
     is_git_url,
     load_env,
@@ -27,6 +29,7 @@ from code2req.cost import cost_lines
 from code2req.estimate import MODEL as ESTIMATED_MODEL
 from code2req.estimate import estimate
 from code2req.eval import eval_markdown, evaluate, evaluate_sysml, sysml_markdown
+from code2req.eval_model import FMG_DIR, SCORE_FILE, lines as score_lines, score
 from code2req.llm import REASONING_LEVELS, with_budget
 from code2req.model.schema import SystemModel
 from code2req.model.spec import write_spec
@@ -176,6 +179,38 @@ def write_run_spec(run_dir: str) -> int:
     return 0
 
 
+def run_fmg(run_dir: str, backend_ai: str | None, model: str, key_path: str | None, score_only: bool) -> int:
+    """SysModeler's full model generation on a finished run's requirements, as a dry run with no
+    project (backend-ai scripts/code2req_ingest -model, every tier forced to one model), then its
+    score. Writes run_dir/fmg/: the SysML, FMG's debug folder and score.json."""
+    out = os.path.join(run_dir, FMG_DIR)
+    if not score_only:
+        script = os.path.join(backend_ai or "", "scripts", "code2req_ingest")
+        if not backend_ai or not os.path.isdir(script):
+            print("set --backend-ai (or SYSMODELER_BACKEND_AI) to a sysmodeler-backend-ai checkout")
+            return 1
+        if os.path.isdir(out):  # this run's earlier dry run
+            rmtree(out)
+        cmd = ["go", "run", "./scripts/code2req_ingest", "-in", os.path.abspath(os.path.join(run_dir, "requirements.json")),
+               "-out", os.path.abspath(out), "-model"]
+        done = subprocess.run(cmd, cwd=backend_ai, env={**os.environ, "LLM_FORCE_MODEL": model}, check=False)
+        if done.returncode:
+            return done.returncode
+    key = None
+    if key_path:
+        with open(key_path, encoding="utf-8") as f:
+            key = json.load(f)
+    try:
+        result = score(run_dir, key)
+    except FileNotFoundError as e:
+        print(e)
+        return 1
+    for line in score_lines(result):
+        print(line)
+    print(f"wrote {os.path.join(out, SCORE_FILE)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="code2req")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -225,6 +260,35 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("run", help="the run's output folder (--out)")
     m.add_argument("-v", "--verbose", action="store_true")
 
+    g = sub.add_parser("fmg", help="run SysModeler's full model generation on a finished run's requirements "
+                                   "(dry run, no project) and score the model it builds")
+    g.add_argument("run", help="the run's output folder (--out)")
+    g.add_argument("--backend-ai", default=os.getenv("SYSMODELER_BACKEND_AI"),
+                   help="sysmodeler-backend-ai checkout to run it from (env SYSMODELER_BACKEND_AI)")
+    g.add_argument("--model", default=os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+                   help="the model every FMG tier is forced to (default DeepSeek-V4-Flash; backend-ai reads "
+                        "DEEPSEEK_API_BASE and DEEPSEEK_API_KEY from the env file)")
+    g.add_argument("--key", help="answer key (benchmarks/<name>.json) to score the model's recall against")
+    g.add_argument("--score-only", action="store_true", help="score the run's existing fmg/ folder again")
+    g.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
+    g.add_argument("-v", "--verbose", action="store_true")
+
+    b = sub.add_parser("bench", help="run the benchmark: each repo of the suite through code2req and full model "
+                                     "generation, scored against its answer key; writes bench.md")
+    b.add_argument("--suite", default=os.path.join("benchmarks", "suite.json"))
+    b.add_argument("--only", action="append", metavar="NAME", help="run only this repo of the suite (repeatable)")
+    b.add_argument("--large", action="store_true", help="also run the repos the suite marks large")
+    b.add_argument("--out", default=os.path.join("out", "bench"))
+    b.add_argument("--backend-ai", default=os.getenv("SYSMODELER_BACKEND_AI"),
+                   help="sysmodeler-backend-ai checkout FMG runs from (env SYSMODELER_BACKEND_AI)")
+    b.add_argument("--fmg-model", default=os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+                   help="the model every FMG tier is forced to")
+    b.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="code2req's model (default DeepSeek)")
+    b.add_argument("--max-cost", type=float, default=6.0, metavar="USD",
+                   help="stop code2req's paid calls for one repo once they reach USD (default 6)")
+    b.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
+    b.add_argument("-v", "--verbose", action="store_true")
+
     args = p.parse_args(argv)
     if args.cmd == "eval" and not args.sysml and not args.baseline:
         p.error("eval needs --baseline (or --sysml)")
@@ -236,6 +300,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "spec":  # no model needed
         return write_run_spec(args.run)
+    if args.cmd == "fmg":  # backend-ai calls the model, with the DeepSeek settings from the env file
+        try:
+            load_env(args.env_file)
+        except FileNotFoundError as e:
+            p.error(str(e))
+        return run_fmg(args.run, args.backend_ai, args.model, args.key, args.score_only)
     if args.cmd == "estimate":  # no model needed
         target = args.target.strip().strip('"')
         tmp = tempfile.mkdtemp(prefix="code2req-estimate-") if is_git_url(target) else None
@@ -260,6 +330,18 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         p.error(str(e))
     logging.getLogger("code2req").info("llm: %s", label)
+
+    if args.cmd == "bench":
+        rows = []
+        for entry in load_suite(args.suite, args.only, args.large):
+            print(f"== {entry['name']}")
+            rows.append(run_entry(entry, args.out, llm, label, args.max_cost,
+                                  lambda out_dir, key: run_fmg(out_dir, args.backend_ai, args.fmg_model, key, False)))
+        text = summary(rows)
+        with open(os.path.join(args.out, SUMMARY), "w", encoding="utf-8") as f:
+            f.write(text)
+        print(text)
+        return 0
 
     if args.cmd == "serve":
         import uvicorn
