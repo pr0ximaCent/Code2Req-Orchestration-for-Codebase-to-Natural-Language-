@@ -7,9 +7,10 @@ import re
 
 import pytest
 
-from code2req.design import fix_route_text, title_for, write_design
-from code2req.design.golang import Design
-from code2req.design.render import render
+from code2req.design import fix_route_text, settings_used, title_for, write_design
+from code2req.design.atomize import broken, check
+from code2req.design.golang import Design, Flow
+from code2req.design.render import render, steps_lines
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "go_service")
 
@@ -96,6 +97,61 @@ def test_settings_requirements_and_returns_are_written_in_the_forms_the_modeller
     assert any(s.get("text") == "Return &o." for s in place["steps"])
     handler = next(a for a in design["activities"] if a["name"] == "Place" and a["owner"] == "ApiHandler")
     assert "Stop and return the error." not in str(handler["steps"])
+
+
+@pytest.fixture(scope="module")
+def reader():
+    d = Design(FIXTURE, report(), "Orders")
+    d.build()
+    return d
+
+
+def steps_of(reader, recv, name):
+    key = next(k for k in reader.comp if k[1] == recv)
+    fl = Flow(reader, key, reader.comp[key]["instances"][0], reader.code.methods[key][name])
+    fl.run()
+    return steps_lines(fl.out)
+
+
+def test_failures_the_code_carries_on_from_say_so(reader):
+    lines = steps_of(reader, "Service", "Reconcile")
+    text = "\n".join(lines)
+    assert lines[0] == "1. For each id in ids:"
+    assert "If the context is cancelled or timed out (ctx.Err() returns an error):" in text
+    assert "If id is in seen: skip it and go on with the next one." in text
+    assert 'If Charge fails (returns an error): log a warning ("charge failed"), then skip it and go on with the next one.' in text
+    assert ('If Insert fails (returns an error): log a warning ("payment not recorded"), then go on; '
+            "the failure does not end Reconcile.") in text
+    assert 'Otherwise (id == ""):' in text and text.count("Skip it and go on with the next one.") == 1  # the else that skips
+
+
+def test_switch_cases_say_what_they_do_without_comments_or_info_logs(reader):
+    lines = steps_of(reader, "Gateway", "Refund")
+    assert lines[:3] == ["1. Depending on currency:", '   - "usd":', '      1.1. Set ref to "usd-refund".']
+    text = "\n".join(lines)
+    assert "Call stripe: New(nil)." in text and "If New fails (returns an error):" in text
+    assert '   - otherwise:\n      1.1. Log a warning ("unknown currency").' in text
+    assert "Stripe refunds" not in text and "usd refund" not in text  # a comment and an info log say nothing
+
+
+def test_requirements_say_which_settings_they_use_with_the_defaults(design):
+    used = settings_used("The ApiHandler component shall listen on the configured port.", design["settings"])
+    assert [s["env"] for s in used] == ["PORT"]
+    assert settings_used("The config module shall read environment variables.", design["settings"]) == []
+    assert [s["env"] for s in settings_used("The gateway shall use STRIPE_KEY.", design["settings"])] == ["STRIPE_KEY"]
+    reqs = [{"id": "R-1", "name": "Listen", "kind": "interface", "subject": "ApiHandler", "implemented_by": "",
+             "text": "The ApiHandler component shall listen on the configured port.", "uses": [used[0]["id"]]}]
+    md = render(dict(design, requirements=reqs, left_out_requirements=[], source=FIXTURE))
+    assert f'listen on the configured port. Uses: `portValue : String = "8080"` ({used[0]["id"]}' in md
+
+
+def test_a_statement_joining_two_actions_is_asked_again_but_kept():
+    inp = [{"id": "R-1", "text": "The A component shall accept POST /x and return the draft."}]
+    joined = [{"id": "R-1", "source": "R-1", "name": "X", "text": "The A component shall accept POST /x and return the draft."}]
+    assert any("joins two actions" in p for p in check(inp, joined)) and broken(check(inp, joined)) == []
+    split = [{"id": "R-1-1", "source": "R-1", "name": "X", "text": "The A component shall accept POST /x."},
+             {"id": "R-1-2", "source": "R-1", "name": "Y", "text": "When a POST /x request arrives, the A component shall return the draft."}]
+    assert check(inp, split) == []
 
 
 def test_route_text_is_checked_against_the_routes(design):

@@ -1,6 +1,11 @@
 package orders
 
-import "example.com/orders/store"
+import (
+	"context"
+	"log/slog"
+
+	"example.com/orders/store"
+)
 
 // Status of an order.
 type Status string
@@ -45,4 +50,34 @@ func (s *Service) charge(o Order) {
 	}
 	_ = s.payments.Insert(o.ID, "ok")
 	_ = s.orders.SetStatus(o.ID, string(StatusPaid))
+}
+
+// Reconcile charges each order once; a failure is logged and does not stop the others.
+func (s *Service) Reconcile(ctx context.Context, ids []string) (int, error) {
+	seen := map[string]bool{}
+	done := 0
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return done, err
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = true
+		if id != "" {
+			err := s.gateway.Charge(id, 0)
+			if err != nil {
+				slog.Warn("charge failed", "id", id)
+				continue
+			}
+		} else {
+			slog.Warn("empty order id")
+			continue
+		}
+		if err := s.payments.Insert(id, "ok"); err != nil {
+			slog.Warn("payment not recorded", "id", id)
+		}
+		done++
+	}
+	return done, nil
 }

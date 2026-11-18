@@ -63,6 +63,11 @@ FOLDER_NOISE = {"domains", "domain", "internal", "pkg", "services", "service", "
                 "v3", "src", "lib", "modules", "module", "impl", "app", "cmd"}
 GETTERS = {"Collection", "Database", "Cursor", "Decode", "Err", "Close"}
 EXIT = re.compile(r"\b(os\.Exit|panic|log\.Fatal\w*)\(")
+# a log line (slog.Warn, s.logger.Error, log.Printf, fmt.Println): not a step, not the call a check is about
+LOG_FN = re.compile(r"(?:^|\.)(?:slog|log|logger|logging|zap|zerolog|logrus|lg|l)\.(?:\w+\.)*?"
+                    r"(Debug|Info|Warn|Warning|Error|Print|Trace|Notice)\w*$|^fmt\.Print\w*$", re.I)
+SKIP = "Skip it and go on with the next one."
+SORT = re.compile(r"(sort\.(Slice|SliceStable|Sort|Stable|Strings|Ints|Float64s)|slices\.(Sort|SortFunc|SortStableFunc))$")
 ROUTER = re.compile(r"http\.NewServeMux\(|gin\.(New|Default)\(|chi\.NewRouter\(|mux\.NewRouter\(|echo\.New\(|fiber\.New\(")
 
 
@@ -233,16 +238,135 @@ def unwrap(a):
     return m.group(1) if m and not re.match(r"^(make|len|new|string|int)\(", t) else t.lstrip("&")
 
 
-def condition_text(cond, last_call):
-    """A check in words, naming its outcome: `err != nil` after Parse -> 'Parse fails (returns an error)'."""
+def log_call(call):
+    """('warning' | 'error' | 'info', message) when the call writes a log line, else None."""
+    f = text(call.child_by_field_name("function"))
+    m = LOG_FN.search(f)
+    if not m:
+        return None
+    word = (m.group(1) or "print").lower()
+    args = call.child_by_field_name("arguments").named_children
+    msg = next((text(a)[1:-1] for a in args if a.type in ("interpreted_string_literal", "raw_string_literal")), "")
+    return ("warning" if word.startswith("warn") else "error" if word == "error" else "info"), msg
+
+
+def arg_text(a, n: int = 50) -> str:
+    """An argument as a step shows it: whole when short; else a composite literal by its keys
+    (`bson.M{status, updated_at}`) and a call by its name (`fmt.Sprintf(…)`), never cut inside an expression."""
+    t = " ".join(text(a).split())
+    if len(t) <= n:
+        return t
+    amp, node = ("&", a.named_children[0]) if a.type == "unary_expression" and t.startswith("&") and a.named_children else ("", a)
+    if node.type == "composite_literal":
+        body = node.child_by_field_name("body")
+        elems = body.named_children if body is not None else []
+        keys = [text(e.child_by_field_name("key")).strip('"` ') for e in elems
+                if e.type == "keyed_element" and e.child_by_field_name("key") is not None]
+        return f"{amp}{text(node.child_by_field_name('type'))}{{{', '.join(keys) if keys else f'{len(elems)} values'}}}"
+    if node.type == "call_expression":
+        return f"{amp}{text(node.child_by_field_name('function'))}(…)"
+    if node.type == "func_literal":
+        return "a function"
+    if node.type in ("interpreted_string_literal", "raw_string_literal"):
+        return t[:n] + "…" + t[-1]
+    return t
+
+
+def assigned_from(st) -> dict:
+    """Where the names a declaration or assignment sets come from: name -> ('call', method, function)
+    for `x, err := s.repo.Find(...)`, ('in', key, map) for `_, ok := seen[k]`, ('is', value, type) for
+    `v, ok := x.(T)`. Checks name these instead of whatever was called last."""
+    left, right = st.child_by_field_name("left"), st.child_by_field_name("right")
+    if left is None or right is None or not right.named_children:
+        return {}
+    names = [text(x) for x in left.named_children]
+    r = right.named_children[0]
+    if r.type == "call_expression":
+        f = text(r.child_by_field_name("function"))
+        if re.fullmatch(r"(fmt\.Errorf|errors\.New)", f):  # an error made here, not a call that failed
+            return {}
+        return {x: ("call", f.split(".")[-1], f) for x in names if x != "_"}
+    if len(names) == 2 and names[1] != "_" and r.type == "index_expression":
+        return {names[1]: ("in", text(r.child_by_field_name("index")), text(r.child_by_field_name("operand")))}
+    if len(names) == 2 and names[1] != "_" and r.type == "type_assertion_expression":
+        return {names[1]: ("is", text(r.child_by_field_name("operand")), text(r.child_by_field_name("type")).lstrip("*"))}
+    return {}
+
+
+def loop_text(head) -> str:
+    """A loop's head in words: `_, g := range groups` -> 'each g in groups';
+    `i := 1; i <= n; i++` -> 'i from 1 while i <= n'."""
+    if head is None or head.type == "block":
+        return "ever"
+    if head.type == "range_clause":
+        left, right = head.child_by_field_name("left"), head.child_by_field_name("right")
+        names = [text(x) for x in left.named_children if text(x) != "_"] if left is not None else []
+        what = " ".join(text(right).split())
+        return f"each {', '.join(names)} in {what}" if names else f"each item of {what}"
+    if head.type == "for_clause":
+        init, cond = head.child_by_field_name("initializer"), head.child_by_field_name("condition")
+        if init is not None and cond is not None and init.type == "short_var_declaration":
+            var, start = text(init.child_by_field_name("left")), text(init.child_by_field_name("right"))
+            return f"{var} from {start} while {' '.join(text(cond).split())}"
+        return " ".join(text(head).split())
+    return "as long as " + " ".join(text(head).split())
+
+
+NEGATE = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
+
+
+def condition_text(cond, last_call, assigned=None):
+    """A check in words, both outcomes: `err != nil` after Parse -> 'Parse fails (returns an error)';
+    after ctx.Err() -> the context is cancelled; `ok` after `_, ok := seen[k]` -> 'k is in seen'.
+    `assigned` (assigned_from) says which call set the error; the call made last is the fallback."""
     c = " ".join(cond.split())
-    m = re.fullmatch(r"(\w+)\s*!=\s*nil", c)
-    if m and m.group(1).lower().endswith("err") and last_call:
-        return f"{last_call} fails (returns an error)", f"{last_call} succeeds"
+    assigned = assigned or {}
+    m = re.fullmatch(r"(\w+)\s*(!=|==)\s*nil", c)
+    if m and m.group(1).lower().endswith("err"):
+        src = assigned.get(m.group(1))
+        name, ftext = (src[1], src[2]) if src and src[0] == "call" else (last_call, last_call or "")
+        if name:
+            pair = ((f"the context is cancelled or timed out ({ftext}() returns an error)", "the context is still live")
+                    if name == "Err" and re.search(r"(?i)ctx|context", ftext)
+                    else (f"{name} fails (returns an error)", f"{name} succeeds"))
+            return pair if m.group(2) == "!=" else pair[::-1]
+    m = re.fullmatch(r"([\w.]*(?:ctx|Ctx|Context\(\)))\.Err\(\)\s*!=\s*nil", c)
+    if m:
+        return f"the context is cancelled or timed out ({m.group(1)}.Err() returns an error)", "the context is still live"
+    m = re.fullmatch(r"(!?)\s*errors\.Is\((\w+),\s*([\w.]+)\)", c)
+    if m:
+        src = assigned.get(m.group(2))
+        who = f"{src[1]} fails with" if src and src[0] == "call" else "the error is"
+        pair = (f"{who} {m.group(3)}", f"not ({who} {m.group(3)})")
+        return pair[::-1] if m.group(1) else pair
+    found = {v: s for v, s in assigned.items() if s[0] in ("in", "is") and re.search(rf"\b{re.escape(v)}\b", c)}
+    if found:
+        def says(v, neg=False):
+            s = found[v]
+            return f"{s[1]} is {'not ' if neg else ''}in {s[2]}" if s[0] == "in" else f"{s[1]} is {'not ' if neg else ''}a {s[2]}"
+        m = re.fullmatch(r"(!?)\s*(\w+)", c)
+        if m and m.group(2) in found:
+            pair = (says(m.group(2)), says(m.group(2), True))
+            return pair[::-1] if m.group(1) else pair
+        words = c
+        for v in found:
+            words = re.sub(rf"!\s*{re.escape(v)}\b", says(v, True), words)
+            words = re.sub(rf"(?<![\w.]){re.escape(v)}\b(?! is)", says(v), words)
+        words = words.replace("&&", "and").replace("||", "or")
+        return words, f"not ({words})"
     m = re.fullmatch(r"!\s*([\w.]+)\((.*)\)", c, re.S)
     if m:
         return f"{m.group(1).split('.')[-1]} fails ({c})", f"{m.group(1).split('.')[-1]} succeeds"
+    m = re.fullmatch(r"([^&|<>=!]+?)\s*(==|!=|<=|>=|<|>)\s*([^&|<>=!]+)", c)
+    if m:
+        return c, f"{m.group(1)} {NEGATE[m.group(2)]} {m.group(3)}"
+    c = code_words(c)
     return c, f"not ({c})"
+
+
+def code_words(c: str) -> str:
+    """Go's boolean operators in words: `a && !b || c` -> 'a and not b or c' (string literals untouched)."""
+    return re.sub(r"(?<![\w\"'])!(?=[\w(])", "not ", c.replace(" && ", " and ").replace(" || ", " or "))
 
 
 class Design:
@@ -759,7 +883,7 @@ class Design:
                     setter[mname] = found[0]
 
             def events(fn):
-                out, last = [], {}
+                out, last, assigned = [], {}, {}
 
                 def stmt_events(st, guard, exit_):
                     for n in names:
@@ -776,17 +900,22 @@ class Design:
                             init = st.child_by_field_name("initializer")
                             if init is not None:
                                 stmt_events(init, guard, exit_)
+                                assigned.update(assigned_from(init))
                                 for call in calls_in(init):
-                                    last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
+                                    if log_call(call) is None:
+                                        last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
                             cons = st.child_by_field_name("consequence")
-                            fails, _ = condition_text(text(st.child_by_field_name("condition")), last.get("fn"))
+                            fails, _ = condition_text(text(st.child_by_field_name("condition")), last.get("fn"), assigned)
                             walk(cons, fails, bool(c.find(cons, "return_statement")))
                         elif st.type == "block":
                             walk(st, guard, exit_)
                         else:
                             stmt_events(st, guard, exit_)
+                            if st.type in ("short_var_declaration", "assignment_statement"):
+                                assigned.update(assigned_from(st))
                             for call in calls_in(st):
-                                last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
+                                if log_call(call) is None:
+                                    last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
                 walk(fn.body)
                 return out
             ev = {m: events(fn) for m, fn in methods.items() if fn.body is not None}
@@ -1241,13 +1370,18 @@ def int_value(s):
 
 class Flow:
     """One operation's body as steps: its calls in order, a condition per check with both outcomes,
-    the alternatives of a switch, a step per background `go`, loops with their body."""
+    the alternatives of a switch, a step per background `go`, loops with their body. What a branch does
+    besides calls (setting a value, logging a failure, skipping an item) is said where it is all the
+    branch does, so no branch reads as empty, and a failure the code carries on from never reads as
+    the end of the operation."""
 
     def __init__(self, d: Design, key, part, fn):
         self.d, self.key, self.part, self.fn = d, key, part, fn
         self.out: list[dict] = []
         self.steps = self.checks = self.forks = self.responds = 0
         self.last: dict = {}
+        self.assigned: dict = {}  # name -> where its value came from (assigned_from)
+        self.switches = 0  # inside a switch, `break` leaves the switch, not the loop
         self.stopped = False
 
     def run(self):
@@ -1262,9 +1396,14 @@ class Flow:
         d = self.d
         k = d.classify(call, self.fn, self.part)
         ftext = text(call.child_by_field_name("function"))
-        self.last.update(fn=ftext.split(".")[-1], line=call.start_point[0] + 1)
-        args = ", ".join(short(text(a), 50) for a in call.child_by_field_name("arguments").named_children
+        if log_call(call) is None:  # a log line is not the call a later check is about
+            self.last.update(fn=ftext.split(".")[-1], line=call.start_point[0] + 1)
+        args = ", ".join(arg_text(a) for a in call.child_by_field_name("arguments").named_children
                          if text(a) not in ("ctx", "r.Context()", "context.Background()", "w", "r"))
+        if not k and SORT.match(ftext):  # the order results come back in is behaviour too
+            first = call.child_by_field_name("arguments").named_children
+            self.steps += 1
+            return {"do": f"Sort {arg_text(first[0]) if first else 'the results'} ({ftext})."}
         if not k:
             return None
         if k[0] == "part":
@@ -1272,7 +1411,7 @@ class Flow:
             return {"do": f"Call {d.pname(k[1])}.{k[2]}({args})."}
         if k[0] == "ext":
             self.steps += 1
-            return {"do": f"Call {camel(k[1])}: {k[2]}({short(args, 70)})."}
+            return {"do": f"Call {camel(k[1])}: {k[2]}({args})."}
         if k[0] == "own":
             self.steps += 1
             return {"do": f"Run {k[1].name}({args})" + (" — an operation of its own (section 6)." if self.key and k[1].name in d.comp[self.key]["ops"] else ".")}
@@ -1302,19 +1441,25 @@ class Flow:
         return False
 
     def walk(self, block):
-        steps = []
-        if block is None:
-            return steps
-        for st in block.named_children:
+        return self.stmts(block.named_children if block is not None else [])
+
+    def stmts(self, nodes, say_minor=False):
+        """Statements as steps: calls of parts, external systems and helpers, checks, loops, switches,
+        background work, returns and skips. A branch (say_minor) with none of these says what its
+        statements do instead (minor_steps): a value set, a failure logged."""
+        steps, minor = [], []
+        for st in nodes:
             t = st.type
+            if t in ("short_var_declaration", "assignment_statement"):
+                self.assigned.update(assigned_from(st))
             if t == "if_statement":
                 steps += self.if_stmt(st)
             elif t == "for_statement":
-                head = st.named_children[0] if st.named_children else None
-                over = short(text(head), 80) if head is not None and head.type != "block" else "ever"
                 body = self.walk(st.child_by_field_name("body"))
                 if body:
-                    steps.append({"loop": over, "steps": body})
+                    steps.append({"loop": loop_text(st.named_children[0] if st.named_children else None), "steps": body})
+                else:
+                    minor += self.minor_steps([st])
             elif t in ("expression_switch_statement", "type_switch_statement"):
                 steps += self.switch(st)
             elif t == "go_statement":
@@ -1331,29 +1476,125 @@ class Flow:
                         steps.append(s)
                 steps.append({"stop": True, "text": self.return_text(st)})
                 return steps
-            elif t == "defer_statement":
+            elif t == "continue_statement":
+                steps.append({"do": SKIP})
+                return steps
+            elif t == "break_statement":
+                if not self.switches:
+                    steps.append({"do": "Stop the loop."})
+                return steps
+            elif t in ("defer_statement", "comment"):
                 continue
             elif t == "block":
                 steps += self.walk(st)
+            elif self.record(st):
+                self.steps += 1
+                steps.append({"do": self.set_text(st) + "."})
             else:
-                for call in calls_in(st):
-                    s = self.describe(call)
-                    if s:
-                        steps.append(s)
+                got = [s for s in (self.describe(call) for call in calls_in(st)) if s]
+                steps += got
                 if EXIT.search(text(st)):
                     steps.append({"stop": True, "exit": True})
                     return steps
-        return steps
+                if not got:
+                    minor += self.minor_steps([st])
+        return steps or (minor if say_minor else [])
+
+    def minor_steps(self, nodes):
+        """What statements with no step in them do, in words: a value set or added to, a warning or an
+        error logged, an item skipped, a loop left, and the checks and loops around these. Debug and
+        info logs, declarations and comments say nothing."""
+        out = []
+        for st in nodes:
+            t = st.type
+            if t in ("short_var_declaration", "assignment_statement"):
+                self.assigned.update(assigned_from(st))
+                w = self.set_text(st)
+                if w:
+                    out.append({"do": w + "."})
+            elif t in ("inc_statement", "dec_statement"):
+                target = text(st.named_children[0]) if st.named_children else ""
+                out.append({"do": f"Add 1 to {target}." if t == "inc_statement" else f"Take 1 from {target}."})
+            elif t == "expression_statement":
+                call = st.named_children[0] if st.named_children else None
+                lg = log_call(call) if call is not None and call.type == "call_expression" else None
+                if lg and lg[0] != "info":
+                    out.append({"do": f"Log {'a warning' if lg[0] == 'warning' else 'an error'}" + (f' ("{lg[1]}")' if lg[1] else "") + "."})
+            elif t == "continue_statement":
+                out.append({"do": SKIP})
+                break
+            elif t == "break_statement":
+                if not self.switches:
+                    out.append({"do": "Stop the loop."})
+                break
+            elif t == "if_statement":
+                out += self.if_stmt(st)
+            elif t == "for_statement":
+                bnode = st.child_by_field_name("body")
+                body = self.minor_steps(bnode.named_children if bnode is not None else [])
+                if body:
+                    out.append({"loop": loop_text(st.named_children[0] if st.named_children else None), "steps": body})
+            elif t == "block":
+                out += self.minor_steps(st.named_children)
+        return out
+
+    @staticmethod
+    def set_text(st):
+        """An assignment in words: `x = y` -> 'Set x to y'; `xs = append(xs, v)` -> 'Add v to xs';
+        `n += k` -> 'Add k to n'. None for `_ = ...`."""
+        left, right = st.child_by_field_name("left"), st.child_by_field_name("right")
+        if left is None or right is None:
+            return None
+        targets = [text(x) for x in left.named_children if text(x) != "_"]
+        if not targets:
+            return None
+        vals = right.named_children
+        op = next((ch.type for ch in st.children if not ch.is_named), "=")
+        if len(vals) == 1 and vals[0].type == "call_expression" and text(vals[0].child_by_field_name("function")) == "append":
+            args = vals[0].child_by_field_name("arguments").named_children
+            if args and text(args[0]) == targets[0]:
+                items = [arg_text(a) for a in args[1:]]
+                return f"Add {', '.join('the items of ' + x[:-3] if x.endswith('...') else x for x in items)} to {targets[0]}"
+        what = ", ".join(arg_text(v, 120) for v in vals)
+        if op == "+=":
+            return f"Add {what} to {targets[0]}"
+        if op == "-=":
+            return f"Take {what} from {targets[0]}"
+        return f"Set {', '.join(targets)} to {what}"
+
+    def record(self, st):
+        """A record built from helper calls (`item := EvidenceItem{Text: str(p, "text"), ...}`): one step,
+        the record with its fields, not a step per helper call. Calls of parts or external systems are
+        steps of their own."""
+        if st.type not in ("short_var_declaration", "assignment_statement"):
+            return False
+        right = st.child_by_field_name("right")
+        val = right.named_children[0] if right is not None and len(right.named_children) == 1 else None
+        if val is not None and val.type == "unary_expression" and val.named_children:
+            val = val.named_children[0]
+        if val is None or val.type != "composite_literal":
+            return False
+        kinds = [self.d.classify(call, self.fn, self.part) for call in calls_in(val)]
+        return (any(k and k[0] == "local" and k[2] is not None and not self.d.trivial(k[2]) for k in kinds)
+                and all(k is None or k[0] == "local" for k in kinds))
+
+    @staticmethod
+    def ends(steps):
+        """Whether a branch leaves the operation or the item: it stops, skips or leaves the loop."""
+        return bool(steps) and ("stop" in steps[-1] or steps[-1].get("do") in (SKIP, "Stop the loop."))
+
+    def carry_on(self):
+        return {"do": f"Go on; the failure does not end {self.fn.name}."}
 
     def return_text(self, st):
         """A return in words: an error return stops, any other gives back what the operation produces."""
-        vals = [text(v).strip() for v in (st.named_children[0].named_children if st.named_children else [])]
+        vals = list(st.named_children[0].named_children) if st.named_children else []
         if not vals:
             return "Stop." if self.route else "Return."
-        if any(re.search(r"\berr\b|Errorf|errors\.New|Err\w*\b", v) for v in vals):
+        if any(re.search(r"\berr\b|Errorf|errors\.New|Err\w*\b", text(v)) for v in vals):
             return "Stop and return the error."
-        shown = [v for v in vals if v != "nil"]
-        return f"Return {short(', '.join(shown), 80)}." if shown else "Return."
+        shown = [arg_text(v, 80) for v in vals if text(v).strip() != "nil"]
+        return f"Return {', '.join(shown)}." if shown else "Return."
 
     def if_stmt(self, st):
         steps = []
@@ -1361,27 +1602,22 @@ class Flow:
         cond_node = st.child_by_field_name("condition")
         cons, alt = st.child_by_field_name("consequence"), st.child_by_field_name("alternative")
         if init is not None:
+            self.assigned.update(assigned_from(init))
             for call in calls_in(init):
                 s = self.describe(call)
                 if s:
                     steps.append(s)
-            for call in calls_in(init):
-                self.last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
         for call in calls_in(cond_node):
-            self.last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
-        cond = text(cond_node)
-        yes, no = condition_text(cond, self.last.get("fn"))
+            if log_call(call) is None:
+                self.last["fn"] = text(call.child_by_field_name("function")).split(".")[-1]
+        yes, no = condition_text(text(cond_node), self.last.get("fn"), self.assigned)
+        failure = bool(re.search(r" fails\b|is cancelled", yes))
         if not self.has_content(cons) and not self.has_content(alt):
-            body = " ".join(text(cons).split())[1:-1].strip() if cons is not None else ""
-            if re.search(r"\bcontinue\b", body):
-                self.steps += 1
-                steps.append({"do": f"If {yes}: skip it and go on with the next one."})
-            elif self.d.code.find(cons, "assignment_statement") or self.d.code.find(cons, "inc_statement"):
-                self.steps += 1  # data the code fixes up (a default, a rescued value) is a step of its own
-                steps.append({"do": f"If {yes}: {short(body, 110)}."})
-            return steps
+            return steps + self.fixup(yes, no, failure, cons, alt)
         self.checks += 1
-        then = self.walk(cons)
+        before = dict(self.assigned)
+        then = self.stmts(cons.named_children if cons is not None else [], say_minor=True)
+        after_then, self.assigned = self.assigned, dict(before)
         # a check on a function that writes the HTTP response itself (DecodeJSONBody): say what it answers
         for call in calls_in(cond_node):
             k = self.d.classify(call, self.fn, self.part)
@@ -1392,9 +1628,34 @@ class Flow:
                     then.insert(0, {"do": f"{callee.name} has already answered " + " or ".join(str(c) for c in codes) + "."})
         other = []
         if alt is not None:
-            other = self.walk(alt) if alt.type == "block" else self.if_stmt(alt)
+            other = self.stmts(alt.named_children, say_minor=True) if alt.type == "block" else self.if_stmt(alt)
+        # a name each branch sets from a different call (err from ChatVisionExtract or from ChatJSON) names both
+        for v, s in after_then.items():
+            o = self.assigned.get(v)
+            if s != before.get(v) and o is not None and o != before.get(v) and s[0] == o[0] == "call" and s[1] != o[1]:
+                self.assigned[v] = ("call", f"{s[1]} or {o[1]}", s[2])
+            elif o is None or o == before.get(v):
+                self.assigned[v] = s
+        if failure and not self.ends(then):
+            then.append(self.carry_on())
         steps.append({"if": yes, "otherwise": no, "then": then, "else": other})
         return steps
+
+    def fixup(self, yes, no, failure, cons, alt):
+        """A check whose branches call nothing: what each does (a default set, a failure logged, an item
+        skipped). One line when only the check's own branch does a little, else the check with both."""
+        then = self.minor_steps(cons.named_children if cons is not None else [])
+        other = [] if alt is None else self.minor_steps(alt.named_children if alt.type == "block" else [alt])
+        if not then and not other and not failure:
+            return []
+        if failure and not self.ends(then):
+            then.append(self.carry_on())
+        if not other and len(then) <= 3 and all("do" in s for s in then):
+            self.steps += 1  # data the code fixes up (a default, a rescued value) is a step of its own
+            what = ", then ".join(s["do"][:1].lower() + s["do"][1:].rstrip(".") for s in then)
+            return [{"do": f"If {yes}: {what}."}]
+        self.checks += 1
+        return [{"if": yes, "otherwise": no, "then": then, "else": other}]
 
     def switch(self, st):
         cases = [c for c in st.named_children if c.type in ("expression_case", "default_case", "type_case")]
@@ -1403,18 +1664,11 @@ class Flow:
         self.checks += 1
         value = st.child_by_field_name("value")
         out = []
+        self.switches += 1
         for c in cases:
-            label = "otherwise" if c.type == "default_case" else short(text(c.child_by_field_name("value")), 80)
-            body = []
-            for s in c.named_children:
-                if s == c.child_by_field_name("value"):
-                    continue
-                if s.type == "if_statement":
-                    body += self.if_stmt(s)
-                elif s.type == "return_statement":
-                    body += [x for x in (self.describe(call) for call in calls_in(s)) if x] + [{"stop": True}]
-                else:
-                    got = [x for x in (self.describe(call) for call in calls_in(s)) if x]
-                    body += got or [{"do": short(" ".join(text(s).split()), 100) + "."}]
+            heads = c.children_by_field_name("value") + c.children_by_field_name("type")
+            label = "otherwise" if c.type == "default_case" else ", ".join(code_words(" ".join(text(h).split())) for h in heads)
+            body = self.stmts([s for s in c.named_children if not any(s == h for h in heads)], say_minor=True)
             out.append({"case": label, "steps": body})
-        return [{"switch": short(text(value), 60) if value is not None else "the case that holds", "cases": out}]
+        self.switches -= 1
+        return [{"switch": " ".join(text(value).split()) if value is not None else "the case that holds", "cases": out}]

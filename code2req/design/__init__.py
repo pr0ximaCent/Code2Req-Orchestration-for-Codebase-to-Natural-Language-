@@ -103,6 +103,34 @@ def fix_route_text(text: str, design: dict, subject: str, impl: str) -> tuple[st
     return text, fixes
 
 
+# short words in setting names and the words requirements write for them
+SYNONYMS = {"db": "database", "addr": "address", "coll": "collection", "max": "maximum", "min": "minimum",
+            "num": "number", "cfg": "configuration", "conn": "connection", "ttl": "time to live", "dir": "directory"}
+CONFIGURED = re.compile(r"\bconfigur\w*|\bsettings?\b|\benvironment\b", re.I)
+
+
+def settings_used(text: str, settings: list[dict]) -> list[dict]:
+    """The settings a requirement relies on: named by environment variable or by its value
+    ('ps_raw_chunks'), or by the words of the setting's name ('read timeout' for readTimeout, 'database
+    name' for dbName). A one-word name ('uri', 'host') counts only where another word of the sentence
+    says the value is configured."""
+    low, out = text.lower(), []
+    for s in settings:
+        value = str(s.get("value", "")).strip('"`')
+        if (s.get("env") and re.search(rf"\b{re.escape(s['env'])}\b", text)) \
+                or (len(value) >= 4 and re.search(rf"(?<![\w/]){re.escape(value)}(?![\w/])", text)):
+            out.append(s)
+            continue
+        ws = [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", s["name"]) if w.lower() != "value"]
+        if not ws:
+            continue
+        alts = ["(?:" + "|".join(re.escape(a) for a in (w, SYNONYMS.get(w)) if a) + ")s?" for w in ws]
+        named = re.compile(r"\b" + r"[\s-]+".join(alts) + r"\b(?![\s-]+variables?)")  # not "environment variables"
+        if named.search(low) and (len(ws) > 1 or CONFIGURED.search(named.sub(" ", low))):
+            out.append(s)
+    return out
+
+
 def write_design(run_dir: str, repo: str, llm, title: str | None = None, target: str = "") -> dict | None:
     """Read the design from the source, attach the run's requirements, and write the documents.
     Returns a summary, or None when the language is not read yet."""
@@ -127,6 +155,8 @@ def write_design(run_dir: str, repo: str, llm, title: str | None = None, target:
         a["implemented_by"] = impl.get(src, "")
         a["text"], f = fix_route_text(a["text"], design, a["subject"], a["implemented_by"])
         fixes += f
+        # the model gives an attribute its value from the requirement that states it: name the defaults here
+        a["uses"] = [s["id"] for s in settings_used(a["text"], design["settings"])]
     if fixes:
         design["decisions"].append("Routes named in requirements were checked against the routes the code registers: "
                                    + "; ".join(f"{a} → {b}" for a, b in dict.fromkeys(fixes)) + ".")

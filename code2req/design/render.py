@@ -272,12 +272,18 @@ def render(d: dict) -> str:
     md.p("These requirements are already extracted from the code and already atomic, in NASA form: one obligation each. "
          "Each is one requirement def with exactly the ID and name given (`requirement def <'ID'> Name`), its sentence as its "
          "doc, its subject the component named, in that component's requirement file. They are not extracted again, and "
-         "none is split, merged, reworded or renumbered; the model has exactly these, no more.")
+         "none is split, merged, reworded or renumbered; the model has exactly these, no more. `Uses:` after a sentence "
+         "names the settings the requirement relies on, as attributes with the values the code gives them (section 4.1): "
+         "the model has those attributes with those values. `Uses:` is not part of the sentence.")
+    settings = {s["id"]: s for s in d["settings"]}
     by_subject = {}
     for r in reqs:
+        uses = [settings[i] for i in r.get("uses", []) if i in settings]
         by_subject.setdefault(r["subject"], []).append(
             f"- `requirement def <'{r['id']}'> {r['name']}` ({r['kind']}"
-            + (f"; implemented by {r['implemented_by']}" if r.get("implemented_by") else "") + f"): {r['text']}")
+            + (f"; implemented by {r['implemented_by']}" if r.get("implemented_by") else "") + f"): {r['text']}"
+            + (" Uses: " + ", ".join(f"{attr_line(s['name'], s['value'])} ({s['id']}, owner {s['owner']})" for s in uses) + "."
+               if uses else ""))
     groups = [(f"Subject: {s} ({comps[s]['id'] if s in comps else d['system']['id']})", ls) for s, ls in by_subject.items()]
     md.parts(3, "11.1 Requirements by subject", groups or [("", ["- (none)"])])
 
