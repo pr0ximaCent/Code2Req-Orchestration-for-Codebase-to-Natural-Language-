@@ -30,9 +30,12 @@ from code2req.cache import with_cache
 from code2req.config import is_git_url, prune_clone, referenced_files, resolve_repo, rmtree
 from code2req.estimate import estimate
 from code2req.llm import LLM, with_budget
+from code2req.model.schema import SystemModel
+from code2req.model.spec import build_spec
 from code2req.pipeline import RunStopped
 from code2req.pipeline import run as run_pipeline
-from code2req.render_pdf import render_pdf
+from code2req.render_pdf import render_pdf, render_spec_pdf
+from code2req.schema import FlatRequirement
 from code2req.structure import DEFAULT_MODULE_CHARS
 
 logger = logging.getLogger(__name__)
@@ -227,6 +230,14 @@ class RunManager:
                                   followup=req.followup, entries=req.entries or None,
                                   include_assets=req.assets, target=meta["target"],
                                   stop=self.stops[run_id], profile=req.profile)
+            try:  # the system design reads every source file: before a clone is pruned
+                from ..design import supported, write_design
+                if supported(repo):
+                    progress("design", 0, 0)
+                    meta["design"] = write_design(out_dir, repo, llm, target=meta["target"])
+                    logger.info("system design written: %s", meta["design"])
+            except Exception:  # noqa: BLE001 - the requirements stand without the design
+                logger.exception("run %s: system design not written", run_id)
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)
@@ -438,6 +449,36 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
             raise HTTPException(500, f"PDF rendering failed: {e}") from e
         headers = {"Content-Disposition": f'attachment; filename="code2req-{run_id}.pdf"'}
         return Response(pdf, media_type="application/pdf", headers=headers)
+
+    @app.get("/api/runs/{run_id}/model_spec.pdf")
+    def model_spec_pdf(run_id: str) -> Response:
+        """The model spec to upload to SysModeler, from the run's model and requirements. Rendered
+        on request, so a requirement marked wrong in the UI is left out of it."""
+        path = os.path.join(mgr._dir(run_id), "model.json")
+        model = SystemModel.model_validate(_read_json(path, {})) if os.path.isfile(path) else SystemModel()
+        if not model.parts and not model.states:
+            raise HTTPException(404, "this run has no model: run it again, or its code is in a language "
+                                     "code2req does not read a model from yet")
+        reqs = [FlatRequirement.model_validate(r) for r in reviewed(run_id).get("requirements", [])
+                if (r.get("review") or {}).get("verdict") != "wrong"]
+        try:
+            pdf = render_spec_pdf(build_spec(model, reqs, model.description))
+        except Exception as e:
+            raise HTTPException(500, f"PDF rendering failed: {e}") from e
+        headers = {"Content-Disposition": f'attachment; filename="model-spec-{run_id}.pdf"'}
+        return Response(pdf, media_type="application/pdf", headers=headers)
+
+    @app.get("/api/runs/{run_id}/system_design.{ext}")
+    def system_design(run_id: str, ext: str) -> FileResponse:
+        """The system design to upload to SysModeler (.txt: SysModeler reads a text upload as text)
+        or to read (.pdf, .md)."""
+        if ext not in ("txt", "md", "pdf"):
+            raise HTTPException(404, "system_design.txt, .md or .pdf")
+        path = os.path.join(mgr._dir(run_id), f"system_design.{ext}")
+        if not os.path.isfile(path):
+            raise HTTPException(404, "this run has no system design: its code is in a language the design reader "
+                                     "does not handle yet (Go services today), or it ran before the design existed")
+        return FileResponse(path, filename=f"system-design-{run_id}.{ext}")
 
     @app.get("/api/health")
     def health() -> dict:

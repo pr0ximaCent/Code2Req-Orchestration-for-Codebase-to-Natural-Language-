@@ -147,3 +147,25 @@ def test_stop_a_run_in_progress(tmp_path):
     assert client.post(f"/api/runs/{meta['id']}/stop").status_code == 409  # not in progress any more
     assert client.post("/api/runs/no-such-run/stop").status_code == 404
     assert client.delete(f"/api/runs/{meta['id']}").status_code == 200
+
+
+def test_model_spec_is_rendered_for_a_run_with_a_model_and_refused_without_one(tmp_path):
+    from tests.test_model import PHONE, OneClaimLLM, line_of, write
+    off = line_of(PHONE, "phone/phone.py", "if self.state is State.OFF:")
+    app = create_app(str(tmp_path / "runs"), cache_path=str(tmp_path / "cache.sqlite"),
+                     llm_factory=lambda: (OneClaimLLM("phone/phone.py", off, off + 1), "fake/model"))
+    client = TestClient(app)
+    repo = write(tmp_path / "repo", PHONE)
+    meta = client.post("/api/runs", json={"target": repo, "workers": 1}).json()
+    assert wait_done(client, meta["id"])["status"] == "done"
+    spec = client.get(f"/api/runs/{meta['id']}/model_spec.pdf")
+    assert spec.headers["content-type"] == "application/pdf" and spec.content.startswith(b"%PDF")
+    req_id = client.get(f"/api/runs/{meta['id']}/result").json()["requirements"][0]["id"]
+    client.post(f"/api/runs/{meta['id']}/reviews", json={"req_id": req_id, "verdict": "wrong"})
+    assert client.get(f"/api/runs/{meta['id']}/model_spec.pdf").content.startswith(b"%PDF")
+
+    shop = make_client(tmp_path / "shop")  # a FastAPI app: no part holds others, so no model
+    run = shop.post("/api/runs", json={"target": FIXTURE, "workers": 1}).json()
+    assert wait_done(shop, run["id"])["status"] == "done"
+    missing = shop.get(f"/api/runs/{run['id']}/model_spec.pdf")
+    assert missing.status_code == 404 and "no model" in missing.json()["detail"]

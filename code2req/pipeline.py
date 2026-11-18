@@ -31,6 +31,9 @@ from code2req.agents.module_agent import (
 from code2req.cost import llm_task
 from code2req.dedup import assign_ids, dedup
 from code2req.llm import LLM, BudgetReached
+from code2req.model import build_model
+from code2req.model.schema import SystemModel
+from code2req.model.spec import write_spec
 from code2req.prompts import ASSET_SYSTEM, MODULE_SYSTEM, SYSML_ASSET_SYSTEM, SYSML_MODULE_SYSTEM
 from code2req.render_md import render_markdown
 from code2req.render_pdf import write_pdf
@@ -451,7 +454,12 @@ REFUSAL_RE = re.compile(
     r"|Gone|PreconditionFailed|RequestEntityTooLarge|UnsupportedMediaType|UnprocessableEntity|TooManyRequests"
     r"|InternalServerError|NotImplemented|BadGateway|ServiceUnavailable|GatewayTimeout)\b"
     r"|(?i:status(?:_?code)?)\s*[:=(]\s*[45]\d\d\b")  # status_code=404, { status: 400 }, .status(403)
-STATE_RE = re.compile(r"\.\w*(?:[sS]tatus|[sS]tate)\s*=(?!=)")  # scooter.status = ..., o.State = ...
+# A change of state: scooter.status = ..., o.State = ..., or a member passed or assigned whatever
+# the field is called: self._enter(State.LOCKED), setState(OrderState.Paid), state: State = State.IDLE.
+# The smartphone changes state only through self._enter(State.X), which the first form missed, so
+# its five state-machine requirements shared a budget of 4. A check (is/== State.X) is not a change.
+STATE_RE = re.compile(r"\.\w*(?:[sS]tatus|[sS]tate)\s*=(?!=)"
+                      r"|\w\(\s*\w*(?:State|Status)\.[A-Z]\w*|(?<![=!<>])=\s*\w*(?:State|Status)\.[A-Z]\w*")
 COMMENT_PREFIXES = ("#", "//", "/*", "*")
 
 
@@ -922,10 +930,26 @@ def run(repo_path: str, out_dir: str, llm: LLM, model: str, workers: int = 4,
         "cost": getattr(llm, "usage", None),
     }
 
+    behaviour = None
+    try:
+        behaviour = build_model(repo_path, sorted(code_files), reqs, files)
+    except Exception as e:  # noqa: BLE001 - the requirements are the product; a model failure must not fail the run
+        logger.warning("model.json not written: %s", e)
+
     with open(os.path.join(out_dir, "requirements.json"), "w", encoding="utf-8") as f:
         json.dump(report.to_json(), f, indent=2, ensure_ascii=False)
     with open(os.path.join(out_dir, "requirements.md"), "w", encoding="utf-8") as f:
-        f.write(render_markdown(report))
+        f.write(render_markdown(report, behaviour))
+    model_path = os.path.join(out_dir, "model.json")
+    if behaviour is not None:
+        with open(model_path, "w", encoding="utf-8") as f:
+            json.dump(behaviour.to_json(), f, indent=2, ensure_ascii=False)
+    elif os.path.isfile(model_path):  # never leave an earlier run's model next to this run's requirements
+        os.remove(model_path)
+    try:  # the spec SysModeler generates the model from
+        write_spec(out_dir, behaviour or SystemModel(), reqs)
+    except Exception as e:  # noqa: BLE001 - the requirements are the product
+        logger.warning("model spec not written: %s", e)
     with open(os.path.join(out_dir, "module_tree.json"), "w", encoding="utf-8") as f:
         json.dump(structure.module_tree, f, indent=2)
     with open(os.path.join(out_dir, "cost.json"), "w", encoding="utf-8") as f:

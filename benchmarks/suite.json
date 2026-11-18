@@ -1,0 +1,18 @@
+{
+  "about": "Repos run by `code2req bench` after every change: code2req, then SysModeler's full model generation, scored against the key. Git repos are checked out at the pinned commit, so a score moves only when code2req or FMG changes.",
+  "repos": [
+    {"name": "atm", "language": "python", "repo": "tests/fixtures/atm", "key": "benchmarks/atm.json"},
+    {"name": "realworld-go", "language": "go", "repo": "https://github.com/gothinkster/golang-gin-realworld-example-app",
+     "commit": "a41289b2a4951e7cc09066f86742a27f85121c9b", "key": "benchmarks/realworld.json"},
+    {"name": "realworld-node", "language": "javascript", "repo": "https://github.com/gothinkster/node-express-realworld-example-app",
+     "commit": "30b68e1e881462b2f4164ea09ab4c4f5699c7b0b", "key": "benchmarks/realworld.json"},
+    {"name": "realworld-python", "language": "python", "repo": "https://github.com/nsidnev/fastapi-realworld-example-app",
+     "commit": "029eb7781c60d5f563ee8990a0cbfb79b244538c", "key": "benchmarks/realworld.json"},
+    {"name": "realworld-java", "language": "java", "repo": "https://github.com/gothinkster/spring-boot-realworld-example-app",
+     "commit": "ee17e31aafe733d98c4853c8b9a74d7f2f6c924a", "key": "benchmarks/realworld.json"},
+    {"name": "realworld-csharp", "language": "csharp", "repo": "https://github.com/gothinkster/aspnetcore-realworld-example-app",
+     "commit": "6fe67a53892213d264dc8fa244e3aaaf55f50390", "key": "benchmarks/realworld.json"},
+    {"name": "gotenberg", "language": "go", "repo": "https://github.com/gotenberg/gotenberg",
+     "commit": "2a025609d36eb7a970c31397e652ee439a7214fe", "key": null, "large": true}
+  ]
+}
