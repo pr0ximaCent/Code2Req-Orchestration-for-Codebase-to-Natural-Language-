@@ -216,6 +216,8 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
   <a class="btn" id="exportBtn" aria-disabled="true">Export JSON</a>
   <a class="btn" id="pdfBtn" aria-disabled="true" title="Readable report with your review verdicts">Export PDF</a>
   <a class="btn" id="specBtn" aria-disabled="true" title="The model spec to upload to SysModeler: the model read from the code, with fixed IDs, and the requirements (those marked wrong are left out)">Model spec</a>
+  <a class="btn" id="designTxtBtn" aria-disabled="true" title="The system design to upload to SysModeler: parts, connections, routes, behaviour and requirements read from the code (Go services today)">System design (.txt)</a>
+  <a class="btn" id="designPdfBtn" aria-disabled="true" title="The same system design, as a PDF to read">System design (PDF)</a>
 </header>
 <div class="options" id="options" hidden>
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
@@ -422,9 +424,11 @@ async function refresh() {
 /* ---------- top-level render ---------- */
 function render() {
   renderStatus();
-  for (const [btn, path] of [["#exportBtn", "export"], ["#pdfBtn", "export.pdf"], ["#specBtn", "model_spec.pdf"]]) {
+  for (const [btn, path] of [["#exportBtn", "export"], ["#pdfBtn", "export.pdf"], ["#specBtn", "model_spec.pdf"],
+                             ["#designTxtBtn", "system_design.txt"], ["#designPdfBtn", "system_design.pdf"]]) {
     const exp = $(btn);
-    if (S.run?.status === "done") { exp.href = `/api/runs/${S.runId}/${path}`; exp.setAttribute("aria-disabled", "false"); }
+    const ready = S.run?.status === "done" && (!path.startsWith("system_design") || S.run?.design);
+    if (ready) { exp.href = `/api/runs/${S.runId}/${path}`; exp.setAttribute("aria-disabled", "false"); }
     else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
   }
   $("#deleteBtn").disabled = !S.run || ACTIVE.includes(S.run.status);

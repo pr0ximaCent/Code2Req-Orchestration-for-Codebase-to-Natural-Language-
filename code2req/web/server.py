@@ -230,6 +230,14 @@ class RunManager:
                                   followup=req.followup, entries=req.entries or None,
                                   include_assets=req.assets, target=meta["target"],
                                   stop=self.stops[run_id], profile=req.profile)
+            try:  # the system design reads every source file: before a clone is pruned
+                from ..design import supported, write_design
+                if supported(repo):
+                    progress("design", 0, 0)
+                    meta["design"] = write_design(out_dir, repo, llm, target=meta["target"])
+                    logger.info("system design written: %s", meta["design"])
+            except Exception:  # noqa: BLE001 - the requirements stand without the design
+                logger.exception("run %s: system design not written", run_id)
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)
@@ -459,6 +467,18 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
             raise HTTPException(500, f"PDF rendering failed: {e}") from e
         headers = {"Content-Disposition": f'attachment; filename="model-spec-{run_id}.pdf"'}
         return Response(pdf, media_type="application/pdf", headers=headers)
+
+    @app.get("/api/runs/{run_id}/system_design.{ext}")
+    def system_design(run_id: str, ext: str) -> FileResponse:
+        """The system design to upload to SysModeler (.txt: SysModeler reads a text upload as text)
+        or to read (.pdf, .md)."""
+        if ext not in ("txt", "md", "pdf"):
+            raise HTTPException(404, "system_design.txt, .md or .pdf")
+        path = os.path.join(mgr._dir(run_id), f"system_design.{ext}")
+        if not os.path.isfile(path):
+            raise HTTPException(404, "this run has no system design: its code is in a language the design reader "
+                                     "does not handle yet (Go services today), or it ran before the design existed")
+        return FileResponse(path, filename=f"system-design-{run_id}.{ext}")
 
     @app.get("/api/health")
     def health() -> dict:

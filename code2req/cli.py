@@ -179,6 +179,24 @@ def write_run_spec(run_dir: str) -> int:
     return 0
 
 
+def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: str) -> int:
+    """The system design for a finished run: what `code2req design` and the end of every analyze write."""
+    from code2req.design import supported, write_design
+    if supported(repo) is None:
+        print("system design: not written (the design reader handles Go services today)")
+        return 0
+    s = write_design(run_dir, repo, llm, title=title, target=target)
+    if s is None:
+        return 0
+    print(f"system design: {s['components']} components in {s['subsystems']} subsystems, {s['actors']} external systems, "
+          f"{s['connections']} connections, {s['routes']} routes, {s['state_machines']} state machines, "
+          f"{s['activities']} activities, {s['interactions']} interactions, {s['requirements']} requirements "
+          f"({s['left_out']} left out); {s['chars']:,} characters, largest section {s['largest']:,}")
+    print(f"wrote {os.path.join(run_dir, 'system_design.md')}, system_design.txt"
+          + (", system_design.pdf" if s["pdf"] else "") + " and design.json")
+    return 0
+
+
 def run_fmg(run_dir: str, backend_ai: str | None, model: str, key_path: str | None, score_only: bool) -> int:
     """SysModeler's full model generation on a finished run's requirements, as a dry run with no
     project (backend-ai scripts/code2req_ingest -model, every tier forced to one model), then its
@@ -220,6 +238,19 @@ def main(argv: list[str] | None = None) -> int:
     add_run_args(a, out="code2req-out")
     a.add_argument("--keep-clone", action="store_true",
                    help="for a git URL, keep the whole clone instead of only the files the result cites")
+    a.add_argument("--no-design", action="store_true",
+                   help="skip the system design (system_design.md/.txt/.pdf, design.json): the parts, connections, "
+                        "routes and behaviour read from the code, with the requirements, for SysModeler")
+    a.add_argument("--title", help="the system's name in the design (default: the repo's name)")
+
+    dz = sub.add_parser("design", help="write the system design (system_design.md/.txt/.pdf, design.json) of a "
+                                       "finished run, read from its source and requirements.json")
+    dz.add_argument("run", help="the run's output folder (--out)")
+    dz.add_argument("--repo", help="the source folder (default: the one the run read)")
+    dz.add_argument("--title", help="the system's name (default: the repo's name)")
+    dz.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=ENV_HELP)
+    dz.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model that splits the requirements (default DeepSeek)")
+    dz.add_argument("-v", "--verbose", action="store_true")
 
     v = sub.add_parser("eval", help="run a slice of the code and compare it with a baseline run")
     add_run_args(v, out="code2req-eval")
@@ -331,6 +362,14 @@ def main(argv: list[str] | None = None) -> int:
         p.error(str(e))
     logging.getLogger("code2req").info("llm: %s", label)
 
+    if args.cmd == "design":
+        with open(os.path.join(args.run, "requirements.json"), encoding="utf-8") as f:
+            stats = json.load(f).get("stats", {})
+        repo = args.repo or stats.get("repo", "")
+        if not os.path.isdir(repo):
+            p.error(f"no source folder: {repo or '(not recorded)'}; pass --repo")
+        return write_run_design(args.run, repo, with_cache(llm, label), args.title, stats.get("target", ""))
+
     if args.cmd == "bench":
         rows = []
         for entry in load_suite(args.suite, args.only, args.large):
@@ -370,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
                  surface_hints=not args.no_surface_hints)
     if args.cmd == "eval":
         return write_eval(args, report.to_json())
+    if not args.no_design:  # before a clone is pruned: the design reads every source file
+        write_run_design(args.out, repo, llm, args.title, args.target.strip().strip('"'))
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
         kept, removed = prune_clone(repo, referenced_files(report))
         print(f"clone pruned to the {kept} files the result cites ({removed} removed, git data dropped)")
