@@ -211,7 +211,10 @@ class RunManager:
 
         def progress(stage: str, done: int, total: int) -> None:
             with meta_lock:
-                meta["progress"] = {"stage": stage, "done": done, "total": total}
+                if stage.startswith("design"):  # the design is read beside the requirements: its own track
+                    meta["design_progress"] = {"stage": stage, "done": done, "total": total}
+                else:
+                    meta["progress"] = {"stage": stage, "done": done, "total": total}
                 _write_json(meta_path, meta)
 
         try:
@@ -225,19 +228,38 @@ class RunManager:
             logger.info("run %s: %s (%s)", run_id, repo, label)
             # The budget sits below the cache, so answers for unchanged code stay free after the cap.
             llm = with_cache(with_budget(llm, req.max_cost), label, enabled=req.cache, path=self.cache_path)
+            # the design needs only the source: it is read while the requirements are written, and joined after
+            from ..design import load_libraries, read_design, supported, write_design
+            load_libraries()  # before a second thread imports them
+            design_box: dict = {}
+
+            def read() -> None:
+                try:
+                    design_box["design"] = read_design(repo, llm, target=meta["target"], progress=progress)
+                except Exception:  # noqa: BLE001 - the requirements stand without the design
+                    logger.exception("run %s: system design not read", run_id)
+                    design_box["failed"] = True
+
+            reading = threading.Thread(target=read, daemon=True) if supported(repo) else None
+            if reading is not None:
+                progress("design_map", 0, 0)
+                reading.start()
             report = run_pipeline(repo, out_dir, llm, label, req.workers,
                                   req.exclude or None, req.max_module_chars, progress=progress,
                                   followup=req.followup, entries=req.entries or None,
                                   include_assets=req.assets, target=meta["target"],
                                   stop=self.stops[run_id], profile=req.profile)
-            try:  # the system design reads every source file: before a clone is pruned
-                from ..design import supported, write_design
-                if supported(repo):
-                    progress("design", 0, 0)
-                    meta["design"] = write_design(out_dir, repo, llm, target=meta["target"])
-                    logger.info("system design written: %s", meta["design"])
+            try:  # before a clone is pruned: the design read every source file
+                if reading is not None:
+                    reading.join()
+                    if design_box.get("design") is not None:
+                        progress("design_write", 0, 0)
+                        meta["design"] = write_design(out_dir, repo, llm, target=meta["target"], design=design_box["design"])
+                        logger.info("system design written: %s", meta["design"])
+                        progress("design_done", 0, 0)
             except Exception:  # noqa: BLE001 - the requirements stand without the design
                 logger.exception("run %s: system design not written", run_id)
+            progress("done", 0, 0)
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)
@@ -477,8 +499,17 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
         path = os.path.join(mgr._dir(run_id), f"system_design.{ext}")
         if not os.path.isfile(path):
             raise HTTPException(404, "this run has no system design: its code is in a language the design reader "
-                                     "does not handle yet (Go services today), or it ran before the design existed")
+                                     "does not handle yet, or it ran before the design existed")
         return FileResponse(path, filename=f"system-design-{run_id}.{ext}")
+
+    @app.get("/api/runs/{run_id}/model.kpar")
+    def model_kpar(run_id: str) -> FileResponse:
+        """The model itself, as a SysModeler project archive: Import project (.kpar) in SysModeler."""
+        d = mgr._dir(run_id)
+        found = [f for f in os.listdir(d) if f.endswith(".kpar")] if os.path.isdir(d) else []
+        if not found:
+            raise HTTPException(404, "this run has no model: it has no system design")
+        return FileResponse(os.path.join(d, found[0]), filename=found[0], media_type="application/zip")
 
     @app.get("/api/health")
     def health() -> dict:

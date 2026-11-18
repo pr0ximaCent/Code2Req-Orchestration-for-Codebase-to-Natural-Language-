@@ -216,8 +216,9 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
   <a class="btn" id="exportBtn" aria-disabled="true">Export JSON</a>
   <a class="btn" id="pdfBtn" aria-disabled="true" title="Readable report with your review verdicts">Export PDF</a>
   <a class="btn" id="specBtn" aria-disabled="true" title="The model spec to upload to SysModeler: the model read from the code, with fixed IDs, and the requirements (those marked wrong are left out)">Model spec</a>
-  <a class="btn" id="designTxtBtn" aria-disabled="true" title="The system design to upload to SysModeler: parts, connections, routes, behaviour and requirements read from the code (Go services today)">System design (.txt)</a>
+  <a class="btn" id="designTxtBtn" aria-disabled="true" title="The system design to upload to SysModeler: parts, connections, routes, behaviour and requirements read from the code">System design (.txt)</a>
   <a class="btn" id="designPdfBtn" aria-disabled="true" title="The same system design, as a PDF to read">System design (PDF)</a>
+  <a class="btn" id="kparBtn" aria-disabled="true" title="The model itself, checked against the code: in SysModeler, Import project (.kpar)">Model (.kpar)</a>
 </header>
 <div class="options" id="options" hidden>
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
@@ -264,6 +265,9 @@ const STEPS = [
   ["modules", "Write requirements for each module"],
   ["verify", "Check every citation against the code"],
   ["followup", "Cover functions no requirement cites yet"],
+  ["design_map", "Design (alongside): read the architecture of each folder"],
+  ["design_behaviour", "Design (alongside): read what each component does"],
+  ["design_write", "Write the system design and model"],
   ["done", "Save results"],
 ];
 const VIEWS = [["requirements", "Requirements"], ["references", "Reference"], ["gaps", "Gaps"], ["rejected", "Rejected"],
@@ -425,9 +429,10 @@ async function refresh() {
 function render() {
   renderStatus();
   for (const [btn, path] of [["#exportBtn", "export"], ["#pdfBtn", "export.pdf"], ["#specBtn", "model_spec.pdf"],
-                             ["#designTxtBtn", "system_design.txt"], ["#designPdfBtn", "system_design.pdf"]]) {
+                             ["#designTxtBtn", "system_design.txt"], ["#designPdfBtn", "system_design.pdf"],
+                             ["#kparBtn", "model.kpar"]]) {
     const exp = $(btn);
-    const ready = S.run?.status === "done" && (!path.startsWith("system_design") || S.run?.design);
+    const ready = S.run?.status === "done" && (!/^(system_design|model\.kpar)/.test(path) || S.run?.design);
     if (ready) { exp.href = `/api/runs/${S.runId}/${path}`; exp.setAttribute("aria-disabled", "false"); }
     else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
   }
@@ -480,9 +485,15 @@ function renderRun() {
   const idx = STEPS.findIndex(([k]) => k === p.stage);
   let pct = idx < 0 ? 0 : Math.round((idx / (STEPS.length - 1)) * 100);
   if (p.stage === "modules" && p.total) pct = Math.round(((3 + p.done / p.total) / (STEPS.length - 1)) * 100);
+  // the design is read beside the requirements: its steps follow their own progress
+  const DESIGN = ["design_map", "design_behaviour", "design_write"];
+  const d = r.design_progress || {}, didx = d.stage === "design_done" ? DESIGN.length : DESIGN.indexOf(d.stage);
   const steps = STEPS.map(([k, label], i) => {
-    const cls = i < idx ? "past" : i === idx ? "now" : "";
-    const extra = k === p.stage && ["modules", "followup"].includes(k) && p.total ? `${p.done} of ${p.total}` : "";
+    const di = DESIGN.indexOf(k);
+    const cls = di >= 0 ? (didx < 0 ? "" : di < didx ? "past" : di === didx ? "now" : "")
+      : i < idx ? "past" : i === idx ? "now" : "";
+    const cur = di >= 0 ? d : p;
+    const extra = k === cur.stage && ["modules", "followup", "design_map", "design_behaviour"].includes(k) && cur.total ? `${cur.done} of ${cur.total}` : "";
     return `<li class="${cls}"><span class="k">${i + 1}</span><span>${esc(label)}</span><span>${esc(extra)}</span></li>`;
   }).join("");
   const ended = ["failed", "stopped"].includes(r.status);

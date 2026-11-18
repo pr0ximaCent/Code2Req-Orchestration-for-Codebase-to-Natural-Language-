@@ -11,6 +11,8 @@ import json
 import os
 import re
 
+from .names import words
+
 LIMIT = 9000  # characters per subsection: one answer of SysModeler's document reader is 12,000
 
 
@@ -293,6 +295,161 @@ def render(d: dict) -> str:
     md.items([f"D-{i:02d}: {x}" for i, x in enumerate(d["decisions"], 1)]
              + ([f"Requirements left out (they cite no code of the system): {', '.join(d['left_out_requirements'])}"]
                 if d.get("left_out_requirements") else []))
+    return md.text()
+
+
+def short_step(text: str) -> str:
+    """A step in few words: 'Call svc: Place(id, amount).' -> 'svc.Place(id, amount)', 'Respond 201.' -> '→ 201'."""
+    t = str(text).strip().rstrip(".")
+    t = re.sub(r"^Call (\w+): ", r"\1.", t)
+    t = re.sub(r"^Call ", "", t)
+    t = re.sub(r"^Run (\w+\(.*?\))(?: — an operation of its own \(section 6\))?$", r"self.\1", t)
+    t = re.sub(r"^Respond (\S+)$", r"→ \1", t)
+    t = re.sub(r"^Receive the request \((.*)\)$", r"receive \1", t)
+    t = re.sub(r"^Start (\w+) in the background and go on without waiting for it$", r"start \1 in background", t)
+    t = t.replace("Go on; the failure does not end", "go on (does not end").replace("Stop and return the error", "stop with error")
+    return t + (")" if t.startswith("go on (does not end") else "")
+
+
+def compact_steps(steps, depth=1) -> list[str]:
+    pad, out = "  " * depth, []
+    for s in steps:
+        if "do" in s:
+            if not s["do"].startswith("Receive the request"):  # the route is in the flow's heading
+                out.append(pad + short_step(s["do"]))
+        elif "stop" in s:
+            out.append(pad + short_step(s.get("text") or "stop").replace("Stop", "stop").replace("Return", "return"))
+        elif "if" in s:
+            out.append(f"{pad}{s['if']}?")
+            out += compact_steps(s["then"], depth + 1) or [pad + "  (nothing)"]
+            if s["else"]:
+                out.append(f"{pad}else:")
+                out += compact_steps(s["else"], depth + 1)
+        elif "loop" in s:
+            out.append(f"{pad}for {s['loop']}:")
+            out += compact_steps(s["steps"], depth + 1)
+        elif "switch" in s:
+            out.append(f"{pad}by {s['switch']}:")
+            for c in s["cases"]:
+                out.append(f"{pad}  {c['case']}:")
+                out += compact_steps(c["steps"], depth + 2)
+    return out
+
+
+def requirement_lines(reqs: list[dict], subject: str) -> list[str]:
+    """One line per requirement. "The <subject> shall" is left to the heading when it names the heading's subject; a
+    requirement about another element keeps its own opening. The atomic parts of one requirement (ID-1, ID-2, ...)
+    share a line, their common opening said once: "ID-1..3: create an article with (1) a generated id; (2) ..."."""
+    def body(r):
+        t = r["text"].strip().rstrip(".")
+        m = re.match(r"(?:The|An?)\s+(.*?)\s+shall\s+", t)
+        if m and words(m.group(1).replace(" component", "")) == words(subject):
+            t = t[m.end():]
+        return t + (f" [uses {', '.join(r['uses'])}]" if r.get("uses") else "")
+    out, i = [], 0
+    while i < len(reqs):
+        def stem(rid):  # CODE-USER-003-2 is part 2 of CODE-USER-003; CODE-DATA-002 is a requirement of its own
+            m = re.fullmatch(r"(.*-\d+)-\d+", rid)
+            return m.group(1) if m else None
+        j = i
+        while j < len(reqs) and stem(reqs[j]["id"]) is not None and stem(reqs[j]["id"]) == stem(reqs[i]["id"]):
+            j += 1
+        if j - i <= 1:
+            out.append(f"- {reqs[i]['id']}: {body(reqs[i])}")
+            i += 1
+            continue
+        group = reqs[i:j]
+        texts = [body(r).split() for r in group]
+        n = 0
+        while all(len(t) > n + 1 for t in texts) and len({t[n] for t in texts}) == 1:
+            n += 1
+        head = " ".join(texts[0][:n])
+        out.append(f"- {group[0]['id']}..{group[-1]['id'].rsplit('-', 1)[1]}: {head + ' ' if head else ''}"
+                   + "; ".join(f"({k}) {' '.join(t[n:])}" for k, t in enumerate(texts, 1)))
+        i = j
+    return out
+
+
+def render_compact(d: dict) -> str:
+    """The design said once, one line per element: what SysModeler needs to build the model, without the repetition of
+    render(). Evidence (file:line) stays in design.json."""
+    md = Md()
+    title = d["title"]
+    comps = {c["name"]: c for c in d["components"]}
+    ops_of = {}
+    for o in d["operations"]:
+        ops_of.setdefault(o["owner"], []).append(o)
+    reqs = d.get("requirements", [])
+    md.h(1, f"{title} — system design from code")
+    md.p(f"The SysML v2 model of {title} ({d['language']}), read from its code. Build exactly these elements with these IDs "
+         "and names, nothing else. Notation: `A → B: op(args)` is a call from part A to part B; in a flow, an indented line is "
+         "a step, `cond?` a decision whose indented steps run when it holds, `→ 201` a response, `stop` the end of the flow; "
+         "`[uses VAL_nn]` names an attribute a requirement relies on.")
+
+    md.h(2, "1. Structure")
+    md.p(f"System {d['system']['id']} {title} (part def `{d['system']['def']}`). Each component: ID, name, its parts, what "
+         "it does, and its operations (ID name(args) → result; * = has a flow in section 5).")
+    by_sub = {}
+    for c in d["components"]:
+        by_sub.setdefault(c["subsystem"] or "", []).append(c)
+    subs = {s["name"]: s for s in d["subsystems"]}
+    for sub, cs in by_sub.items():
+        lines = []
+        for c in cs:
+            ops = "; ".join(f"{o['id']} {o['name']}({', '.join(o['args'][:4])})" + (f" → {o['result']}" if o["result"] else "")
+                            + ("*" if o["flow"] else "") + (" [background]" if o["background"] else "") for o in ops_of.get(c["name"], []))
+            lines.append(f"- {c['id']} {c['name']} (part {', '.join(p['name'] for p in c['parts'])}): {c['purpose'] or ''}"
+                         + (f" Ops: {ops}." if ops else ""))
+        head = f"{subs[sub]['id']} subsystem {sub}" if sub in subs else "Components"
+        md.parts(3, head, [("", lines)])
+    md.parts(3, "External systems", [("", [f"- {a['id']} {a['name']} (part {a['part']}): {a['what']}" for a in d["actors"]])])
+
+    md.parts(2, "2. Connections", [("", [
+        f"- {cn['id']} {cn['from']} → {cn['to']}: " + "; ".join(
+            x["name"] + (f"({', '.join(x['args'])})" if x["args"] else "") + (f" → {x['result']}" if x["result"] else "")
+            for x in cn["calls"]) for cn in d["connections"]])])
+
+    md.h(2, "3. Attributes")
+    md.parts(3, "Settings and limits (owner: name : Type = value)", [("", [
+        f"- {s['id']} {s['owner']}: {attr_line(s['name'], s['value']).strip('`')} (env {s['env']})" for s in d["settings"]]
+        + [f"- {x['id']} {x['owner']}: {attr_line(x['name'], x['value']).strip('`')}" for x in d["limits"]] or ["- (none)"])])
+    md.parts(3, "Data types", [("", [
+        f"- {x['id']} {x['name']}: " + (f"enum {', '.join(x['values'])}" if x["kind"] == "enum" else ", ".join(x["fields"]) or "—")
+        for x in d["data"]])])
+
+    md.parts(2, "4. Routes", [((f"All under {d['mount']}." if d.get("mount") else ""), [
+        f"- {r['method']} {r['path']} → {r['handler']} ({r['op']})" + (f": {', '.join(str(c) for c in r['codes'])}" if r["codes"] else "")
+        for r in d["routes"]])])
+
+    md.h(2, "5. Flows (action flows)")
+    for a in d["activities"]:
+        md.parts(3, f"{a['id']} {a['owner']}.{a['name']}" + (f" — {a['route']}" if a["route"] else "")
+                 + (" — background" if a["background"] else ""), [("", compact_steps(a["steps"]))])
+
+    if d["state_machines"]:
+        md.h(2, "6. State machines")
+        for m in d["state_machines"]:
+            lines = [f"States: {', '.join(s['id'] + ' ' + s['name'] for s in m['states'])}; initial "
+                     + (m["initial"]["state"] if m["initial"] else m["states"][0]["name"]) + "."]
+            lines += [f"- {t['id']} {t['from']} → {t['to']} when {t['when']}" + (f" / {t['effect']}" if t["effect"] else "")
+                      for t in m["transitions"]]
+            md.parts(3, f"{m['id']} {m['name']} ({m['owner']})", [("", lines)])
+
+    md.h(2, "7. Sequences")
+    md.p("Each: its trigger, then every message in order as `from→to: what`.")
+    for s in d["interactions"]:
+        msgs = [m for m in s["messages"] if not re.search(r"\breturns\b|^HTTP response$", m["what"])]
+        chain = "; ".join(f"{m['from']}→{m['to']}: {re.sub(r'[(].*| request$', '', m['what'])}" for m in msgs)
+        md.p(f"{s['id']} {s['name']} ({s['trigger']}): {chain}" + (f"; then {', '.join(s['spawns'])} in background" if s["spawns"] else ""))
+
+    md.h(2, "8. Requirements")
+    md.p("Already atomic; one requirement def each with exactly this ID, its subject the component named.")
+    by_subject = {}
+    for r in reqs:
+        by_subject.setdefault(r["subject"], []).append(r)
+    md.parts(3, "By subject", [(f"{s} ({comps[s]['id'] if s in comps else d['system']['id']}); a line with no subject "
+                                f"of its own reads \"{s} shall ...\":", requirement_lines(rs, s)) for s, rs in by_subject.items()]
+             or [("", ["- (none)"])])
     return md.text()
 
 

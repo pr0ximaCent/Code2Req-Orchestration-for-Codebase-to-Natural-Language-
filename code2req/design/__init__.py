@@ -3,10 +3,14 @@
 code2req's requirements say what the code must do; the design says what the code is made of and how
 it behaves: its parts and subsystems, the connections between them and what each carries, the
 external systems, the routes, settings and data, the state machines, activities and interactions.
-`write_design` reads a finished run (requirements.json) and the source, and writes design.json and
-system_design.md/.txt/.pdf into the run's folder.
+`write_design` reads a finished run (requirements.json) and the source, and writes design.json,
+system_design.md/.txt/.pdf and the model itself (system_model/ and a .kpar SysModeler imports) into the
+run's folder.
 
-Go services are read today (golang.py); other languages say so and write nothing."""
+Two readers: reader.py (the default), for any language the outline parses (Go, Python, TypeScript,
+JavaScript, Java, C#): the model reads, code checks every answer against the source; and golang.py,
+hand-written rules for Go services wired in one place (`reader="go"`), kept as the reference the first
+is tested against."""
 from __future__ import annotations
 
 import json
@@ -20,8 +24,11 @@ GENERIC_NAMES = {"backend", "server", "service", "api", "app", "src", "code", "r
 
 
 def supported(repo: str) -> str | None:
-    """The language the design reader handles for this repo, or None."""
-    return "go" if os.path.isfile(os.path.join(repo, "go.mod")) else None
+    """The main language of the repo's source, when the design reader handles it; else None."""
+    from .outline import LANG_OF
+    from .reader import source_files
+    langs = Counter(LANG_OF[os.path.splitext(f)[1].lower()] for f in source_files(repo))
+    return langs.most_common(1)[0][0] if langs else None
 
 
 def title_for(repo: str, target: str = "") -> str:
@@ -131,18 +138,49 @@ def settings_used(text: str, settings: list[dict]) -> list[dict]:
     return out
 
 
-def write_design(run_dir: str, repo: str, llm, title: str | None = None, target: str = "") -> dict | None:
-    """Read the design from the source, attach the run's requirements, and write the documents.
-    Returns a summary, or None when the language is not read yet."""
-    lang = supported(repo)
-    if lang is None:
-        log.info("design: no reader for this repo's language yet (Go services are read today)")
+def load_libraries() -> None:
+    """Import the model clients before the design is read on its own thread: two threads importing openai for the
+    first time at once deadlock on Python's import lock (seen with the requirements pass, which imports it lazily)."""
+    import importlib
+    for name in ("openai", "openai.types", "openai.types.chat", "litellm", "codewiki.src.be.llm_services"):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - a module this install lacks is simply not used
+            pass
+
+
+def read_design(repo: str, llm, title: str | None = None, target: str = "", reader: str = "llm", report: dict | None = None,
+                progress=None) -> dict | None:
+    """The design read from the source alone (the slow part: model calls), so it can run while the requirements are
+    written. report: the run's report when it exists, else the surfaces are found here. None when the repo has no
+    source in a language the reader handles."""
+    if supported(repo) is None:
+        log.info("design: no source in a language the design reader handles (Go, Python, TypeScript, JavaScript, Java, C#)")
         return None
+    title = title or title_for(repo, target)
+    from .reader import Reader, source_files
+    files = source_files(repo)
+    if report is None:
+        from ..surfaces import detect_surfaces
+        report = {"surfaces": [x.model_dump() for x in detect_surfaces(repo, files)]}
+    if reader == "go" and os.path.isfile(os.path.join(repo, "go.mod")):
+        from .golang import Design
+        return Design(repo, report, title).build()
+    return Reader(repo, report, title, llm, files, progress=progress).build()
+
+
+def write_design(run_dir: str, repo: str, llm, title: str | None = None, target: str = "", reader: str = "llm",
+                 progress=None, design: dict | None = None) -> dict | None:
+    """Attach the run's requirements to the design and write the documents and the model. design: one read_design
+    already read (while the requirements were written); else it is read here. Returns a summary, or None when the
+    repo has no source in a language the reader handles."""
     with open(os.path.join(run_dir, "requirements.json"), encoding="utf-8") as f:
         report = json.load(f)
-    from .golang import Design
     title = title or title_for(repo, target)
-    design = Design(repo, report, title).build()
+    if design is None:
+        design = read_design(repo, llm, title, target, reader, report, progress)
+    if design is None:
+        return None
     design["source"] = target or repo
     kept, subject, impl, left_out = anchor(design, report)
     names = {rid: (f"{s} component" if s != design["title"] else design["title"]) for rid, s in subject.items()}
@@ -164,6 +202,15 @@ def write_design(run_dir: str, repo: str, llm, title: str | None = None, target:
     design["left_out_requirements"] = left_out
     from .render import write
     stats = write(design, run_dir)
+    # the model itself, as SysML files and as a project archive SysModeler imports
+    from .sysml import write_kpar, write_sysml
+    model_dir = os.path.join(run_dir, "system_model")
+    if os.path.isdir(model_dir):  # a file of an earlier design must not stay behind
+        import shutil
+        shutil.rmtree(model_dir)
+    files = write_sysml(design, model_dir)
+    stats["sysml_files"] = len(files)
+    stats["kpar"] = write_kpar(files, os.path.join(run_dir, re.sub(r"\W+", "_", title).strip("_") + ".kpar"), title)
     summary = {"title": title, "components": len(design["components"]), "subsystems": len(design["subsystems"]),
                "actors": len(design["actors"]), "connections": len(design["connections"]), "routes": len(design["routes"]),
                "state_machines": len(design["state_machines"]), "activities": len(design["activities"]),
@@ -171,4 +218,4 @@ def write_design(run_dir: str, repo: str, llm, title: str | None = None, target:
     return summary
 
 
-__all__ = ["write_design", "supported", "title_for"]
+__all__ = ["read_design", "write_design", "supported", "title_for"]

@@ -179,13 +179,15 @@ def write_run_spec(run_dir: str) -> int:
     return 0
 
 
-def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: str) -> int:
-    """The system design for a finished run: what `code2req design` and the end of every analyze write."""
+def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: str, reader: str = "llm",
+                     design: dict | None = None) -> int:
+    """The system design for a finished run: what `code2req design` and the end of every analyze write. design:
+    one already read beside the requirements."""
     from code2req.design import supported, write_design
     if supported(repo) is None:
-        print("system design: not written (the design reader handles Go services today)")
+        print("system design: not written (no Go, Python, TypeScript, JavaScript, Java or C# source found)")
         return 0
-    s = write_design(run_dir, repo, llm, title=title, target=target)
+    s = write_design(run_dir, repo, llm, title=title, target=target, reader=reader, design=design)
     if s is None:
         return 0
     print(f"system design: {s['components']} components in {s['subsystems']} subsystems, {s['actors']} external systems, "
@@ -194,6 +196,8 @@ def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: st
           f"({s['left_out']} left out); {s['chars']:,} characters, largest section {s['largest']:,}")
     print(f"wrote {os.path.join(run_dir, 'system_design.md')}, system_design.txt"
           + (", system_design.pdf" if s["pdf"] else "") + " and design.json")
+    print(f"wrote the model: {s['sysml_files']} SysML files in {os.path.join(run_dir, 'system_model')} and "
+          f"{s['kpar']} (import it into SysModeler: Import project, .kpar)")
     return 0
 
 
@@ -249,7 +253,11 @@ def main(argv: list[str] | None = None) -> int:
     dz.add_argument("--repo", help="the source folder (default: the one the run read)")
     dz.add_argument("--title", help="the system's name (default: the repo's name)")
     dz.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=ENV_HELP)
-    dz.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model that splits the requirements (default DeepSeek)")
+    dz.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model that reads the design and splits the "
+                    "requirements (default DeepSeek)")
+    dz.add_argument("--reader", choices=("llm", "go"), default="llm",
+                    help="llm: the model reads any language, code checks it (default); go: hand-written rules for Go services")
+    dz.add_argument("--max-cost", type=float, default=6.0, metavar="USD", help="stop paid model calls at this cost (default 6)")
     dz.add_argument("-v", "--verbose", action="store_true")
 
     v = sub.add_parser("eval", help="run a slice of the code and compare it with a baseline run")
@@ -368,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         repo = args.repo or stats.get("repo", "")
         if not os.path.isdir(repo):
             p.error(f"no source folder: {repo or '(not recorded)'}; pass --repo")
-        return write_run_design(args.run, repo, with_cache(llm, label), args.title, stats.get("target", ""))
+        return write_run_design(args.run, repo, with_cache(with_budget(llm, args.max_cost), label), args.title,
+                                stats.get("target", ""), args.reader)
 
     if args.cmd == "bench":
         rows = []
@@ -402,6 +411,17 @@ def main(argv: list[str] | None = None) -> int:
             print(line)
     # The budget sits below the cache, so answers for unchanged code stay free after the cap.
     llm = with_cache(with_budget(llm, args.max_cost), label, enabled=not args.no_cache)
+    design_box: dict = {}
+    reading = None
+    if args.cmd == "analyze" and not args.no_design:  # the design needs only the source: read beside the requirements
+        import threading
+
+        from code2req.design import load_libraries, read_design, supported
+        if supported(repo):
+            load_libraries()  # before a second thread imports them
+            reading = threading.Thread(daemon=True, target=lambda: design_box.update(design=read_design(
+                repo, llm, args.title, args.target.strip().strip('"'))))
+            reading.start()
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
                  target=args.target.strip().strip('"'),
                  followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets,
@@ -410,7 +430,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "eval":
         return write_eval(args, report.to_json())
     if not args.no_design:  # before a clone is pruned: the design reads every source file
-        write_run_design(args.out, repo, llm, args.title, args.target.strip().strip('"'))
+        if reading is not None:
+            reading.join()
+        write_run_design(args.out, repo, llm, args.title, args.target.strip().strip('"'), design=design_box.get("design"))
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
         kept, removed = prune_clone(repo, referenced_files(report))
         print(f"clone pruned to the {kept} files the result cites ({removed} removed, git data dropped)")
