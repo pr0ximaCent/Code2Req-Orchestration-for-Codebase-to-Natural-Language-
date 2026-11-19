@@ -1,0 +1,31 @@
+system VendingMachine                                            @code/vending/
+  actor Customer, Operator
+  part CoinSlot, Shelves, SlotMotor, Controller, TempSensor
+  item Coin {value}
+  cfg coins = {5,10,25} cents, tempRange = 2..8 °C, motorTries = 3
+  req VM-1 accept only coins in coins; push any other coin back
+  req VM-2 add each accepted coin to the credit
+  req VM-3 sell a slot only if credit >= price(slot) and stock(slot) > 0; otherwise sell nothing and keep the credit
+  req VM-4 after a sale reduce stock by one and return credit - price(slot) as change
+  req VM-5 if the motor fails after motorTries attempts, return all credit and sell nothing
+  req VM-6 on cancel before a sale completes, return all credit
+  req VM-7 while temperature is outside tempRange, refuse coins and selections and return any credit
+  req VM-8 when temperature returns to tempRange, return to idle
+  req VM-9 allow restock only when idle with no credit, or out of service
+  req VM-10 record every sale and every refund in the event log
+  state Controller:
+    Idle -(insertCoin[valid] / credit += value)-> Credited
+    Credited -(insertCoin[valid] / credit += value)-> Credited
+    Credited -(select[credit >= price and stock > 0] / push)-> Dispensing
+    Dispensing -(dropped / stock -= 1, returnChange)-> Idle
+    Dispensing -(jammed after motorTries / returnCredit)-> Idle
+    Credited -(cancel / returnCredit)-> Idle
+    Idle -(temp outside tempRange)-> OutOfService
+    Credited -(temp outside tempRange / returnCredit)-> OutOfService
+    OutOfService -(temp in tempRange)-> Idle
+  usecase BuyItem: Customer -> insertCoin+, select, collect item, collect change
+  usecase CancelPurchase: Customer -> insertCoin+, cancel, collect credit
+  usecase Restock: Operator -> open, refill, close
+  omit eventLogEncoding: serialization
+  omit moneyFormat: formatting
+  omit motorPause: implementation
