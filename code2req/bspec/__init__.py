@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .check import Result, check
 from .extract import Extraction, extract
 from .facts import ModuleFacts, RepoFacts
-from .notation import LEGEND, Spec, format_module, parse
+from .notation import ANY, LEGEND, Spec, format_module, parse
 from .report import old_report, review_markdown, size_markdown, size_report
 from .sysml import write as write_sysml
 
@@ -73,7 +73,7 @@ def _write(path: str, text: str) -> None:
         f.write(text)
 
 
-def run(repo_path: str, out_dir: str, llm, label: str, modules: list[str] | None = None, rounds: int = 3,
+def run(repo_path: str, out_dir: str, llm, label: str, modules: list[str] | None = None, rounds: int = 5,
         workers: int = 4, compare: str | None = None) -> dict:
     repo = RepoFacts(repo_path)
     dirs = select(repo, modules)
@@ -89,7 +89,7 @@ def run(repo_path: str, out_dir: str, llm, label: str, modules: list[str] | None
             continue
         texts[f"{ex.module}.c2s"] = ex.text
         notes[ex.module] = [f"extraction: {ex.rounds} round(s), problems per round {ex.history}"]
-    spec = parse(texts)
+    spec = parse(texts, known={h for mf in facts.values() for h, _ in mf.folds})
     results = {m.name: check(spec, m, facts[m.name], repo) for m in spec.modules if m.name in facts}
     os.makedirs(out_dir, exist_ok=True)
     attempts_dir = os.path.join(out_dir, "extract")
@@ -116,14 +116,16 @@ def from_spec(spec_dir: str, out_dir: str, repo_path: str | None = None, compare
         if name.endswith(".c2s") and name != "index.c2s":
             with open(os.path.join(spec_dir, name), encoding="utf-8") as f:
                 texts[name] = f.read()
-    spec = parse(texts)
     results: dict[str, Result] = {}
     if repo_path:
         repo = RepoFacts(repo_path)
+        facts = {repo.names[d]: repo.module(d) for d in repo.dirs if f"{repo.names[d]}.c2s" in texts}
+        spec = parse(texts, known={h for mf in facts.values() for h, _ in mf.folds})
         for m in spec.modules:
-            d = next((d for d in repo.dirs if repo.names[d] == m.name), None)
-            if d is not None:
-                results[m.name] = check(spec, m, repo.module(d), repo)
+            if m.name in facts:
+                results[m.name] = check(spec, m, facts[m.name], repo)
+    else:  # no code to say which helpers were folded: a call the spec does not define is taken as one
+        spec = parse(texts, known=ANY)
     shared = texts.get("_shared.c2s", "")
     if os.path.abspath(spec_dir) == os.path.abspath(os.path.join(out_dir, "spec")):
         raise ValueError("write to another folder than the one the spec is read from")

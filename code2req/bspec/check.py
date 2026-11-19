@@ -6,6 +6,7 @@ the operation whose trace holds it (a `!err ->` or `cond ->` step, an alternativ
 the call of a rule whose definition has an exit. A trace spanning a whole function covers none of its exits."""
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -26,6 +27,7 @@ class Coverage:
     uncovered: list[ExitFact] = field(default_factory=list)
     explained: list[tuple[ExitFact, str]] = field(default_factory=list)  # uncovered, with the issue that says why
     extra: list[str] = field(default_factory=list)  # spec exits matching no code exit
+    notes: list[str] = field(default_factory=list)  # exits stated in the wrong form (default, pass-up)
 
 
 @dataclass
@@ -97,7 +99,8 @@ def check(spec: Spec, m: Module, facts: ModuleFacts, repo: RepoFacts) -> Result:
                 continue
             key = re.sub(r"\s+", " ", s.text.lower())
             if key in seen and seen[key] != o.name:
-                res.lint.append(f"duplication: step {s.text!r} is inline in {seen[key]} and {o.name}: make it a rule")
+                res.lint.append(f"duplication: step {s.text!r} is inline in {seen[key]} and {o.name}: define it once "
+                             f"as a value line `name(args) = ...` and use its name (a rule is only for a listed callee)")
             seen.setdefault(key, o.name)
     # prose the notation already says, and code copied instead of named
     for o in m.ops:
@@ -125,55 +128,99 @@ def check(spec: Spec, m: Module, facts: ModuleFacts, repo: RepoFacts) -> Result:
     for cat, rel, line, why in facts.suspects:
         if not any(i.at and i.at.file == rel and abs(i.at.start - line) <= 2 for i in m.issues):
             res.lint.append(f"missing issue: `? [{cat}] @{rel.rsplit('/', 1)[-1]}:{line} ...` ({why})")
+    if m.default:
+        for r in m.rules:
+            if r.exit and r.exit.actions == m.default.actions:
+                res.lint.append(f"rule {r.name}: `!{r.exit.cond} -> {', '.join(r.exit.actions)}` restates the module "
+                                f"default; drop it")
+        for o in m.ops:
+            for s in walk(o.steps):
+                if s.ref in rules and s.exit is not None and s.exit.default:
+                    res.lint.append(f"{o.name}: `{s.text}!` marks a rule, whose failing the default already covers; "
+                                    f"drop the `!`")
+    fns = {RepoFacts.fn_name(f): f for f in facts.fns}
+    for helper, into in facts.folds:
+        f = fns.get(helper)
+        for o in m.ops:
+            if f is not None and o.at and o.at.file == f.file and o.at.start and f.line - 1 <= o.at.start and o.at.end <= f.end + 1:
+                res.lint.append(f"{o.name}: {helper} folds into {into} (one caller, no exits, no effects); "
+                                f"say what it does in {into}'s step, not on a line of its own")
     res.coverage = coverage(m, facts, rules)
+    res.lint += res.coverage.notes
     res.lint += [f"{x}: `->` ends the operation; a conditional step that goes on is `<step> if <cond>`"
                  for x in res.coverage.extra]
     return res
 
 
-def explicit_exits(op: Op, rules: dict[str, Rule] | None = None) -> list[tuple[int, str]]:
-    """The exits an operation states, in order: (line it cites or 0, text). An exit written on a rule's
-    application restates the rule's own exit and is not counted again."""
+@dataclass
+class Stated:
+    line: int  # the line it cites, 0 for none
+    text: str
+    marked: bool = False  # `step!`
+    actions: tuple[str, ...] = ()
+    kind: str = ""
+
+
+def explicit_exits(op: Op, rules: dict[str, Rule] | None = None) -> list[Stated]:
+    """The exits an operation states, in order. An exit written on a rule's application restates the rule's
+    own exit (or the default) and is not counted again."""
     out = []
     for s in walk(op.steps):
-        if s.exit is not None and not (rules and s.ref in rules and rules[s.ref].exit):
-            out.append((s.at.start if s.at else 0,
-                        f"{s.exit.cond} -> {', '.join(s.exit.actions)}"))
+        if s.exit is not None and not (rules and s.ref in rules):
+            out.append(Stated(s.at.start if s.at else 0, f"{s.text}!" if s.exit.default else
+                              f"{s.exit.cond} -> {', '.join(s.exit.actions)}", s.exit.default, tuple(s.exit.actions),
+                              s.exit.kind))
         if s.fallback:
-            out += [(0, f"?? {a}") for a in s.fallback[:-1]]
+            out += [Stated(0, f"?? {a}") for a in s.fallback[:-1]]
     return out
 
 
 def coverage(m: Module, facts: ModuleFacts, rules: dict[str, Rule]) -> Coverage:
     cov = Coverage()
     left = list(facts.exits)
+    default = tuple(m.default.actions) if m.default else None
     for o in m.ops:
         if o.at is None or not o.at.start:
             continue
         mine = [e for e in left if e.file == o.at.file and o.at.start <= e.line <= o.at.end]
-        # exits after the call of an applied rule that has an exit
-        applied = [rules[s.ref] for s in walk(o.steps) if s.ref in rules and rules[s.ref].exit and rules[s.ref].callee]
+        # exits after the call of an applied rule that has an exit, its own or the module default
+        applied = [rules[s.ref] for s in walk(o.steps)
+                   if s.ref in rules and (rules[s.ref].exit or default) and rules[s.ref].callee]
         for e in list(mine):
             r = next((r for r in applied if e.owner and callee_matches(r.callee, e.owner)), None)
             if r is not None:
                 cov.covered.append((e, f"rule {r.name}"))
                 mine.remove(e)
                 left.remove(e)
-        stated, used = explicit_exits(o, rules), 0
-        for line, what in [x for x in stated if x[0]]:
-            e = next((e for e in mine if abs(e.line - line) <= 1), None)
+        stated, matched = explicit_exits(o, rules), []
+        for x in [x for x in stated if x.line]:
+            e = next((e for e in mine if abs(e.line - x.line) <= 1), None)
             if e is not None:
-                cov.covered.append((e, f"{o.name}: {what}"))
+                matched.append((x, e))
                 mine.remove(e)
-                left.remove(e)
-                used += 1
-        for (_, what), e in zip([x for x in stated if not x[0]], list(mine)):
-            cov.covered.append((e, f"{o.name}: {what}"))
+        for x, e in zip([x for x in stated if not x.line], list(mine)):
+            matched.append((x, e))
             mine.remove(e)
+        for x, e in matched:
+            cov.covered.append((e, f"{o.name}: {x.text}"))
             left.remove(e)
-            used += 1
-        if len(stated) > used:
-            cov.extra.append(f"{o.name}: {len(stated) - used} stated exit(s) match no early return in its lines")
+            if x.marked and facts.default_handling and e.handling and e.handling != facts.default_handling:
+                cov.notes.append(f"{o.name}: `{x.text}` marks the exit at {e.file}:{e.line} as the default, but it is "
+                                 f"handled differently; give it its own `!err -> ...`")
+            elif (not x.marked and default and x.kind == "err" and x.actions == default and e.err
+                  and e.handling == facts.default_handling):
+                cov.notes.append(f"{o.name}: `!err -> {', '.join(default)}` restates the module default; "
+                                 f"mark the step with `!` instead")
+        extra = len(stated) - len(matched)
+        if extra > 0:
+            ups = [f"{os.path.basename(f)}:{n}" for f, n, _ in facts.passups
+                   if f == o.at.file and o.at.start <= n <= o.at.end]
+            if ups:
+                said = [x.text for x in stated if x.kind == "err"]
+                cov.notes.append(f"{o.name}: the final return at {', '.join(ups)} only passes the error up; it is "
+                                 f"implicit: delete `!err -> ...` from the step" + (f" ({said[-1]})" if said else ""))
+            else:
+                cov.extra.append(f"{o.name}: {extra} stated exit(s) match no early return in its lines")
     for e in left:
         issue = next((i for i in m.issues if i.at and i.at.file == e.file and e.line - 3 <= i.at.start <= e.line + 1), None)
         if issue is not None:

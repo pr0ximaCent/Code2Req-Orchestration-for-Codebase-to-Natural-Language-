@@ -3,20 +3,13 @@ def Agent {route, summary, whenToUse, examples, run, skipFollowUp, changesProjec
 historymanager : Agent(route=history-manager, skipFollowUp)  @app/chatbot/agents/historymanager/spec.go
   when  message depends on earlier turns; never answers the user
   cfg   depth=5, turnMax=4000B
-  run(request) = h = recoverContext(prompt); return reroute(h), err  @spec.go:26-29
+  run(request) = h = recoverContext(prompt); return reroute(h), err  @spec.go:26-29  ? [mixed-result] @:28 err still returns reroute=true -> app/chatbot/agent/
   recoverContext(ctx, msg) -> history  @agent.go:20-49
     msgs = chat.LoadHistory(user, thread, depth+1) !err -> log.error, fail
-    t = transcript(msgs)  t=="" -> log.warn, return ""  # no context, so no LLM call
+    t = transcript of msgs !in current: user, files, ai, trunc each  t=="" -> log.warn, return ""  # no context, so no LLM call
     r = llm.LITE(prompt{msg.trim, t}) !err -> fail
     return trim(r)
-  transcript(msgs)  @:51-97
-    each m !in current, user|ai != "":
-      user line: trunc(user)
-      attachments line: names
-      ai line: trunc(text + [action file])
-  trunc(s) = len(s)<=turnMax -> s; s[:turnMax] + " …[truncated]"  @:99-104
-  ? [off-by-one] @:21 current unsaved or ID empty -> 6 turns, prompt says 5
-  ? [encoding] @:103 trunc cuts bytes; can split UTF-8
-  ? [error-handling] @spec.go:28 err still returns reroute=true -> app/chatbot/agent/
-  ? [inconsistency] @prompts.go:6 prompt hardcodes 5, not linked to depth
+  trunc(s) = len(s)<=turnMax -> s; s[:turnMax] + " …[truncated]"  @:99-104  ? [encoding] @:103 trunc cuts bytes; can split UTF-8
+  ? [off-by-one] @agent.go:21 current unsaved or ID empty -> 6 turns, prompt says 5
   ? [boundary] @agent.go:21 LoadHistory order unknown -> app/services/chat/
+  ? [duplicated-constant] @prompts.go:6 prompt hardcodes 5, not linked to depth

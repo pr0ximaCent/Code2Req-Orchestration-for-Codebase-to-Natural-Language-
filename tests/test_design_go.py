@@ -8,7 +8,6 @@ import re
 import pytest
 
 from code2req.design import fix_route_text, settings_used, title_for, write_design
-from code2req.design.atomize import broken, check
 from code2req.design.golang import Design, Flow
 from code2req.design.render import render, steps_lines
 
@@ -143,15 +142,6 @@ def test_requirements_say_which_settings_they_use_with_the_defaults(design):
              "text": "The ApiHandler component shall listen on the configured port.", "uses": [used[0]["id"]]}]
     md = render(dict(design, requirements=reqs, left_out_requirements=[], source=FIXTURE))
     assert f'listen on the configured port. Uses: `portValue : String = "8080"` ({used[0]["id"]}' in md
-
-
-def test_a_statement_joining_two_actions_is_asked_again_but_kept():
-    inp = [{"id": "R-1", "text": "The A component shall accept POST /x and return the draft."}]
-    joined = [{"id": "R-1", "source": "R-1", "name": "X", "text": "The A component shall accept POST /x and return the draft."}]
-    assert any("joins two actions" in p for p in check(inp, joined)) and broken(check(inp, joined)) == []
-    split = [{"id": "R-1-1", "source": "R-1", "name": "X", "text": "The A component shall accept POST /x."},
-             {"id": "R-1-2", "source": "R-1", "name": "Y", "text": "When a POST /x request arrives, the A component shall return the draft."}]
-    assert check(inp, split) == []
 
 
 def test_the_design_is_written_as_sysml_with_its_ids(design):

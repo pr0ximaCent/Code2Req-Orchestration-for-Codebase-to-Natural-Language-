@@ -337,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     bs.add_argument("--from-spec", metavar="DIR", help="no model: rebuild sysml/ and the reports from the .c2s files "
                                                        "in DIR (with TARGET, the checks run against its code too)")
     bs.add_argument("--compare", metavar="JSON", help="an earlier run's requirements.json to compare sizes with")
-    bs.add_argument("--rounds", type=int, default=3, help="model rounds per module, the first and its repairs (default 3)")
+    bs.add_argument("--rounds", type=int, default=5, help="model rounds per module, the first and its repairs (default 5)")
     bs.add_argument("--workers", type=int, default=4)
     bs.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model (default DeepSeek)")
     bs.add_argument("--max-cost", type=float, default=6.0, metavar="USD", help="stop paid model calls at this cost (default 6)")

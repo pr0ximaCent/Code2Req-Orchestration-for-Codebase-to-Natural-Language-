@@ -1,26 +1,23 @@
 auth  @app/api/auth
-  when  serves signup, login, token refresh and password endpoints
-  rule body  JSON body decodes  !err -> 400  ~httputil.DecodeJSONBody
-  rule guard(action, data, ip)  action is allowed  !err -> fail  ~userSvc.IsActionAllowed
-  rule verifyOTP(email, otpId, otp, purpose)  OTP verified  !err -> fail  ~userSvc.VerifyOTP
-  POST /auth/login/credentials {email,password} -> 200  body; ip = clientIP; guard(login, {email}, ip) !err -> fail; sign in !err -> fail  @credentials.go:17-44
-  POST /auth/login/google {access_token} -> 200  body; oauth google login !err -> fail  @:47-58
-  POST /auth/signup {email,name,password,otp_id,otp} -> 201  body; ip = clientIP; guard(signup, {email}, ip) !err -> fail; verifyOTP(email, otp_id, otp, signup) !err -> fail; sign up !err -> fail  @:61-86
-  POST /auth/token/refresh {refresh_token} -> 200  body; refresh token !err -> fail  @:89-101
-  PUT /auth/password/reset {email,otp_id,otp,new_password,confirm_password} -> 200  body; ip = clientIP; guard(passReset, {email}, ip) !err -> fail; verifyOTP(email, otp_id, otp, passwordReset) !err -> fail; set password !err -> fail; get user by email !err -> fail; create login response !err -> fail  @password.go:17-51
-  POST /auth/verification-otps/request {email,purpose,user_id} -> 201  body; no email or bad purpose -> 400; ip = clientIP; guard(sendOTP, {email,purpose}, ip) !err -> fail; send OTP !err -> fail  @verification.go:17-56
+  when  signup, login, token refresh, password reset, and OTP verification
+  !err -> fail
+  rule body  JSON body decodes  !err -> 400  ~httputil.DecodeJSONBody  ? [unresolved] @credentials.go:19 decoding not read -> app/core/httputil/
+  rule actionAllowed(action, data, ip)  action is allowed for data and ip  ~userSvc.IsActionAllowed  ? [unresolved] @:26 checks not read -> app/domains/user/
+  rule verifyOTP(ip, email, otpID, otp, purpose)  OTP verified  ~userSvc.VerifyOTP  ? [unresolved] @:74 checks not read -> app/domains/user/
+  uniqueData(email) = {"email": lower(trim(email))}  @:24
+  POST /auth/login/credentials {email,password} -> 200  body; ip = clientIP; uniqueData(email); actionAllowed(login, uniqueData, ip); sign in!  @:17-44
+  POST /auth/login/google {access_token} -> 200  body; oauth google login!  @:47-58  ? [missing-guard] @:47 no actionAllowed, which 4 siblings call
+  POST /auth/signup {email,name,password,otp_id,otp} -> 201  body; ip = clientIP; uniqueData(email); actionAllowed(signup, uniqueData, ip); verifyOTP(ip, email, otpID, otp, signup); sign up!  @:61-86  ? [ignored-result] @:70 first result of actionAllowed discarded; 1 other caller(s) check it
+  POST /auth/token/refresh {refresh_token} -> 200  body; refresh token!  @:89-101  ? [missing-guard] @:89 no actionAllowed, which 4 siblings call
+  PUT /auth/password/reset {email,otp_id,otp,new_password,confirm_password} -> 200  body; ip = clientIP; uniqueData(email); actionAllowed(passReset, uniqueData, ip); verifyOTP(ip, email, otpID, otp, passwordReset); set password!; get user by email!; create login response!  @password.go:17-51  ? [unused-input] @:18 ConfirmPassword decoded and never read  ? [ignored-result] @:24 first result of actionAllowed discarded; 1 other caller(s) check it
+  POST /auth/verification-otps/request {email,purpose,user_id} -> 201  body; purpose = trim(purpose); email = trim(email); no email or bad purpose -> 400; ip = clientIP; uniqueData = {"email": lower(email), "purpose": purpose}; actionAllowed(sendOTP, uniqueData, ip); send OTP!  @verification.go:17-56  ? [unused-input] @:18 UserID decoded and never read  ? [ignored-result] @:35 first result of actionAllowed discarded; 1 other caller(s) check it
   clientIP(r) -> ip  @helpers.go:9-22
     X-Forwarded-For header present -> return first part
     X-Real-IP header present -> return it
-    parse RemoteAddr -> return addr
+    RemoteAddr parsed -> return addr
     return host
   BearerToken(r) -> token  @:25-31
-    Authorization header starts with "bearer " -> return trimmed after prefix
+    Authorization header starts with "bearer " -> return rest
     return ""
-  ? [missing-guard] @credentials.go:47 no userSvc.IsActionAllowed, which 4 siblings call
-  ? [ignored-result] @:70 first result of userSvc.IsActionAllowed discarded; 1 other caller(s) check it
-  ? [missing-guard] @:89 no userSvc.IsActionAllowed, which 4 siblings call
-  ? [security] @helpers.go:10 client-supplied IP header trusted
+  ? [security] @:10 client-supplied IP header trusted
   ? [security] @:14 client-supplied IP header trusted
-  ? [ignored-result] @password.go:24 first result of userSvc.IsActionAllowed discarded; 1 other caller(s) check it
-  ? [ignored-result] @verification.go:35 first result of userSvc.IsActionAllowed discarded; 1 other caller(s) check it

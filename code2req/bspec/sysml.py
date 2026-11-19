@@ -44,6 +44,7 @@ class ModuleWriter:
         self.rules = {r.name: r for x in spec.modules if x.name.startswith("_") for r in x.rules}
         self.rules.update({r.name: r for r in m.rules})
         self.uses: list[tuple[str, str, Rule, list[str]]] = []  # (usage name, op def, rule, args)
+        self.performs: dict[str, str] = {}  # action def -> its perform usage in the module part
 
     # -- sections
     def text(self) -> str:
@@ -65,8 +66,8 @@ class ModuleWriter:
         for use, _, r, args in sorted(self.uses, key=lambda u: u[0]):
             sets = " ".join(f":>> {camel(p)} = {literal(a)};" for p, a in zip(r.params, args))
             out.append(f"{IND}requirement {use} : {pascal(r.name)}" + (f" {{ {sets} }}" if sets else ";"))
-        for use, _, _, _ in sorted(self.uses, key=lambda u: u[0]):
-            out.append(f"{IND}satisfy {use} by {self.part};")
+        for use, _op, _, _ in sorted(self.uses, key=lambda u: u[0]):
+            out.append(f"{IND}satisfy {use} by {self.part}.{self.performs[_op]};")
         for i in sorted(m.issues, key=lambda i: (i.at.file if i.at else "", i.at.start if i.at else 0, i.category, i.text)):
             where = f" {i.at.file}:{i.at.start}" if i.at and i.at.start else f" {i.at.file}" if i.at else ""
             out.append(f"{IND}// REVIEW: [{i.category or 'other'}]{where} {comment(i.text)}"
@@ -91,10 +92,15 @@ class ModuleWriter:
             names(camel(c.key))
             out.append(IND + cfg_line(c))
         for name, o in actions:
-            out.append(f"{IND}perform action {names(camel(name))} : {name};")
+            self.performs[name] = names(camel(name))
+            out.append(f"{IND}perform action {self.performs[name]} : {name};")
         out.append("}")
         out.append(f"part {self.part} : {self.part_def};")
         return out
+
+    def rule_exit(self, r: Rule):
+        """What failing a rule does: its own exit, else the module's default."""
+        return r.exit or self.m.default
 
     def requirement_def(self, r: Rule) -> list[str]:
         out = [f"requirement def {pascal(r.name)} {{", f"{IND}doc /* {comment(r.predicate)} */"]
@@ -104,8 +110,9 @@ class ModuleWriter:
             out.append(IND + trace(r.at))
         names = Names()
         out += [f"{IND}attribute {names(camel(p))} : String;" for p in r.params]
-        if r.exit:
-            out.append(f"{IND}doc /* {comment('when not met: ' + ', '.join(r.exit.actions))} */")
+        failing = self.rule_exit(r)
+        if failing:
+            out.append(f"{IND}doc /* {comment('when not met: ' + ', '.join(failing.actions))} */")
         out.append("}")
         return out
 
@@ -164,7 +171,7 @@ class Flow:
             name = self.names(camel(r.name))
             use = self.w.names_use(self.op, r)
             self.w.uses.append((use, self.op, r, s.args))
-            extra = " out attribute failed : Boolean;" if r.exit else ""
+            extra = " out attribute failed : Boolean;" if self.w.rule_exit(r) else ""
             applied = pascal(r.name) + (f"({', '.join(s.args)})" if s.args else "")
             return name, [f"action {name} {{ doc /* {comment('applies ' + applied)} */{extra} }}"]
         if s.returns and not s.text:
@@ -214,7 +221,7 @@ class Flow:
             lines += decl[1:]
             attach = "then "
             r = self.w.rules.get(s.ref) if s.ref else None
-            exit_ = s.exit or (r.exit if r else None)
+            exit_ = s.exit or (self.w.rule_exit(r) if r else None)
             if exit_ is not None:
                 g = f"{name}.failed" if exit_.kind == "err" else self.guard(exit_.cond)
                 xname, xdecl = self.exit_node(exit_.actions)

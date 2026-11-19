@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 # what an open issue may be tagged with: what kind of problem the code shows
-CATEGORIES = ("missing-guard", "ignored-result", "boundary", "unnamed-check", "encoding", "inconsistency",
-              "security", "off-by-one", "error-handling", "dead-code", "other")
+CATEGORIES = ("missing-guard", "ignored-result", "unused-input", "duplicated-constant", "mixed-result", "unresolved",
+              "boundary", "unnamed-check", "encoding", "inconsistency", "security", "off-by-one", "error-handling",
+              "dead-code", "other")
 # calls a step may make without the spec defining them
 BUILTINS = {"len", "trim", "lower", "upper", "join", "split", "min", "max", "int", "str", "names", "sort",
             "count", "now", "hash", "uuid", "format", "parse", "fail", "return"}
@@ -36,6 +37,8 @@ One line per distinct behaviour. Indentation (2 spaces) is nesting. `@` traces a
 | `x = call(...)`, `a; b`, successive lines | Ordered steps |
 | `cond -> actions` | Guarded exit |
 | `step  !err -> actions` | Error exit of that step |
+| `!err -> actions` (module line) | Default handling of an error exit |
+| `step!` | The step can fail, handled by the module default |
 | `ruleName`, `ruleName(arg)` | Applies a shared rule |
 | `each v !in X, filter:` + indented steps | Loop |
 | `a ?? b ?? c` | Fallback chain: the first that holds |
@@ -76,6 +79,8 @@ class Issue:
     at: Trace | None = None
     boundary: str = ""  # the package that would settle it
     line_no: int = 0
+    on: str = ""  # the line it was written on ("rule:guard", "op:POST /x"); "" for a line of its own
+    more: list = field(default_factory=list, repr=False)  # further issues written on the same line
 
 
 @dataclass
@@ -83,6 +88,7 @@ class Exit:
     kind: str  # "err" (the step failed) or "guard" (a condition holds)
     cond: str
     actions: list[str]
+    default: bool = False  # `step!`: the module's default handling
 
 
 @dataclass
@@ -153,6 +159,7 @@ class Module:
     def_name: str = ""
     def_args: list[tuple[str, str]] = field(default_factory=list)  # (attribute, value); a flag's value is "true"
     when: list[str] = field(default_factory=list)
+    default: Exit | None = None  # the module's `!err -> actions` line
     cfg: list[Cfg] = field(default_factory=list)
     rules: list[Rule] = field(default_factory=list)
     ops: list[Op] = field(default_factory=list)
@@ -242,7 +249,8 @@ def cut(text: str, pattern: str) -> tuple[str, str]:
 
 # ---------------------------------------------------------------------------------------------- parser
 class Parser:
-    def __init__(self):
+    def __init__(self, known: set[str] | None = None):
+        self.known = known or set()  # names steps may call that the spec does not define (helpers folded into a step)
         self.spec = Spec()
         self.where = ""
         self.module: Module | None = None
@@ -280,7 +288,11 @@ class Parser:
         if traces:
             at = self.trace(traces[-1].group(1), line)
             body = (body[:traces[-1].start()] + body[traces[-1].end():]).rstrip()
-        issue = self.issue(issue_text[1:].strip(), line, at) if issue_text else None
+        issue = None
+        if issue_text:  # one or more `? ...` at the end of the line
+            parts = [p for p in re.split(ISSUE, issue_text) if p.strip()]
+            found = [self.issue(p.strip(), line, at) for p in parts]
+            issue, issue.more = found[0], found[1:]
         return body.strip(), at, issue, rationale
 
     def issue(self, text: str, line: int, default_at: Trace | None) -> Issue:
@@ -338,6 +350,8 @@ class Parser:
                     head, cond = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
                 s.exit = Exit("guard", cond.strip(), actions)
         head = head.strip()
+        if head.endswith("!") and s.exit is None:  # `create user!`: fails as the module default says
+            s.exit, head = Exit("err", "err", [], default=True), head[:-1].rstrip()
         m = re.match(r"(\w+)\s*=(?!=)\s*(.+)$", head)
         if m:
             s.assign, head = m.group(1), m.group(2).strip()
@@ -366,12 +380,18 @@ class Parser:
     def member(self, body: str, line: int, at: Trace | None, issue: Issue | None, rationale: str) -> Op | None:
         m = self.module
         if issue is not None:
-            m.issues.append(issue)
+            m.issues += [issue] + issue.more
         if not body:
             if rationale:
                 m.rationale.append(rationale)
             elif issue is None:
                 raise self.err(line, "empty line")
+            return None
+        d = re.fullmatch(r"!err\s*->\s*(.+)", body)
+        if d:
+            if m.default is not None:
+                raise self.err(line, "a second default `!err -> ...` line")
+            m.default = Exit("err", "err", [a.strip() for a in split_top(d.group(1), ",") if a.strip()])
             return None
         word, _, rest = body.partition(" ")
         rest = rest.strip()
@@ -406,6 +426,9 @@ class Parser:
             if any(x.name == r.group(1) for x in m.rules):
                 raise self.err(line, f"rule {r.group(1)} defined twice")
             m.rules.append(Rule(r.group(1), params, pred, callee, exit_, at, line))
+            if issue is not None:
+                for x in [issue] + issue.more:
+                    x.on = f"rule:{r.group(1)}"
             return None
         e = re.match(r"(" + "|".join(METHODS) + r")\s+(/\S*)\s*(\{[^}]*\})?\s*->\s*(\d{3})\s*(.*)$", body)
         if e:
@@ -414,6 +437,9 @@ class Parser:
                     status=e.group(4), at=at, line_no=line)
             op.steps = self.steps(e.group(5), line, at, rationale) if e.group(5).strip() else []
             m.ops.append(op)
+            if issue is not None:
+                for x in [issue] + issue.more:
+                    x.on = f"op:{op.name}"
             return op
         c = re.match(r"([A-Za-z_]\w*)(?:\(([^)]*)\))?\s*=(?!=)\s*(.+)$", body)
         if c:
@@ -421,12 +447,18 @@ class Parser:
                     out=c.group(1), at=at, line_no=line)
             op.steps = self.steps(c.group(3), line, at, rationale)
             m.ops.append(op)
+            if issue is not None:
+                for x in [issue] + issue.more:
+                    x.on = f"op:{op.name}"
             return op
-        o = re.fullmatch(r"([A-Za-z_]\w*)\(([^)]*)\)\s*(?:->\s*(\w+|\([\w\s,]+\)))?", body)
+        o = re.fullmatch(r"([A-Za-z_]\w*)\(([^)]*)\)\s*(?:->\s*([\w.\[\]*]+|\([\w\s,.\[\]*]+\)))?", body)
         if o:
             op = Op("op", o.group(1), params=[p.strip() for p in o.group(2).split(",") if p.strip()],
                     out=o.group(3) or "", at=at, line_no=line, rationale=[rationale] if rationale else [])
             m.ops.append(op)
+            if issue is not None:
+                for x in [issue] + issue.more:
+                    x.on = f"op:{op.name}"
             return op
         raise self.err(line, f"cannot read {body!r}: a module member is `when`, `cfg`, `rule`, an endpoint "
                              f"`METHOD /path {{fields}} -> 201  steps  @trace`, an operation `name(ins) -> out  @trace` "
@@ -473,7 +505,7 @@ class Parser:
                 self.last_file = at.file if at.start or re.search(r"\.\w+$", at.file) else ""
                 self.spec.modules.append(mod)
                 if issue is not None:
-                    mod.issues.append(issue)
+                    mod.issues += [issue] + issue.more
                 continue
             if self.module is None:
                 raise self.err(n, "an indented line outside a module")
@@ -487,11 +519,11 @@ class Parser:
             if not stack:
                 if body.startswith("#") or (not body and (issue or rationale)):
                     if issue:
-                        self.module.issues.append(issue)
+                        self.module.issues += [issue] + issue.more
                     continue
                 raise self.err(n, "a step outside an operation")
             if issue is not None:
-                self.module.issues.append(issue)
+                self.module.issues += [issue] + issue.more
             if not body:
                 if rationale:
                     owner = stack[0][1]
@@ -527,6 +559,19 @@ class Parser:
                         known_vars.add(s.assign)
             for o in m.ops:
                 for s in walk(o.steps):
+                    c = re.fullmatch(r"([A-Za-z_]\w*)(?:\((.*)\))?", s.exit.cond) if s.exit and not s.text else None
+                    if c and c.group(1) in rules:  # `guard(login) -> 403`: the rule, failing with these actions
+                        s.text, s.ref = s.exit.cond, c.group(1)
+                        s.args = [a.strip() for a in split_top(c.group(2), ",") if a.strip()] if c.group(2) else []
+                        s.exit = Exit("err", "err", s.exit.actions)
+            for o in m.ops:
+                for s in walk(o.steps):
+                    if s.exit is not None and s.exit.default:
+                        if m.default is None:
+                            raise SpecError(m.source, s.line_no, f"`{s.text}!` needs the module's default `!err -> ...` line")
+                        s.exit.actions = list(m.default.actions)
+            for o in m.ops:
+                for s in walk(o.steps):
                     if not s.ref:
                         continue
                     if s.ref in rules:
@@ -534,7 +579,7 @@ class Parser:
                         if len(s.args) != len(r.params):
                             raise SpecError(m.source, s.line_no, f"rule {r.name} takes {len(r.params)} argument(s), got {len(s.args)}")
                         continue
-                    if s.ref in ops or s.ref in known_vars or s.ref in BUILTINS:
+                    if s.ref in ops or s.ref in known_vars or s.ref in BUILTINS or s.ref in self.known:
                         s.ref = s.ref if s.ref in ops else ""
                         continue
                     if s.args or re.search(r"\(", s.text):  # called by name but defined nowhere
@@ -558,9 +603,17 @@ def walk(steps: list[Step]):
         yield from walk(s.children)
 
 
-def parse(files: dict[str, str]) -> Spec:
+class _Any(set):
+    def __contains__(self, item) -> bool:
+        return True
+
+
+ANY = _Any()  # known= for a spec read without its code: every call counts as defined
+
+
+def parse(files: dict[str, str], known: set[str] | None = None) -> Spec:
     """files: {name: text}, read in name order (a shared file starting with _ first). Raises SpecError."""
-    p = Parser()
+    p = Parser(known)
     for where in sorted(files, key=lambda w: (not w.rsplit("/", 1)[-1].startswith("_"), w)):
         p.parse_file(files[where], where)
     p.resolve()
@@ -573,6 +626,8 @@ def step_text(s: Step) -> str:
         return f"each {s.loop}:"
     out = (f"{s.assign} = " if s.assign else "") + ("return " if s.returns else "") + s.text
     out = out.strip()
+    if s.exit and s.exit.default:
+        return out + "!"
     if s.exit:
         if s.exit.kind == "err":
             out = f"{out} !err -> " if out else "!err -> "
@@ -600,23 +655,36 @@ def format_module(m: Module, defs: dict[str, Def] | None = None) -> str:
         last[0] = t.file
         return "  " + s
 
+    def issue(i: Issue) -> str:
+        return "? " + (f"[{i.category}] " if i.category else "") + (tr(i.at).strip() + " " if i.at else "") \
+            + i.text + (f" -> {i.boundary}" if i.boundary else "")
+
+    def inline(key: str) -> str:
+        return "".join("  " + issue(i) for i in m.issues if i.on == key)
+
     lines += [f"  # {r}" for r in m.rationale]
     lines += [f"  when  {w}" for w in m.when]
     if m.cfg:
         lines.append("  cfg   " + ", ".join(f"{c.key}={c.raw}" for c in m.cfg))
+    if m.default:
+        lines.append("  !err -> " + ", ".join(m.default.actions))
     for r in m.rules:
         ex = f"  !{r.exit.cond} -> {', '.join(r.exit.actions)}" if r.exit else ""
-        lines.append(f"  rule {r.name}{'(' + ', '.join(r.params) + ')' if r.params else ''}  {r.predicate}{ex}"
-                     + (f"  ~{r.callee}" if r.callee else "") + tr(r.at))
+        head = (f"  rule {r.name}{'(' + ', '.join(r.params) + ')' if r.params else ''}  {r.predicate}{ex}"
+                + (f"  ~{r.callee}" if r.callee else "") + tr(r.at))
+        lines.append(head + inline(f"rule:{r.name}"))
     for o in m.ops:
         if o.kind == "endpoint":
             body = "{" + ",".join(o.fields) + "} " if o.fields else ""
-            lines.append(f"  {o.method} {o.path} {body}-> {o.status}  " + "; ".join(step_text(s) for s in o.steps) + tr(o.at))
+            head = f"  {o.method} {o.path} {body}-> {o.status}  " + "; ".join(step_text(s) for s in o.steps) + tr(o.at)
+            lines.append(head + inline(f"op:{o.name}"))
         elif o.kind == "calc":
-            lines.append(f"  {o.name}{'(' + ', '.join(o.params) + ')' if o.params else ''} = "
-                         + "; ".join(step_text(s) for s in o.steps) + tr(o.at))
+            head = f"  {o.name}{'(' + ', '.join(o.params) + ')' if o.params else ''} = " \
+                + "; ".join(step_text(s) for s in o.steps) + tr(o.at)
+            lines.append(head + inline(f"op:{o.name}"))
         else:
-            lines.append(f"  {o.name}({', '.join(o.params)})" + (f" -> {o.out}" if o.out else "") + tr(o.at))
+            head = f"  {o.name}({', '.join(o.params)})" + (f" -> {o.out}" if o.out else "") + tr(o.at)
+            lines.append(head + inline(f"op:{o.name}"))
             lines += [f"    # {r}" for r in o.rationale]
 
             def put(steps, depth):
@@ -624,7 +692,7 @@ def format_module(m: Module, defs: dict[str, Def] | None = None) -> str:
                     lines.append("  " * depth + step_text(s) + (f"  # {s.rationale}" if s.rationale else ""))
                     put(s.children, depth + 1)
             put(o.steps, 2)
-    for i in sorted(m.issues, key=lambda i: (i.at.file if i.at else "", i.at.start if i.at else 0, i.category, i.text)):
-        lines.append("  ? " + (f"[{i.category}] " if i.category else "") + (tr(i.at).strip() + " " if i.at else "")
-                     + i.text + (f" -> {i.boundary}" if i.boundary else ""))
+    for i in sorted((i for i in m.issues if not i.on),
+                    key=lambda i: (i.at.file if i.at else "", i.at.start if i.at else 0, i.category, i.text)):
+        lines.append("  " + issue(i))
     return "\n".join(lines) + "\n"

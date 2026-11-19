@@ -1,33 +1,20 @@
-historymanager : Agent(route="history-manager", skipFollowUp, run=run)  @app/chatbot/agents/historymanager/spec.go
-  when  Use when message needs earlier context
+historymanager : Agent(route="history-manager", skipFollowUp)  @app/chatbot/agents/historymanager/spec.go
+  when  the message only makes sense against something said earlier
   cfg   historyDepth=5, maxTurnChars=4000B
-  run(ctx, request) -> (result, err)  @:26-29
-    history, err = Run(ctx, request.ChatContext, request.Input.Prompt) !err -> return (result, err)
-    return (result{Reroute: true, History: history}, nil)
+  !err -> fail
   Run(ctx, chatContext, userMessage) -> (string, error)  @agent.go:20-49
-    load history !err -> return ("", loadErr)
-    transcript = formatHistory(messages, chatContext.MessageID)
-    transcript == "" -> return ("", nil)
-    fill prompt with userMessage and transcript
-    run llm !err -> return ("", runErr)
-    return trim response
-  formatHistory(messages, currentMessageID) -> string  @:51-78
-    each message in messages:
-      skip if currentMessageID matches
-      userText = trim message.UserMessage
-      assistantText = formatBlocks(message.Response)
-      skip if both empty
-      write user line if userText != ""
-      write attachments line if len(message.AttachmentNames) > 0
-      write ai line if assistantText != ""
-      write blank line
-    return trim output
-  formatBlocks(blocks) -> string  @:80-97
-    each block in blocks:
-      append text if text block and non-empty
-      append tool detail if tool block with detail
-    return trim join
-  truncate(text) -> string  @:99-104
+    messages = load history of depth+1 !err -> fail
+    transcript = formatHistory(messages, currentMessageID)
+    transcript == "" -> return ""
+    filled = prompt with userMessage and transcript
+    response = run LLM with filled !err -> fail
+    return trimmed response
+  run(ctx, request) -> (agent.Result, error)  @spec.go:26-29
+    history = Run(ctx, request.ChatContext, request.Input.Prompt)
+    return agent.Result(Reroute=true, History=history)
+  truncate(text) -> string  @agent.go:99-104
     len(text) <= maxTurnChars -> return text
     return text[:maxTurnChars] + " …[truncated]"
   ? [encoding] @:103 string cut by bytes; can split a UTF-8 character
+  ? [duplicated-constant] @prompts.go:6 historyDepth=5 also written as 5 in a string
+  ? [mixed-result] @spec.go:28 returns a success value together with the error

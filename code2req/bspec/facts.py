@@ -27,6 +27,10 @@ TRIVIAL_LAST = re.compile(r"(?i)^(log\w*|debug\w*|info\w*|warn\w*|error\w*|fatal
 # a contract's type with a generic name takes its package's name instead: agent.Spec -> Agent
 GENERIC_TYPES = {"Spec", "Config", "Options", "Opts", "Params", "Settings", "Definition", "Def", "Info", "Meta"}
 REGISTER = re.compile(r"(?i)^(must)?register\w*$")
+# standard library that has no effect outside the process: a helper calling only these (and its own module) folds
+PURE_STD = re.compile(r"^(strings|strconv|fmt\.(Sprintf|Sprint|Sprintln|Fprintf|Fprint|Fprintln|Errorf)|sort|math|bytes|"
+                      r"unicode|utf8|errors|slices|maps|regexp|path|filepath\.(Join|Base|Dir|Ext|Clean)|len|append|make|"
+                      r"cap|copy|min|max|new|int|string|float64|byte|rune)\b")
 GO_STD_TOP = set("""archive bufio builtin bytes cmp compress container context crypto database debug embed encoding
 errors expvar flag fmt go hash html image index io iter log maps math mime net os path plugin reflect regexp
 runtime slices sort strconv strings sync syscall testing text time unicode unique unsafe""".split())
@@ -38,6 +42,8 @@ class ExitFact:
     line: int
     fn: str
     owner: str  # the call it follows (a callee key), "" when none
+    err: bool = False  # it answers a failed call (`if err != nil`)
+    handling: str = ""  # what it does before returning, identifiers of errors made alike: same text, same handling
 
 
 @dataclass
@@ -77,6 +83,10 @@ class ModuleFacts:
     contracts: list[ContractFact] = field(default_factory=list)
     boundaries: list[str] = field(default_factory=list)
     suspects: list[tuple[str, str, int, str]] = field(default_factory=list)  # (category, file, line, why)
+    folds: list[tuple[str, str]] = field(default_factory=list)  # (helper, the operation it folds into)
+    passups: list[tuple[str, int, str]] = field(default_factory=list)  # (file, line, fn): `return ..., err` ending a fn
+    default_handling: str = ""  # the handling most error exits share, when 2+ do
+    default_count: int = 0
     source_hash: str = ""
 
 
@@ -150,8 +160,9 @@ class RepoFacts:
                 if final and e >= final:
                     continue
                 owner = self.exit_owner(fn, calls, recv, prev, e)
+                err, handling = self.handling(fn, e)
                 prev = e
-                mf.exits.append(ExitFact(fn.file, e, self.fn_name(fn), owner))
+                mf.exits.append(ExitFact(fn.file, e, self.fn_name(fn), owner, err, handling))
                 if owner:
                     guarded.add(owner)
             for key, line, raw in calls:
@@ -161,6 +172,13 @@ class RepoFacts:
         for key in sorted(callers):
             if len(callers[key]) >= 2 and (key in guarded or "." in key):
                 mf.rules.append(RuleFact(key, sorted(callers[key]), key in guarded, where[key]))
+        errs = [e.handling for e in mf.exits if e.err and e.handling]
+        if errs:
+            top = max(sorted(set(errs)), key=errs.count)
+            if errs.count(top) >= 2:
+                mf.default_handling, mf.default_count = top, errs.count(top)
+        mf.folds = self.folds(mf)
+        mf.passups = self.passups(mf)
         mf.suspects = self.suspects(mf)
         mf.contracts = self.contracts_of(d)
         own = set()
@@ -171,9 +189,79 @@ class RepoFacts:
         mf.boundaries = sorted(own)
         return mf
 
+    # -- how an exit is handled
+    def handling(self, fn: Fn, e: int) -> tuple[bool, str]:
+        """(answers a failed call, what the branch does before it returns). The branch is the lines after the `if`
+        that holds the exit; error variables are written ERR so loadErr and err handled alike compare equal."""
+        cond_line = 0
+        for n in range(e, max(fn.line, e - 8) - 1, -1):
+            if re.match(r"\s*(?:\}\s*else\s+)?if\b", self.outline.line(fn.file, n)):
+                cond_line = n
+                break
+        if not cond_line:
+            return False, ""
+        cond = self.outline.line(fn.file, cond_line)
+        err = bool(re.search(r"\b\w*[eE]rr\w*\s*!=\s*nil", cond))
+        body = " ".join(self.outline.line(fn.file, n).strip() for n in range(cond_line + 1, e + 1))
+        body = re.sub(r"\b\w*[eE]rr\b", "ERR", body)
+        return err, " ".join(body.split())
+
+    def folds(self, mf: ModuleFacts) -> list[tuple[str, str]]:
+        """Helpers that fold into their caller's line: called by exactly one function of the module, no early exit,
+        no effect outside (no call to another package or a dependency, no I/O). Followed to the operation."""
+        by_name = {f.name: f for f in mf.fns if not f.owner}
+        callers: dict[str, set[str]] = {n: set() for n in by_name}
+        for f in mf.fns:
+            for callee, _ in f.calls:
+                if callee in by_name and callee != f.name:
+                    callers[callee].add(self.fn_name(f))
+        exits = {e.fn for e in mf.exits}
+        imports = {}
+        for rel in mf.files:
+            imports.update(self.import_map(rel))
+
+        def pure(f: Fn) -> bool:
+            for callee, _ in f.calls:
+                segs = callee.split(".")
+                if len(segs) == 1:
+                    if callee not in by_name and not PURE_STD.match(callee):
+                        return False
+                elif segs[0] in imports:
+                    if not PURE_STD.match(callee):
+                        return False  # another package, ours or not, or I/O
+                elif segs[0] == self.receiver(f):
+                    return False  # a dependency it was given
+            return True
+        direct = {n: next(iter(c)) for n, c in callers.items()
+                  if len(c) == 1 and n not in exits and pure(by_name[n]) and n not in ("init", "main")}
+        out = []
+        for n in sorted(direct):
+            into, seen = direct[n], {n}
+            while into in direct and into not in seen:
+                seen.add(into)
+                into = direct[into]
+            out.append((n, into))
+        return out
+
+    def passups(self, mf: ModuleFacts) -> list[tuple[str, int, str]]:
+        """A function's last statement `return ..., err` where err came from a call: the error goes up as it is."""
+        out = []
+        for f in mf.fns:
+            last = self.last_statement(f)
+            text = self.outline.line(f.file, last) if last else ""
+            m = re.match(r"\s*return\b.*,\s*(\w*[eE]rr\w*)\s*$", text)
+            if m and any(re.search(r"\b" + m.group(1) + r"\b[\w\s,]*:?=", self.outline.line(f.file, n))
+                         for n in range(f.line, last)):
+                out.append((f.file, last, self.fn_name(f)))
+        return out
+
     # -- possible bugs a pattern shows; the spec must flag each as a `?` line
     def suspects(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
         out = []
+        for rf in mf.rules:  # a rule's body is in another package, not read with this module
+            rel, line = rf.lines[0]
+            out.append(("unresolved", rel, line, f"{rf.callee} is not in this module; what it checks is not read"))
+        out += self.unused_inputs(mf) + self.duplicated_constants(mf) + self.mixed_results(mf)
         fns = {self.fn_name(f): f for f in mf.fns}
         for rf in mf.rules:
             # a result one caller checks and another discards
@@ -206,6 +294,72 @@ class RepoFacts:
                         any("len(" in self.outline.line(fn.file, k) for k in range(fn.line, fn.end + 1)):
                     out.append(("encoding", fn.file, n, "string cut by bytes; can split a UTF-8 character"))
         return sorted(set(out), key=lambda s: (s[1], s[2], s[0]))
+
+    def unused_inputs(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """A request field decoded into a variable and never read in that function."""
+        out = []
+        for f in mf.fns:
+            lines = [self.outline.line(f.file, n) for n in range(f.line, f.end + 1)]
+            for i, ln in enumerate(lines):
+                m = re.match(r"\s*var\s+(\w+)\s+\*?(\w+)\s*$", ln)
+                if not m or not any(re.search(r"(Decode|Bind|Unmarshal)\w*\(.*&" + m.group(1) + r"\b", x) for x in lines):
+                    continue
+                var, tname = m.groups()
+                for t in self.outline.type_named(tname):
+                    if not t.file.startswith(mf.dir + "/") and mf.dir:
+                        continue
+                    for fname, _ in t.fields:
+                        if not any(re.search(r"\b" + var + r"\." + fname + r"\b", x) for x in lines):
+                            out.append(("unused-input", f.file, f.line + i, f"{tname}.{fname} is decoded and never read"))
+        return out
+
+    def duplicated_constants(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """A constant's number also written as a literal inside a string (a prompt saying `last 5`)."""
+        consts = []
+        for rel in mf.files:
+            for n, ln in enumerate(self.outline.files[rel].lines, 1):
+                m = re.match(r"\s*(?:const\s+)?([A-Za-z_]\w*)\s*(?:\w+\s*)?=\s*(\d+)\s*(?://.*)?$", ln)
+                if m and int(m.group(2)) >= 2 and (ln.lstrip().startswith("const") or self.in_const_block(rel, n)):
+                    consts.append((m.group(1), m.group(2)))
+        out = []
+        for rel in mf.files:
+            in_raw = False
+            for n, ln in enumerate(self.outline.files[rel].lines, 1):
+                strings = []
+                parts = ln.split("`")
+                for k, part in enumerate(parts):
+                    if (k % 2 == 1) != in_raw:
+                        strings.append(part)
+                if len(parts) % 2 == 0:
+                    in_raw = not in_raw
+                strings += re.findall(r'"((?:[^"\\]|\\.)*)"', ln)
+                for name, val in consts:
+                    if any(re.search(r"(?<![\w.])" + val + r"(?![\w.])", x) for x in strings):
+                        out.append(("duplicated-constant", rel, n, f"{name}={val} also written as {val} in a string"))
+        return out
+
+    def in_const_block(self, rel: str, n: int) -> bool:
+        lines = self.outline.files[rel].lines
+        for k in range(n - 1, max(0, n - 40), -1):
+            t = lines[k - 1].strip()
+            if t.startswith("const ("):
+                return True
+            if t == ")" or t.startswith(("func ", "var ", "type ")):
+                return False
+        return False
+
+    def mixed_results(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """A return that carries an error and a non-zero success value together."""
+        out = []
+        zero = re.compile(r'^(nil|""|0|false|\w+\{\}|\w+\.\w+\{\}|\[\]\w*\{\}|\w+)$')
+        for f in mf.fns:
+            for n in range(f.line, f.end + 1):
+                m = re.match(r"\s*return\s+(.+),\s*(\w*[eE]rr\w*)\s*$", self.outline.line(f.file, n))
+                if m and m.group(2) != "nil":
+                    vals = [v.strip() for v in m.group(1).split(",")]
+                    if any(not zero.match(v) for v in vals):
+                        out.append(("mixed-result", f.file, n, "returns a success value together with the error"))
+        return out
 
     # -- calls
     def exit_owner(self, fn: Fn, calls: list[tuple[str, int, str]], recv: str, prev: int, e: int) -> str:

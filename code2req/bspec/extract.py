@@ -18,7 +18,7 @@ from .notation import CATEGORIES, LEGEND, Spec, SpecError, format_module, parse
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3"
+PROMPT_VERSION = "5"
 
 SYSTEM = LEGEND + """
 You write the behaviour spec of ONE module of a codebase in this notation, from its code. The spec is turned
@@ -43,7 +43,12 @@ Write:
   it: `step !err -> actions` when the call before it failed, `cond -> actions` for a condition, an
   alternative of `a ?? b`, or the application of a rule with an exit whose callee is the call it follows
   (the rule covers every exit after its call). Count them: the explicit exits of an operation, in order,
-  must match its listed exits one for one. `->` always ends the operation: a conditional step that does not
+  must match its listed exits one for one. When DEFAULT HANDLING is given, write it once as the module line
+  `!err -> fail` and mark each step whose exit is listed `(default)` with `!` (`create user!`); only exits
+  listed `(differs)` get their own `!err -> ...` or `cond -> ...`. A rule needs no exit of its own when the
+  default applies to it. Returns listed under PASS-UP are the function's normal end: write no exit for them.
+- FOLDS: a helper listed there has one caller, no exits and no effects: never give it a line of its own; say
+  what it does inside its caller's step (`t = transcript of msgs, each turn truncated`). `->` always ends the operation: a conditional step that does not
   end it is written `write ai line if text`, never `text -> write ai line`.
 - Open issues as `? [category] @file:line <short text> [-> package/]`: a possible bug or gap (a sibling
   endpoint missing a guard the others have, a result ignored, an off-by-one, bytes vs characters, a
@@ -67,10 +72,11 @@ A complete example, for a different module (pricing.go has price at lines 10-31,
 ```c2s
 orders  @app/api/orders
   cfg   maxItems=50
-  rule auth(role)  caller has role  !err -> 403  ~authz.Require
-  rule body  JSON body decodes  !err -> 400  ~httputil.Decode
-  POST /orders {items,coupon} -> 201  body; auth(buyer); len(items)>maxItems -> 422; total = price(items); save order !err -> fail  @handler.go:20-48
-  DELETE /orders/{id} -> 204  auth(admin); cancel order !err -> fail  @:51-63  ? [missing-guard] @:51 no owner check
+  !err -> fail
+  rule auth(role)  caller has role  !err -> 403  ~authz.Require  ? [unresolved] @handler.go:24 roles not read -> app/authz/
+  rule body  JSON body decodes  !err -> 400  ~httputil.Decode  ? [unresolved] @handler.go:21 decoding not read -> app/core/httputil/
+  POST /orders {items,coupon} -> 201  body; auth(buyer); len(items)>maxItems -> 422; total = price(items); save order!  @handler.go:20-48
+  DELETE /orders/{id} -> 204  auth(admin); cancel order!  @:51-63  ? [missing-guard] @:51 no owner check
   price(items) -> total  @pricing.go:10-31
     each i in items:
       add qty * unitPrice
@@ -94,8 +100,13 @@ def normalize(text: str) -> str:
         line = KEYWORD.sub(r"\1", raw.rstrip())
         line = re.sub(r"(=\s*)call\s+", r"\1", line)
         body = line.strip()
-        if out and (body.startswith("!err") or re.fullmatch(r"@\S+", body)):
+        indent = len(line) - len(line.lstrip(" "))
+        if out and ((body.startswith("!err") and indent >= 4) or re.fullmatch(r"@\S+", body)):  # indent 2: the default
             out[-1] = out[-1].rstrip() + "  " + body
+            continue
+        d = re.match(r"(\S.*?|  (?:when|cfg)\s.*?)\s{2,}(!err\s*->.*)$", line)
+        if d and not body.startswith(("rule ", "!err")) and not re.match(r"\s*(GET|POST|PUT|PATCH|DELETE)", line):
+            out += [d.group(1).rstrip(), "  " + d.group(2).strip()]  # the default written on the module or when line
             continue
         m = re.match(r"(\s*\?\s*(?:\[[\w-]+\]\s*)?(?:@\S+\s*)?)<(.*)>(\s*->\s*\S+/)?\s*$", line)
         if m:
@@ -140,21 +151,36 @@ def user_prompt(repo: RepoFacts, mf: ModuleFacts, label: str) -> str:
         out.append("RULES (called from 2+ operations: one rule each, ending in ~callee):")
         out += [f"  ~{r.callee}  called by {', '.join(r.callers)}" + ("; an exit follows it" if r.guarded else "")
                 for r in mf.rules]
+    if mf.default_handling:
+        out.append(f"DEFAULT HANDLING ({mf.default_count} error exits do the same): {mf.default_handling[:120]}")
     if mf.exits:
         out.append("EXITS (early or error returns; each must be explicit):")
         by_fn: dict[str, list[str]] = {}
         for e in mf.exits:
+            tag = "" if not mf.default_handling or not e.err else \
+                " (default)" if e.handling == mf.default_handling else " (differs)"
             by_fn.setdefault(f"{e.fn} ({os.path.basename(e.file)})", []).append(
-                f"{e.line}" + (f" after {e.owner}" if e.owner else ""))
+                f"{e.line}" + (f" after {e.owner}" if e.owner else "") + tag)
         out += [f"  {fn}: {', '.join(xs)}" for fn, xs in by_fn.items()]
+    if mf.passups:
+        out.append("PASS-UP (a final `return ..., err`; implicit, no exit): "
+                   + ", ".join(f"{fn} {os.path.basename(f)}:{n}" for f, n, fn in mf.passups))
+    if mf.folds:
+        out.append("FOLDS (no line of their own; describe inside the caller's step): "
+                   + ", ".join(f"{h} into {i}" for h, i in mf.folds))
     out.append("FUNCTIONS: " + "; ".join(f"{repo.fn_name(f)} {os.path.basename(f.file)}:{f.line}-{f.end}" for f in mf.fns))
     if mf.suspects:
         out.append("SUSPECTS (flag each as a `?` line at that location, with that category):")
         out += [f"  [{c}] {os.path.basename(rel)}:{line}  {why}" for c, rel, line, why in mf.suspects]
     if mf.boundaries:
         out.append("PACKAGES NOT READ (our own code this module calls): " + ", ".join(mf.boundaries))
+    folded = {(f.file, f.line): into for f in mf.fns for h, into in mf.folds if repo.fn_name(f) == h}
     for rel in mf.files:
-        out += ["", f"### {rel[len(mf.dir) + 1:] if mf.dir else rel}", numbered(repo.repo, rel)]
+        listing = numbered(repo.repo, rel).splitlines()
+        for (frel, line), into in folded.items():
+            if frel == rel:
+                listing[line - 1] += f"    <<< FOLDED into {into}: no line of its own"
+        out += ["", f"### {rel[len(mf.dir) + 1:] if mf.dir else rel}", "\n".join(listing)]
     return "\n".join(out)
 
 
@@ -165,7 +191,7 @@ def spec_block(answer: str) -> str:
 
 def evaluate(text: str, shared: str, mf: ModuleFacts, repo: RepoFacts) -> tuple[Spec | None, Result | None, str]:
     try:
-        spec = parse({"_shared.c2s": shared, f"{mf.name}.c2s": text})
+        spec = parse({"_shared.c2s": shared, f"{mf.name}.c2s": text}, known={h for h, _ in mf.folds})
     except SpecError as e:
         return None, None, str(e)
     m = spec.module(mf.name)
@@ -181,7 +207,7 @@ def problems_of(ex: Extraction) -> list[str]:
     return ex.result.problems() if ex.result else []
 
 
-def extract(llm, repo: RepoFacts, mf: ModuleFacts, shared: str, label: str, rounds: int = 3) -> Extraction:
+def extract(llm, repo: RepoFacts, mf: ModuleFacts, shared: str, label: str, rounds: int = 5) -> Extraction:
     base = user_prompt(repo, mf, label)
     best: Extraction | None = None
     attempts: list[tuple[str, list[str]]] = []
@@ -205,9 +231,10 @@ def extract(llm, repo: RepoFacts, mf: ModuleFacts, shared: str, label: str, roun
         if not probs:
             break
         log.info("bspec %s round %d: %d problem(s)", mf.name, n, len(probs))
-        prompt = (base + "\n\nYOUR PREVIOUS ANSWER (rejected):\n```c2s\n" + text + "```\nIT WAS REJECTED FOR THESE "
-                  "PROBLEMS. Answer the whole spec again with every one fixed; an answer with the same problems is "
-                  "rejected again:\n" + "\n".join(f"- {p}" for p in probs[:40]))
+        # repair the best answer so far, not the last: a round that fixes some problems and adds others is dropped
+        prompt = (base + "\n\nYOUR PREVIOUS ANSWER (rejected):\n```c2s\n" + best.text + "```\nIT WAS REJECTED FOR "
+                  "THESE PROBLEMS. Change only what they name and keep everything else as it is; answer the whole spec "
+                  "again:\n" + "\n".join(f"- {p}" for p in problems_of(best)[:40]))
     if best is None:
         best = Extraction(mf.name, error="no answer from the model")
     best.rounds = len(best.history)

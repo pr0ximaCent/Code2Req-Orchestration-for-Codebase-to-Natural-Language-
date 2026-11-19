@@ -183,9 +183,12 @@ def write_design(run_dir: str, repo: str, llm, title: str | None = None, target:
         return None
     design["source"] = target or repo
     kept, subject, impl, left_out = anchor(design, report)
-    names = {rid: (f"{s} component" if s != design["title"] else design["title"]) for rid, s in subject.items()}
-    from .atomize import atomize
-    atomic = atomize(llm, kept, names) if kept else []
+    atomic, seen = [], {}
+    for r in kept:  # each requirement as the run wrote it; names unique
+        name = r.get("name") or r["id"]
+        seen[name] = seen.get(name, 0) + 1
+        atomic.append({"id": r["id"], "source": r["id"], "name": name if seen[name] == 1 else f"{name}_{seen[name]}",
+                       "text": r["text"], "kind": r.get("type", "functional"), "attributes": []})
     fixes = []
     for a in atomic:
         src = a.get("source", a["id"])
