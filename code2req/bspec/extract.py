@@ -18,7 +18,7 @@ from .notation import CATEGORIES, LEGEND, Spec, SpecError, format_module, parse
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5"
+PROMPT_VERSION = "8"
 
 SYSTEM = LEGEND + """
 You write the behaviour spec of ONE module of a codebase in this notation, from its code. The spec is turned
@@ -59,14 +59,17 @@ Never write: "shall", the module's name inside lines, "or an error" (exits are e
 fields imply, debug logging, TODOs or planned designs (only what the code does now), guesses about code not
 shown (write a `?` instead).
 
-NAME THE BEHAVIOUR, NEVER COPY THE CODE. A step is a few words; an exit's actions are a status, `fail`,
-`return x`, `log.error`. No receivers or request objects (h., r., w., ctx), no standard library calls, no
-response writes (the endpoint's `-> 200` already says it), no keywords (`fn`, `cond`, `call`), no `a ? b : c`
-(write `cond -> a; b`). Put `!err -> ...` on the SAME line as its step.
-  copied:  res = h.userSvc.SignIn(r.Context(), req.Email, req.Password)    named:  sign in !err -> fail
-  copied:  !err -> response.WriteError(w, err, "auth failed"); return      named:  (on its step) !err -> fail
-  copied:  response.JSON(w, http.StatusOK, res)                            named:  (nothing)
-  copied:  email == "" || !purpose.IsValid() -> response.Error(w, 400, ..) named:  no email or bad purpose -> 400
+WRITE PLAIN WORDS, NEVER CODE. The spec becomes a system document engineers read; the code is only evidence.
+Steps, conditions and actions are short plain phrases: no dotted names (h.svc, req.Email), no operators (==, !=,
+<=, &&, ||), no brackets, braces or call syntax, no nil/null. Leave out locking, logging details, copying and
+formatting: they are not behaviour. Name things by what they are (the cached balance, the message's usage).
+A conditional step that does not end the operation is `step if condition`. Put `!err -> ...` on the SAME line as
+its step. Applying a rule by name (`guard(signup)`) and calling an operation by name are fine.
+  code:  res = h.userSvc.SignIn(r.Context(), req.Email, req.Password)    plain:  sign in!
+  code:  cacheMutex.Lock(); cached, ok := cache[userID]; unlock           plain:  read the cached balance
+  code:  !ok || now > cached.expiry -> refresh                            plain:  refresh the balance if missing or expired
+  code:  email == "" || !purpose.IsValid() -> 400                         plain:  no email or invalid purpose -> 400
+  code:  !err -> return Balance{}, err                                    plain:  !err -> fail
 
 A complete example, for a different module (pricing.go has price at lines 10-31, helpers.go region at 5-12):
 ```c2s
@@ -75,14 +78,14 @@ orders  @app/api/orders
   !err -> fail
   rule auth(role)  caller has role  !err -> 403  ~authz.Require  ? [unresolved] @handler.go:24 roles not read -> app/authz/
   rule body  JSON body decodes  !err -> 400  ~httputil.Decode  ? [unresolved] @handler.go:21 decoding not read -> app/core/httputil/
-  POST /orders {items,coupon} -> 201  body; auth(buyer); len(items)>maxItems -> 422; total = price(items); save order!  @handler.go:20-48
+  POST /orders {items,coupon} -> 201  body; auth(buyer); more than maxItems items -> 422; total = price(items); save order!  @handler.go:20-48
   DELETE /orders/{id} -> 204  auth(admin); cancel order!  @:51-63  ? [missing-guard] @:51 no owner check
   price(items) -> total  @pricing.go:10-31
     each i in items:
-      add qty * unitPrice
-    coupon == "" -> return total
-    c = coupons.Lookup(coupon) !err -> return total  # an unknown coupon is ignored, not an error
-    return total * (1 - c.rate)
+      add quantity times unit price
+    no coupon -> return total
+    look up the coupon !err -> return total  # an unknown coupon is ignored, not an error
+    return total less the coupon rate
   region = X-Region header ?? defaultRegion  @helpers.go:5-12
   ? [boundary] @pricing.go:24 coupon expiry not checked here -> app/domains/coupons/
 ```
@@ -105,7 +108,7 @@ def normalize(text: str) -> str:
             out[-1] = out[-1].rstrip() + "  " + body
             continue
         d = re.match(r"(\S.*?|  (?:when|cfg)\s.*?)\s{2,}(!err\s*->.*)$", line)
-        if d and not body.startswith(("rule ", "!err")) and not re.match(r"\s*(GET|POST|PUT|PATCH|DELETE)", line):
+        if d and not body.startswith(("rule ", "!err")) and not re.match(r"\s*(GET|POST|PUT|PATCH|DELETE)\b", line):
             out += [d.group(1).rstrip(), "  " + d.group(2).strip()]  # the default written on the module or when line
             continue
         m = re.match(r"(\s*\?\s*(?:\[[\w-]+\]\s*)?(?:@\S+\s*)?)<(.*)>(\s*->\s*\S+/)?\s*$", line)
@@ -191,7 +194,7 @@ def spec_block(answer: str) -> str:
 
 def evaluate(text: str, shared: str, mf: ModuleFacts, repo: RepoFacts) -> tuple[Spec | None, Result | None, str]:
     try:
-        spec = parse({"_shared.c2s": shared, f"{mf.name}.c2s": text}, known={h for h, _ in mf.folds})
+        spec = parse({"_shared.c2s": shared, f"{mf.name}.c2s": text}, known={f.name for f in mf.fns})
     except SpecError as e:
         return None, None, str(e)
     m = spec.module(mf.name)

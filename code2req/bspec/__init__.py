@@ -47,7 +47,7 @@ def select(repo: RepoFacts, modules: list[str] | None) -> list[str]:
 
 
 def write_outputs(out_dir: str, spec: Spec, shared: str, results: dict[str, Result], old: dict | None,
-                  notes: dict[str, list[str]] | None = None) -> dict:
+                  notes: dict[str, list[str]] | None = None, title: str = "") -> dict:
     spec_dir, sysml_dir = os.path.join(out_dir, "spec"), os.path.join(out_dir, "sysml")
     for d in (spec_dir, sysml_dir):
         if os.path.isdir(d):  # a module of an earlier run must not stay behind
@@ -59,6 +59,8 @@ def write_outputs(out_dir: str, spec: Spec, shared: str, results: dict[str, Resu
         _write(os.path.join(spec_dir, f"{m.name}.c2s"), format_module(m))
     _write(os.path.join(spec_dir, "index.c2s"), "".join(format_module(m).splitlines()[0] + "\n" for m in mods))
     _write(os.path.join(out_dir, "LEGEND.md"), LEGEND)
+    from .doc import system_doc
+    _write(os.path.join(out_dir, "system_doc.md"), system_doc(spec, title or "System"))
     for name, text in write_sysml(spec).items():
         _write(os.path.join(sysml_dir, name), text)
     rep = size_report(spec, results, old)
@@ -89,7 +91,7 @@ def run(repo_path: str, out_dir: str, llm, label: str, modules: list[str] | None
             continue
         texts[f"{ex.module}.c2s"] = ex.text
         notes[ex.module] = [f"extraction: {ex.rounds} round(s), problems per round {ex.history}"]
-    spec = parse(texts, known={h for mf in facts.values() for h, _ in mf.folds})
+    spec = parse(texts, known={f.name for mf in facts.values() for f in mf.fns})
     results = {m.name: check(spec, m, facts[m.name], repo) for m in spec.modules if m.name in facts}
     os.makedirs(out_dir, exist_ok=True)
     attempts_dir = os.path.join(out_dir, "extract")
@@ -100,7 +102,8 @@ def run(repo_path: str, out_dir: str, llm, label: str, modules: list[str] | None
         _write(os.path.join(attempts_dir, f"{ex.module}.md"), "".join(
             f"## Round {i}\n\n```c2s\n{text}```\n\n" + "".join(f"- {p}\n" for p in probs) + "\n"
             for i, (text, probs) in enumerate(ex.attempts, 1)))
-    rep = write_outputs(out_dir, spec, shared, results, old_report(compare), notes)
+    from ..design import title_for
+    rep = write_outputs(out_dir, spec, shared, results, old_report(compare), notes, title_for(repo.repo))
     usage = getattr(llm, "usage", None)
     summary = {"repo": repo.repo, "modules": sorted(facts), "model": label, "size": rep["total"],
                "not_extracted": sorted(k for k, v in notes.items() if v and v[0].startswith("not extracted")),
@@ -120,7 +123,7 @@ def from_spec(spec_dir: str, out_dir: str, repo_path: str | None = None, compare
     if repo_path:
         repo = RepoFacts(repo_path)
         facts = {repo.names[d]: repo.module(d) for d in repo.dirs if f"{repo.names[d]}.c2s" in texts}
-        spec = parse(texts, known={h for mf in facts.values() for h, _ in mf.folds})
+        spec = parse(texts, known={f.name for mf in facts.values() for f in mf.fns})
         for m in spec.modules:
             if m.name in facts:
                 results[m.name] = check(spec, m, facts[m.name], repo)

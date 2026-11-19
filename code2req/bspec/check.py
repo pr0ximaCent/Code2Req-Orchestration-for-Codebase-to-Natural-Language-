@@ -15,8 +15,9 @@ from .notation import Module, Op, Rule, Spec, Step, walk
 
 PROSE = re.compile(r"(?i)\b(shall|must|returns? an error|or an error|the system)\b")
 # a step that copies code instead of naming the behaviour: receiver/request chains, standard library, response writes
-CODE_COPY = re.compile(r"\b(r|w|h|req|ctx|self|this|c)\.\w|\b(strings|fmt|response|http|json|errors|strconv|slog|log|"
-                       r"os|bytes|time)\.[A-Z]\w*\(|\bContext\(\)|&\w")
+# code in a step, condition or action: the document is read by engineers, not compiled. Dotted names, operators,
+# brackets, call syntax, locking.
+CODE_COPY = re.compile(r"\w\.\w|==|!=|<=|>=|&&|\|\||[\[\]{}*&]|\w\(|\b(nil|null|defer|ERR)\b|(?i:\b(mutex|lock|unlock|locked)\b)")
 MAX_STEP = 60  # characters of one step's action
 MAX_EXIT = 32  # characters of one exit's actions
 
@@ -108,13 +109,21 @@ def check(spec: Spec, m: Module, facts: ModuleFacts, repo: RepoFacts) -> Result:
             if PROSE.search(s.text) or (m.name and re.search(r"\b" + re.escape(m.name) + r"\b", s.text)):
                 res.lint.append(f"{o.name}: {s.text!r} restates what the notation says (no 'shall', module name, 'or an error')")
             acts = ", ".join(s.exit.actions) if s.exit else ""
-            if CODE_COPY.search(s.text) or CODE_COPY.search(acts):
-                res.lint.append(f"{o.name}: {(s.text or acts)[:60]!r} copies code; name the behaviour in a few words "
-                                f"(`sign in`, `!err -> fail`), no receivers, request objects or response writes")
+            cond = s.exit.cond if s.exit and s.exit.kind == "guard" else ""
+            said = "" if s.ref else s.text  # a rule applied by name is not code
+            bad = next((x for x in (said, cond, acts) if x and CODE_COPY.search(x)), "")
+            if bad:
+                res.lint.append(f"{o.name}: {bad[:60]!r} is code; write it in plain words a systems engineer reads "
+                                f"(`sign in`, `the cached balance is missing or expired -> unavailable`), no dotted "
+                                f"names, operators, brackets, calls or locking")
             elif len(s.text) > MAX_STEP and not s.fallback:
                 res.lint.append(f"{o.name}: step {s.text[:40]!r}... is {len(s.text)} chars; at most {MAX_STEP}")
             elif len(acts) > MAX_EXIT:
                 res.lint.append(f"{o.name}: exit {acts[:30]!r}... is {len(acts)} chars; at most {MAX_EXIT}")
+    if m.default and CODE_COPY.search(", ".join(m.default.actions)):
+        res.lint.append(f"default `!err -> {', '.join(m.default.actions)}` is code; write it as `!err -> fail`")
+    for c in m.cfg:
+        pass
     for w in m.when:
         if len(w) > 80:
             res.lint.append(f"when: {len(w)} chars; say when the module applies in at most 80")

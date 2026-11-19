@@ -579,7 +579,7 @@ class Parser:
                         if len(s.args) != len(r.params):
                             raise SpecError(m.source, s.line_no, f"rule {r.name} takes {len(r.params)} argument(s), got {len(s.args)}")
                         continue
-                    if s.ref in ops or s.ref in known_vars or s.ref in BUILTINS or s.ref in self.known:
+                    if s.ref in ops or s.ref in known_vars or s.ref in BUILTINS or s.ref in self.known or s.ref[0].isupper():
                         s.ref = s.ref if s.ref in ops else ""
                         continue
                     if s.args or re.search(r"\(", s.text):  # called by name but defined nowhere
