@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from ..design.names import words
 from .compare import alike, stem, wordset
+from .doc import readable
 from .notation import OMIT_REASONS, REQ_ID, System, Trace, chain_text
 from .sysfacts import Fact, SystemFacts
 
@@ -332,6 +333,10 @@ def check(s: System, sf: SystemFacts, repo: str) -> Result:
         if o.reason not in OMIT_REASONS:
             res.errors.append(f"omit {', '.join(o.names)}: {o.reason!r} is not a reason ({', '.join(OMIT_REASONS)}); "
                               f"a plan or TODO is not in the code's model at all, so drop its line")
+    for a in s.activities:
+        if not readable(a.nodes):
+            res.lint.append(f"activity {a.name}: one decision per step and no decision inside another "
+                            f"(`a -> [cond] x | y -> z`); leave nested choices to the state machine or a second activity")
     if not s.reqs:
         res.lint.append("no requirements: write one `req` per observable behaviour or constraint")
     return res

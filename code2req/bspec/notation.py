@@ -551,7 +551,7 @@ class Parser:
 
 def cfg_value(key: str, raw: str, at: Trace | None = None) -> Cfg:
     """`{5,10,25} cents` -> value {5,10,25}, unit cents; `2..8 °C`; `3`; `{price cents, stock} per slot`."""
-    m = re.match(r"(\{.*\}|\"[^\"]*\"|\S+)\s*(.*)$", raw)
+    m = re.match(r"(\{.*\}|\(.*\)|\[.*\]|\"[^\"]*\"|\S+)\s*(.*)$", raw)
     value, unit = (m.group(1), m.group(2).strip()) if m else (raw, "")
     return Cfg(key, value, unit, at)
 

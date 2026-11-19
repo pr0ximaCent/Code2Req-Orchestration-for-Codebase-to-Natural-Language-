@@ -28,6 +28,8 @@ def plain(text: str) -> str:
     t = re.sub(r"\b([\w ]+?)\s*-=\s*([\w ()]+)", lambda m: f"reduce {m.group(1).strip()} by {m.group(2).strip()}", t)
     for pat, rep in OPS:
         t = re.sub(pat, rep, t)
+    t = re.sub(r"\s*\|\s*", " or ", t)  # value: 5 | 10 | 25
+    t = re.sub(r"\[([^\[\],]+),\s*([^\[\],]+)\]", r"\1 to \2", t)  # [tempLow, tempHigh]
     t = re.sub(r"(\d+)\.\.(\d+)", r"\1 to \2", t)
     t = CAMEL.sub(lambda m: human(m.group()), t)
     return " ".join(t.split())
@@ -54,13 +56,22 @@ def article(phrase: str) -> str:
     return ("an " if phrase[:1].lower() in "aeiou" else "a ") + phrase
 
 
+UNIT_WORDS = {"C": "°C", "degC": "°C", "F": "°F", "degF": "°F"}
+
+
+def number(x: str) -> str:
+    return re.sub(r"^(-?\d+)\.0+$", r"\1", x)  # 2.0 -> 2
+
+
 def cfg_value(value: str, unit: str) -> str:
     v = value.strip()
-    if v.startswith("{") and v.endswith("}"):
-        inner = [x.strip() for x in v[1:-1].split(",")]
-        v = listing(inner) if all(re.fullmatch(r"-?\d+(\.\d+)?", x) for x in inner) else ", ".join(plain(x) for x in inner)
-    v = re.sub(r"(\d+)\.\.(\d+)", r"\1 to \2", v)
-    return f"{v} {plain(unit)}".strip() if unit else v
+    if (v.startswith("{") and v.endswith("}")) or (v.startswith("(") and v.endswith(")")):  # a set or a list
+        inner = [x.strip() for x in v[1:-1].split(",") if x.strip()]
+        v = listing([number(x) for x in inner]) if all(re.fullmatch(r"-?\d+(\.\d+)?", x) for x in inner) \
+            else ", ".join(plain(x) for x in inner)
+    v = re.sub(r"(\d+)\.\.(\d+)", r"\1 to \2", number(v))
+    u = UNIT_WORDS.get(unit.strip(), plain(unit)) if unit else ""
+    return f"{v} {u}".strip()
 
 
 def transition_text(t: Transition, num: dict[str, int] | None = None) -> str:
@@ -74,6 +85,17 @@ def transition_text(t: Transition, num: dict[str, int] | None = None) -> str:
     then = f"{plain(t.effect)}, then {move}" if t.effect else move
     only = " (not shown in the code)" if t.doc_only else ""
     return f"{src}, {when}{guard}: {then}.{only}"
+
+
+def readable(nodes: list[Node]) -> bool:
+    """A chain the document can say step by step: no decision left inside a step's text (the model nested
+    decisions the notation has no form for, `[a] x | [b] y | z -> w | [c] v`)."""
+    for nd in nodes:
+        if not nd.cond and re.search(r"[\[\]|]", nd.text):
+            return False
+        if nd.cond and not (readable(nd.then) and readable(nd.other)):
+            return False
+    return True
 
 
 def chain_text(nodes: list[Node]) -> list[str]:
@@ -139,18 +161,23 @@ def system_text(s: System) -> str:
         num = {r.id: i for i, r in enumerate(s.reqs, 1)}
         out += [f"- {transition_text(t, num)}" for t in m.transitions]
         out.append("")
-    if s.activities:
+    shown = [a for a in s.activities if a.nodes and readable(a.nodes)]  # a garbled chain would mislead: left out
+    if shown:
         out += ["## Step by step", ""]
-        for a in s.activities:
+        for a in shown:
             steps = chain_text(a.nodes)
             out.append(f"**{human(a.name)[0].upper() + human(a.name)[1:]}:**")
             out += [f"{i}. {x}" for i, x in enumerate(steps, 1)]
             out.append("")
-    if s.satisfies:
+    # who carries out what, when it says something: a part that carries out every behaviour says nothing
+    sats = [sat for sat in s.satisfies if not (s.reqs and {r.id for r in s.reqs} <= set(sat.ids))]
+    if sats:
         out += ["## Who does what", ""]
-        for sat in s.satisfies:
+        for sat in sats:
             nums = [str(i) for i, r in enumerate(s.reqs, 1) if r.id in sat.ids]
-            out.append(f"- The {human(sat.by).lower()} carries out behaviour {listing(nums)}.")
+            who = human(sat.by).lower()
+            verb = "carry" if who.endswith("s") and not who.endswith("ss") else "carries"
+            out.append(f"- The {who} {verb} out behaviour {listing(nums)}.")
         out.append("")
     questions = [(r.id, q) for r in s.reqs for q in r.issues] + [(u.name, q) for u in s.usecases for q in u.issues] + \
         [("", q) for q in s.issues]
