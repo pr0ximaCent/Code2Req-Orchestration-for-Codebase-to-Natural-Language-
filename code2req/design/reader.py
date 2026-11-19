@@ -269,14 +269,21 @@ class Reader:
         named, source = [e for e in cfg.engines() if e in SQL], ", ".join(cfg.files)
         if not named:  # no configuration says: the driver the code imports
             named, source = [e for e in drivers([i for f in self.outline.files.values() for i in f.imports]) if e in SQL], "the driver the code imports"
-        if len(said) == 1 and len(named) == 1 and said[0] != named[0]:
-            old, new = said[0], named[0]
-            self.actors[new] = dict(self.actors.pop(old), name=new, what=f"{new} ({source})")
-            for c in self.comps.values():
-                for e in c["external"]:
-                    if norm_actor(e["system"]) == old:
-                        e["system"] = new
-            self.problems.append(f"database: {new}, as {source} says (the code reading said {old})")
+        if len(named) == 1 and not said and any(  # the model named none, but data-access code and a configured engine
+                re.search(r"(Repository|Repo|Dao|Mapper|Store|ReadService|QueryService)$", c["code"]) or c.get("kind") == "repository"
+                for c in self.comps.values()):
+            self.actors[named[0]] = {"name": named[0], "what": f"{named[0]} ({source})", "clients": set()}
+            self.problems.append(f"database: {named[0]}, as {source} says (the code reading named none)")
+        if len(named) == 1 and any(a != named[0] for a in said):  # one engine configured: every SQL database guessed is it
+            new = named[0]
+            for old in [a for a in said if a != new]:
+                gone = self.actors.pop(old)
+                self.actors.setdefault(new, dict(gone, name=new, what=f"{new} ({source})"))
+                for c in self.comps.values():
+                    for e in c["external"]:
+                        if norm_actor(e["system"]) == old:
+                            e["system"] = new
+                self.problems.append(f"database: {new}, as {source} says (the code reading said {old})")
 
     def beside_mount(self, rt: dict, mount: dict) -> bool:
         """A route registered on the application itself, not on what a mount hands the prefix to: app.get('/') with
@@ -500,8 +507,9 @@ class Reader:
         sets = []
         for s in ans.get("settings", []) or []:
             if isinstance(s, dict) and not (re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", str(s.get("key", ""))) or (
-                    isinstance(s.get("line"), int) and READS.search(" ".join(
-                        self.outline.line(ids.get(s.get("file"), ""), s["line"] + k) for k in (-1, 0, 1))))):
+                    isinstance(s.get("line"), int) and (READS.search(" ".join(
+                        self.outline.line(ids.get(s.get("file"), ""), s["line"] + k) for k in (-1, 0, 1)))
+                        or self.in_settings_class(ids.get(s.get("file"), ""), s["line"])))):
                 problems.append(f"setting {s.get('key')}: line {s.get('line')} does not read it from the environment or config")
                 continue
             if isinstance(s, dict) and s.get("key") and (ok(s, s["key"], "line", True) or ok(s, str(s.get("default", "")).strip('"\''), "line", True)):
@@ -521,7 +529,8 @@ class Reader:
                  and ok(w, str(w["instance"]), "line", True)]
         routes = []
         for r in ans.get("routes", []) or []:
-            why = self.route_problem(ids.get(r.get("file"), ""), r) if isinstance(r, dict) and r.get("path") else "no path"
+            # "" is a path: @router.post("") under include_router(prefix="/users") serves /users
+            why = self.route_problem(ids.get(r.get("file"), ""), r) if isinstance(r, dict) and isinstance(r.get("path"), str) else "no path"
             if not why:
                 routes.append(r)
             elif isinstance(r, dict):
@@ -572,6 +581,7 @@ class Reader:
                             "given": [{"name": n_, "type": ty} for n_, ty in t.fields if ty[:1].isupper()],
                             "implements": list(t.bases), "operations": ops, "external": []}
                 self.problems.append(f"component {t.name}: its framework builds it ({mark.group(0)}), so it is one")
+        wired = {str(w.get("component", "")).split(".")[-1] for a in answers for w in a.get("wiring", [])}
         repeated = Counter(code for _, code in raw)
         self.comps: dict[str, dict] = OrderedDict()
         self.by_code: dict[str, list[str]] = {}
@@ -580,6 +590,9 @@ class Reader:
                 continue
             if STAND_IN.search(c.get("file", "").lower()):
                 continue  # a stand-in a demo or example plugs in, not a part of the system
+            if code not in wired and self.built_per_call(code, c.get("file", "")):
+                self.problems.append(f"component {code}: an operation builds one for each call, so it is part of that step")
+                continue
             name = pascal(code)
             if repeated[code] > 1 or (len(words(code)) == 1 and code.lower() in GENERIC):
                 folder = next((p for p in reversed(dirn.replace("\\", "/").split("/")) if p and p.lower() not in NOISE), "")
@@ -616,12 +629,20 @@ class Reader:
         self.data = OrderedDict((x["name"], x) for a in answers for x in a.get("data", [])
                                 if x["name"] not in self.by_code and not re.search(r"(Config|Configuration|Settings|Options)$", x["name"]))
         self.enums = OrderedDict((x["name"], x) for a in answers for x in a.get("enums", []))
-        self.settings, seen = [], set()
+        # one setting per key: a development or test settings file only overrides the value the running system has
+        by_key = OrderedDict()
         for s in (s for a in answers for s in a.get("settings", [])):
-            key = (str(s.get("key")), str(s.get("default")))
-            if key not in seen:
-                seen.add(key)
-                self.settings.append(s)
+            by_key.setdefault(str(s.get("key")).lower(), []).append(s)
+        self.settings = []
+        for key, same in by_key.items():
+            same.sort(key=lambda s: bool(re.search(r"(^|[/_.-])(dev|development|test|tests|testing|local|staging|ci)([/_.-]|$)",
+                                                   str(s.get("file", "")).lower())))
+            self.settings.append(same[0])
+            others = [f"{os.path.splitext(os.path.basename(str(s.get('file', ''))))[0]}: {s.get('default')}" for s in same[1:]
+                      if str(s.get("default")) != str(same[0].get("default"))]
+            if others:
+                self.problems.append(f"setting {same[0].get('key')}: {same[0].get('default')} as the system runs; "
+                                     f"other environments override it ({'; '.join(dict.fromkeys(others))})")
         self.limits, seen = [], set()
         for x in (x for a in answers for x in a.get("limits", [])):
             x["raw"] = str(x.get("value", ""))
@@ -663,7 +684,10 @@ class Reader:
                           for fn in f.fns if fn.name == op), None) if op else None
             line = int(rt.get("line") or 0)
             head = " ".join(self.outline.files[rel].lines[max(0, line - 1):line + 3])  # the handler may follow guards
-            inline = bool(re.search(r"=>|\bfunction\b|\bdef\b|lambda", head))
+            decorated = self.decorated_fn(rel, line)
+            inline = decorated is None and bool(re.search(r"=>|\bfunction\b|\bdef\b|lambda", head))
+            if decorated is not None:  # @router.post("/login") over def login(...): login is the handler
+                named, op = decorated, decorated.name
             if inline:  # the function written on the route's line handles it; what it calls is a step of it
                 named = None
             if rt.get("component") in comps and (named is None or named.owner or
@@ -673,10 +697,19 @@ class Reader:
                 continue
             where = named.file if named is not None else rel
             owner = self.comp_of_file(where)
-            if owner is None:  # no component for this file: a module component named after the folder
-                owner = pascal(os.path.basename(folder) or os.path.splitext(os.path.basename(where))[0])
-                while owner in comps and comps[owner].get("file") and os.path.dirname(comps[owner]["file"]) != folder:
-                    owner += "Module"
+            if owner is None:  # no component for this file: a module component, the package's in Go, else the file's
+                stem = os.path.splitext(os.path.basename(where))[0]
+                if self.outline.files[where].lang == "go":
+                    owner = pascal(os.path.basename(folder) or stem)
+                    while owner in comps and comps[owner].get("file") and os.path.dirname(comps[owner]["file"]) != folder:
+                        owner += "Module"
+                else:  # article.controller.ts -> ArticleController; articles/api.py -> ArticlesApi
+                    owner = pascal(stem)
+                    if stem.lower() in ("index", "api", "routes", "router", "views", "urls", "handlers", "controller",
+                                        "controllers", "endpoints", "main", "app", "__init__", "server"):
+                        owner = pascal(os.path.basename(folder)) + owner
+                    while owner in comps and comps[owner].get("file") and comps[owner]["file"] != where:
+                        owner += "Module"
                 if owner not in comps:
                     comps[owner] = {"name": owner, "code": owner, "file": where, "lines": [1, 1], "kind": "handler",
                                     "purpose": f"Handles the routes registered in {folder or where}", "given": [], "implements": [],
@@ -838,6 +871,53 @@ class Reader:
                             return n
         bare = re.sub(r"^(New|new|create|Create|make|Make|build|Build)", "", name)
         return self.resolve(f"{qual}.{bare}" if qual else bare, rel) if bare != name else None
+
+    def built_per_call(self, code: str, rel: str) -> bool:
+        """A request's validator, serializer or form: named so, not one its framework builds, and constructed inside a
+        function of another type (NewUserModelValidator(), ProfileSerializer{c}, new LoginForm(...)) - an object made for
+        one call, not a part of the running system."""
+        if not re.search(r"(Validator|Serializer|Form|Request|Response|Dto|DTO|Params|Payload)$", code):
+            return False
+        t = next((t for t in self.outline.type_named(code) if t.file == rel), None)
+        if t is not None and DI_MARK.search(self.marks_at(rel, t.line)):
+            return False
+        made = re.compile(rf"\b(?:New{re.escape(code)}\s*\(|new\s+{re.escape(code)}\s*[(<]|{re.escape(code)}\s*\{{|{re.escape(code)}\s*\()")
+        for f in self.outline.files.values():
+            for fn in f.fns:
+                if fn.owner == code or fn.name in (code, f"New{code}"):
+                    continue
+                if any(made.search(x) for x in f.lines[fn.line:fn.end]):
+                    return True
+        return False
+
+    def in_settings_class(self, rel: str, line: int) -> bool:
+        """Whether line declares a field of a class its framework fills from the environment or config: one extending
+        BaseSettings (pydantic), directly or through classes of the repo, or marked @ConfigurationProperties (Spring)."""
+        f = self.outline.files.get(rel)
+        t = next((t for t in f.types if t.line <= line <= t.end), None) if f is not None else None
+        seen = set()
+        while t is not None and t.name not in seen:
+            seen.add(t.name)
+            if any(re.search(r"\bBaseSettings\b", b) for b in t.bases) or "@ConfigurationProperties" in " ".join(
+                    self.outline.files[t.file].lines[max(0, t.line - 4):t.line]):
+                return True
+            t = next((x for b in t.bases for x in self.outline.type_named(base_type(b))), None)
+        return False
+
+    def decorated_fn(self, rel: str, line: int):
+        """The function a route decorator on line (or one of the two lines above, for a decorator written over several
+        lines) is written over: the first function of the file starting below it with only decorators between."""
+        f = self.outline.files.get(rel)
+        if f is None or not 0 < line <= len(f.lines):
+            return None
+        at = next((k for k in range(line, max(0, line - 3), -1) if f.lines[k - 1].lstrip().startswith("@")), None)
+        if at is None:
+            return None
+        fn = min((fn for fn in f.fns if at < fn.line <= at + 15), key=lambda fn: fn.line, default=None)
+        if fn is None:
+            return None
+        between = " ".join(f.lines[at:fn.line - 1])  # decorator arguments and other decorators only
+        return None if re.search(r"^\s*(?:async\s+)?(?:def|class)\b", between, re.M) else fn
 
     def inline_handler(self, rel: str, o: dict) -> bool:
         """An anonymous route handler (router.get('/user', async (req, res) => {...})), named by its route: its first

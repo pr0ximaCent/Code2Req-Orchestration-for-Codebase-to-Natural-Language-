@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger(__name__)
 
@@ -123,23 +124,29 @@ def rank(problems: list[str]) -> tuple[int, int]:
     return len(broken(problems)), len(problems)
 
 
-def atomize(llm, reqs: list[dict], subjects: dict[str, str], batch: int = 20, rounds: int = 3) -> list[dict]:
-    """reqs: code2req requirements; subjects: requirement id -> the subject name its text uses."""
+def atomize(llm, reqs: list[dict], subjects: dict[str, str], batch: int = 20, rounds: int = 3, workers: int = 4) -> list[dict]:
+    """reqs: code2req requirements; subjects: requirement id -> the subject name its text uses. The batches of a round
+    are asked at once (workers): one after another, a 200-requirement run waited minutes on them."""
     final: dict[str, list[dict]] = {}
     todo, notes = list(reqs), {}
+
+    def ask(part: list[dict]) -> list:
+        payload = [{"id": r["id"], "subject": subjects[r["id"]], "text": r["text"], "type": r.get("type", ""),
+                    "attributes": [{k: a.get(k) for k in ("name", "operator", "value", "unit_literal")}
+                                   for a in r.get("attributes", [])]}
+                   | ({"previous_answer_broke": notes[r["id"]]} if r["id"] in notes else {}) for r in part]
+        try:
+            answer = json.loads(llm.complete(SYSTEM, json.dumps({"requirements": payload}, indent=1), json_mode=True))
+        except (ValueError, RuntimeError) as e:  # a bad answer or the budget: keep the inputs as they are
+            log.warning("atomize: %s", e)
+            answer = {}
+        return answer.get("requirements", []) if isinstance(answer, dict) else []
+
     for attempt in range(rounds):
-        for i in range(0, len(todo), batch):
-            part = todo[i:i + batch]
-            payload = [{"id": r["id"], "subject": subjects[r["id"]], "text": r["text"], "type": r.get("type", ""),
-                        "attributes": [{k: a.get(k) for k in ("name", "operator", "value", "unit_literal")}
-                                       for a in r.get("attributes", [])]}
-                       | ({"previous_answer_broke": notes[r["id"]]} if r["id"] in notes else {}) for r in part]
-            try:
-                answer = json.loads(llm.complete(SYSTEM, json.dumps({"requirements": payload}, indent=1), json_mode=True))
-            except (ValueError, RuntimeError) as e:  # a bad answer or the budget: keep the inputs as they are
-                log.warning("atomize: %s", e)
-                answer = {}
-            got = answer.get("requirements", []) if isinstance(answer, dict) else []
+        parts = [todo[i:i + batch] for i in range(0, len(todo), batch)]
+        with ThreadPoolExecutor(max(1, min(workers, len(parts)))) as ex:
+            answers = list(ex.map(ask, parts))
+        for part, got in zip(parts, answers):
             for r in part:
                 mine = [o for o in got if isinstance(o, dict) and o.get("source") == r["id"]]
                 if len(mine) == 1:  # a requirement that was not split keeps its ID exactly
@@ -166,6 +173,6 @@ def atomize(llm, reqs: list[dict], subjects: dict[str, str], batch: int = 20, ro
             o.setdefault("source", r["id"])
             seen[o["name"]] = seen.get(o["name"], 0) + 1
             if seen[o["name"]] > 1:  # names unique across batches
-                o["name"] = f"{o['name']}{seen[o['name']]}"
+                o["name"] = f"{o['name']}_{seen[o['name']]}"  # Limit20_2, not Limit202
             out.append(o)
     return out

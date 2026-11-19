@@ -9,6 +9,7 @@ import os
 import re
 from collections import Counter, OrderedDict
 
+from .mounts import Mounts
 from .names import camel, pascal, words
 from .reader import HTTP_METHODS as HTTP
 from .reader import SKIP, SYSTEM, norm_actor
@@ -114,7 +115,7 @@ def assemble(r) -> dict:
         if id(m) in used or any(rt["method"] == method and rt["file"] == m.get("file") and abs(int(rt["line"] or 0) - int(m.get("line") or 0)) <= 2
                                 for rt in routes):
             continue
-        if method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS") and path:  # "tags": a path as written
+        if method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):  # "tags", "": a path as written
             routes.append({"method": method, "path": "/" + path.lstrip("/"), "comp": m.get("component"), "op": m.get("operation"),
                            "file": m.get("file"), "line": m.get("line")})
     # mount prefixes: one handed to a registering function (UsersRegister(v1.Group("/users"))) applies to the routes
@@ -125,7 +126,13 @@ def assemble(r) -> dict:
     by_registrar = {str(m.get("registrar") or "").split(".")[-1].split("(")[0]: str(m["prefix"]).rstrip("/")
                     for m in r.mounts if m.get("registrar") and str(m.get("prefix", "")).rstrip("/")}
     done = set()
+    tree = Mounts(r.outline)  # nested routers (include_router, register_blueprint, use): the prefixes the code gives
     for k, rt in enumerate(routes):
+        full = tree.full_path(rt.get("file") or "", int(rt.get("line") or 0)) if rt.get("file") else None
+        if full:
+            rt["path"] = full
+            done.add(k)
+            continue
         fn = r.outline.fn_at(rt.get("file") or "", int(rt.get("line") or 0)) if rt.get("file") else None
         if fn is not None and fn.name in by_registrar:
             rt["path"] = join(by_registrar[fn.name], rt["path"])
@@ -143,7 +150,9 @@ def assemble(r) -> dict:
     merged = OrderedDict()
     for rt in routes:  # the same route found twice (by the surfaces and by the map) is one; /x/ is /x
         rt["path"] = rt["path"].rstrip("/") or "/"
-        merged.setdefault((rt["method"], rt["path"]), rt)
+        kept = merged.setdefault((rt["method"], rt["path"]), rt)
+        if kept is not rt and not kept.get("comp") and rt.get("comp"):  # the copy that names the handler wins
+            kept.update(comp=rt["comp"], op=rt["op"])
     routes = list(merged.values())
     for rt in routes:  # the handler must be a component's operation
         if rt["comp"] not in r.comps:
@@ -250,7 +259,9 @@ def assemble(r) -> dict:
             elif "if" in s:
                 cond = str(s["if"]).strip().rstrip(".")
                 m = re.match(r"(?:the call to )?(\w+) fails$", cond)
-                yes, no = (f"{m.group(1)} fails (returns an error)", f"{m.group(1)} succeeds") if m else (cond, f"not ({cond})")
+                neg = re.fullmatch(r"not\s+(?!\()(.+)", cond)  # "not user.check_password(...)": its opposite drops the not
+                yes, no = (f"{m.group(1)} fails (returns an error)", f"{m.group(1)} succeeds") if m else (
+                    cond, neg.group(1) if neg else f"not ({cond})")
                 then = convert(comp, pk, opname, s.get("then", []), c)
                 other = convert(comp, pk, opname, s.get("else", []), c)
                 failure = bool(re.search(r" fails\b", yes))
