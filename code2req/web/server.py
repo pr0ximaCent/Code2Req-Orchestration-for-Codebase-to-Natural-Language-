@@ -52,6 +52,7 @@ class RunRequest(BaseModel):
     max_module_chars: int = Field(default=DEFAULT_MODULE_CHARS, ge=5_000, le=400_000)
     profile: str = Field(default="sysml", pattern="^(sysml|exhaustive|bspec)$")  # bspec: the compact system document
     modules: list[str] = Field(default_factory=list)  # bspec: the folders of one system (default the whole repo)
+    review: bool = False  # bspec: also run the code detectors and write review.md
     followup: bool = True  # exhaustive profile only
     entries: list[str] = Field(default_factory=list)  # extra entry-point globs for dead-code detection
     assets: bool = True  # include prompts, templates, reference files and CI/CD
@@ -231,14 +232,14 @@ class RunManager:
             llm = with_cache(with_budget(llm, req.max_cost), label, enabled=req.cache, path=self.cache_path)
             if req.profile == "bspec":  # the compact behaviour spec and its system document, instead of requirements
                 from ..bspec import run as run_bspec
-                progress("bspec", 0, 0)
                 folders = [m.strip() for m in req.modules if m.strip()]
-                got = run_bspec(repo, out_dir, llm, label, [folders] if folders else None, workers=req.workers)
+                got = run_bspec(repo, out_dir, llm, label, [folders] if folders else None, workers=req.workers,
+                                with_review=req.review, progress=progress)
                 size = got["size"]
                 meta["summary"] = {"bspec": True, "systems": got["systems"], "lines": size["lines"], "chars": size["chars"],
                                    "requirements": size["requirements"], "transitions": size["transitions"],
                                    "usecases": size["usecases"], "behaviours": size["behaviours"],
-                                   "dropped": size["dropped"], "lint_hits": size["lint_hits"],
+                                   "dropped": size["dropped"], "lint_hits": size["lint_hits"], "review": req.review,
                                    "not_extracted": got["not_extracted"],
                                    "cost_usd": (got.get("usage") or {}).get("cost_usd")}
                 progress("done", 0, 0)

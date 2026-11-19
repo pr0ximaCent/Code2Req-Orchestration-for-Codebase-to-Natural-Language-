@@ -135,6 +135,12 @@ SHOWS = {"entry": ("usecase", "transition", "activity", "req"),
 
 
 def maps_to(f: Fact, s: System, els: list[tuple[str, str, str, Trace | None]], enums: dict[str, list[str]]) -> str:
+    if f.kind == "constant" and f.detail.startswith("values: "):  # a set of values: most of them named somewhere
+        vals = [v.strip() for v in f.detail[len("values: "):].split(",") if v.strip()]
+        everything = wordset(" ".join(txt for _, _, txt, _ in els))
+        found = sum(1 for v in vals if contained(frozenset(wordset(v)), everything))
+        if vals and found * 2 >= len(vals):
+            return f"{found} of its {len(vals)} values named in the model"
     fws = fact_words(f)
     for kind, label, txt, _ in sorted(els, key=lambda e: SHOWS[f.kind].index(e[0]) if e[0] in SHOWS[f.kind] else 99):
         if kind not in SHOWS[f.kind]:

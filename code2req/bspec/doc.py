@@ -15,10 +15,38 @@ CAMEL = re.compile(r"\b[a-z]+(?:[A-Z][a-z0-9]*)+\b|\b[A-Z][a-z0-9]+(?:[A-Z][a-z0
 
 
 def human(name: str) -> str:
-    """insertCoin -> insert coin; OutOfService -> out of service; LITE stays LITE."""
+    """insertCoin -> insert coin; OutOfService -> out of service; LITE and OTP stay; GoogleOAuth -> google OAuth."""
     if name.isupper():
         return name
-    return " ".join(words(name))
+    out: list[str] = []
+    for part in re.split(r"[^0-9A-Za-z]+", name):
+        segs = re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z]+|\d+", part)
+        i = 0
+        while i < len(segs):
+            seg = segs[i]
+            if len(seg) == 1 and seg.isupper() and seg not in "AI" and i + 1 < len(segs) and segs[i + 1][:1].isupper():
+                out.append(seg + segs[i + 1])  # OAuth, iPhone-style names stay one word
+                i += 2
+                continue
+            out.append(seg if seg.isupper() and len(seg) > 1 else seg.lower())
+            i += 1
+    return " ".join(out)
+
+
+def plural(phrase: str) -> str:
+    """credentials stays, data stays, call totals stays, slot -> slots, entry -> entries, box -> boxes."""
+    head, _, last = phrase.rpartition(" ")
+    w = last
+    if not w or w.endswith("s") and not w.endswith(("ss", "us")) or w.lower() in ("data", "media", "metadata", "info",
+                                                                                   "feedback", "staff"):
+        out = w
+    elif w.endswith(("ss", "x", "ch", "sh", "us")):
+        out = w + "es"
+    elif w.endswith("y") and w[-2:-1] not in "aeiou":
+        out = w[:-1] + "ies"
+    else:
+        out = w + "s"
+    return (head + " " if head else "") + out
 
 
 def plain(text: str) -> str:
@@ -53,7 +81,12 @@ def listing(xs: list[str]) -> str:
 def article(phrase: str) -> str:
     if phrase.endswith("s") and not phrase.endswith("ss"):  # shelves, sensors
         return phrase
-    return ("an " if phrase[:1].lower() in "aeiou" else "a ") + phrase
+    first = phrase.split()[0]
+    if first.isupper() and len(first) > 1:  # an LLM, an OTP, a TLS link: the letter's sound
+        vowel = first[0] in "AEFHILMNORSX"
+    else:  # a user, a usage, a one-time code, an order
+        vowel = first[:1].lower() in "aeiou" and not re.match(r"(us|uni|uti|eu|one\b)", first.lower())
+    return ("an " if vowel else "a ") + phrase
 
 
 UNIT_WORDS = {"C": "°C", "degC": "°C", "F": "°F", "degF": "°F"}
@@ -87,13 +120,17 @@ def transition_text(t: Transition, num: dict[str, int] | None = None) -> str:
     return f"{src}, {when}{guard}: {then}.{only}"
 
 
-def readable(nodes: list[Node]) -> bool:
+MAX_DECISIONS = 2  # a chain with more decisions in a row reads as a run-on sentence: the state machine says it
+
+
+def readable(nodes: list[Node], depth: int = 0) -> bool:
     """A chain the document can say step by step: no decision left inside a step's text (the model nested
-    decisions the notation has no form for, `[a] x | [b] y | z -> w | [c] v`)."""
+    decisions the notation has no form for, `[a] x | [b] y | z -> w | [c] v`), and no more than MAX_DECISIONS
+    decisions one inside the other."""
     for nd in nodes:
         if not nd.cond and re.search(r"[\[\]|]", nd.text):
             return False
-        if nd.cond and not (readable(nd.then) and readable(nd.other)):
+        if nd.cond and (depth + 1 > MAX_DECISIONS or not (readable(nd.then, depth + 1) and readable(nd.other, depth + 1))):
             return False
     return True
 
@@ -135,7 +172,7 @@ def system_text(s: System) -> str:
             out.append("It is made of " + listing([article(human(p.name).lower()) for p in s.parts]) + ".")
         for it in s.items:
             fields = f" ({', '.join(plain(f) for f in it.fields)})" if it.fields else ""
-            out.append(f"It handles {human(it.name).lower()}s{fields}.")
+            out.append(f"It handles {plural(human(it.name).lower() if not human(it.name).isupper() else human(it.name))}{fields}.")
         out.append("")
     if s.cfg:
         out += ["## Settings", ""]

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 
 from .check import Result, check
-from .notation import LEGEND, OMIT_REASONS, Spec, SpecError, System, format_system, parse
+from .notation import LEGEND, OMIT_REASONS, Named, Spec, SpecError, System, format_system, parse
 from .sysfacts import SystemFacts
 
 log = logging.getLogger(__name__)
@@ -195,9 +195,23 @@ def normalize(text: str) -> str:
     """What models write around the notation: tabs, a 4-space indent for system members, blank trailing spaces."""
     lines = [ln.replace("\t", "    ").rstrip() for ln in text.splitlines()]
     # file references written into a statement (`... password.go:24-27, verification.go:35`) are traces, not text
-    lines = [re.sub(r"\s{3,}(?=[@?])", "  ", FILE_REFS.sub("", ln)) if ln.lstrip().startswith(("req ", "usecase ", "activity "))
-             else ln for ln in lines]
+    lines = [re.sub(r"\s{3,}(?=[@?])", "  ", one_trace(FILE_REFS.sub("", ln)))
+             if ln.lstrip().startswith(("req ", "usecase ", "activity ")) else ln for ln in lines]
+    # a route written into a use case step (`submit details via POST /auth/signup`) is a trace, not a step
+    lines = [re.sub(r"\s*\(?\b(?:via|using|with|at|through)?\s*(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s,)]*\)?", "", ln)
+             if ln.lstrip().startswith("usecase ") else ln for ln in lines]
     return "\n".join(lines) + "\n"
+
+
+def one_trace(line: str) -> str:
+    """Several `@file:lines` on one line (`... error @a.go:26-35, @b.go:35-38,  @c.go:24-27`): the last is the
+    element's trace, the others are dropped from the text."""
+    body, q, rest = line.partition(" ? ")
+    traces = list(re.finditer(r"(?<!\S)@[\w./:-]+,?", body))
+    for m in reversed(traces[:-1]):
+        body = body[:m.start()] + body[m.end():]
+    body = re.sub(r"[\s,]+(?=\s@)", "", body)
+    return body + (q + rest if q else "")
 
 
 FILE_REFS = re.compile(r"(?<![@\w/])\s*\(?[\w/.-]+\.(?:go|py|ts|tsx|js|jsx|java|cs)(?::\d+(?:-\d+)?)?"
@@ -211,7 +225,13 @@ def evaluate(text: str, sf: SystemFacts, repo: str) -> tuple[Spec | None, Result
         return None, None, str(e)
     if len(spec.systems) != 1:
         return spec, None, f"write exactly one `system` (found {len(spec.systems)})"
-    return spec, check(spec.systems[0], sf, repo), ""
+    s = spec.systems[0]
+    declared = {a.name for a in s.actors}
+    for u in s.usecases:  # a use case's actor that the model forgot to declare is declared for it
+        if re.fullmatch(r"[A-Z]\w*", u.actor) and u.actor not in declared and u.actor not in {p.name for p in s.parts}:
+            s.actors.append(Named(u.actor))
+            declared.add(u.actor)
+    return spec, check(s, sf, repo), ""
 
 
 def problems_of(ex: Extraction) -> list[str]:
@@ -220,12 +240,14 @@ def problems_of(ex: Extraction) -> list[str]:
     return ex.result.problems() if ex.result else []
 
 
-def extract(llm, repo: str, sf: SystemFacts, label: str, rounds: int = 4) -> Extraction:
+def extract(llm, repo: str, sf: SystemFacts, label: str, rounds: int = 4, on_round=None) -> Extraction:
     base = user_prompt(repo, sf, label)
     best: Extraction | None = None
     attempts: list[tuple[str, list[str]]] = []
     prompt = base
     for n in range(1, rounds + 1):
+        if on_round is not None:  # the web UI shows which round is asking the model
+            on_round(n)
         answer = None
         for wait in RETRY_WAITS:  # a failed call is tried again; budget or a lasting outage keeps the best so far
             try:

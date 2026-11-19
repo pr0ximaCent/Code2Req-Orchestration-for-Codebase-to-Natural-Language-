@@ -228,6 +228,7 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
     </select></label>
   <label class="grow" for="modules">Folders inside the repo (comma-separated; bspec: one system made of these folders, empty = the whole repo)
     <input class="field" id="modules" placeholder="app/services/credits, app/api/auth"></label>
+  <label for="review"><input type="checkbox" id="review"> Also run the code detectors (bspec: review.md)</label>
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
     <input class="field" id="exclude" placeholder="*_test.go, migrations/*"></label>
   <label for="workers">Parallel modules
@@ -275,6 +276,14 @@ const STEPS = [
   ["design_map", "Design (alongside): read the architecture of each folder"],
   ["design_behaviour", "Design (alongside): read what each component does"],
   ["design_write", "Write the system design and model"],
+  ["done", "Save results"],
+];
+// a system document run (profile bspec) reports its own steps
+const BSPEC_STEPS = [
+  ["resolving", "Get the source"],
+  ["bspec_facts", "Read the code: entry points, state, settings, interfaces"],
+  ["bspec_model", "Write the system model and check it against the code"],
+  ["bspec_write", "Write system_doc.md, coverage and review"],
   ["done", "Save results"],
 ];
 const VIEWS = [["requirements", "Requirements"], ["references", "Reference"], ["gaps", "Gaps"], ["rejected", "Rejected"],
@@ -396,6 +405,7 @@ $("#runForm").onsubmit = async e => {
     max_cost: +$("#maxCost").value > 0 ? +$("#maxCost").value : null,
     profile: $("#mode").value,
     modules: $("#modules").value.split(",").map(s => s.trim()).filter(Boolean),
+    review: !!$("#review")?.checked,
   };
   $("#runBtn").disabled = true;
   try {
@@ -430,6 +440,8 @@ async function refresh() {
       S.doc = r.ok ? await r.text() : "(no system document)";
       const v = await fetch(`/api/runs/${id}/bspec/coverage.md`);
       S.review = v.ok ? await v.text() : "";
+      const rv = S.run.summary.review ? await fetch(`/api/runs/${id}/bspec/review.md`) : null;
+      S.findings = rv && rv.ok ? await rv.text() : "";
       loadRuns();
     }
   } else if (S.run.status === "done") {
@@ -493,11 +505,11 @@ function renderDoc() {
     <div>${esc((s.systems || []).join(", "))} · ${s.requirements} requirements · ${s.transitions} transitions ·
       ${s.usecases} use cases · ${s.lines} spec lines · <b>${s.dropped}</b> dropped facts · <b>${s.lint_hits}</b> lint hits${cost}${warn}</div>
     <div style="display:flex; gap:.5em; flex-wrap:wrap; margin:.6em 0">
-      ${tab("doc", "System document")} ${tab("review", "Coverage")}
+      ${tab("doc", "System document")} ${tab("review", "Coverage")} ${S.findings ? tab("findings", "Review") : ""}
       <a class="btn" href="/api/runs/${id}/bspec/system_doc.md" download="system_doc-${id}.md">Download system_doc.md</a>
       <a class="btn" href="/api/runs/${id}/bspec/spec.zip">Download spec + reports (.zip)</a>
     </div>
-    <article class="doc" style="max-width:60em; line-height:1.5">${md(S.docTab === "review" ? S.review : S.doc)}</article>
+    <article class="doc" style="max-width:60em; line-height:1.5">${md(S.docTab === "review" ? S.review : S.docTab === "findings" ? S.findings : S.doc)}</article>
   </section>`;
   $("#body").querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { S.docTab = b.dataset.tab; renderDoc(); });
 }
@@ -535,8 +547,33 @@ const hideModels = s => s
   .replace(/\b(?:gemini|azure|openai|anthropic|vertex_ai)[:/][\w.\-]+|\b(?:gemini|gpt|claude|kimi|o\d)-[\w.\-]*\d[\w.\-]*/gi, "model");
 
 /* ---------- running / failed ---------- */
+function renderBspecRun(r, p) {
+  const stage = p.stage === "bspec_systems" ? "bspec_model" : p.stage;  // several systems: one step, counted
+  const idx = BSPEC_STEPS.findIndex(([k]) => k === stage);
+  const steps = BSPEC_STEPS.map(([k, label], i) => {
+    const cls = i < idx ? "past" : i === idx ? "now" : "";
+    const extra = k !== stage || k !== "bspec_model" || !p.total ? ""
+      : p.stage === "bspec_systems" ? `${p.done} of ${p.total} systems` : `round ${p.done} of up to ${p.total}`;
+    return `<li class="${cls}"><span class="k">${i + 1}</span><span>${esc(label)}</span><span>${esc(extra)}</span></li>`;
+  }).join("");
+  const ended = ["failed", "stopped"].includes(r.status);
+  const pct = idx < 0 ? 0 : Math.round(((idx + (stage === "bspec_model" && p.total ? p.done / (p.total + 1) : 0))
+    / (BSPEC_STEPS.length - 1)) * 100);
+  const fail = r.status === "failed" ? `<div class="failbox"><b>The run stopped.</b> ${esc(r.error)}</div>`
+    : r.status === "stopped" ? `<div class="notebox"><b>Stopped on request.</b> Answers received so far are kept and reused at no cost.</div>`
+    : r.status === "stopping" ? `<div class="notebox"><b>Stopping.</b> The model call in progress finishes first.</div>` : "";
+  $("#body").innerHTML = `<section class="run">
+    ${fail}
+    <ol class="steps">${steps}</ol>
+    ${!ended ? `<div class="meter"><div style="width:${pct}%"></div></div>` : ""}
+    <div><h3>Log</h3></div>
+    <div class="log" id="log">${esc(hideModels(S.log.slice(-500).join("\n"))) || "Waiting for output…"}</div>
+  </section>`;
+  const lg = $("#log"); lg.scrollTop = lg.scrollHeight;
+}
 function renderRun() {
   const r = S.run, p = r.progress || {};
+  if (r.options?.profile === "bspec") return renderBspecRun(r, p);
   const idx = STEPS.findIndex(([k]) => k === p.stage);
   let pct = idx < 0 ? 0 : Math.round((idx / (STEPS.length - 1)) * 100);
   if (p.stage === "modules" && p.total) pct = Math.round(((3 + p.done / p.total) / (STEPS.length - 1)) * 100);

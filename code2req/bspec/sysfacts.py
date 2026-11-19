@@ -215,11 +215,33 @@ class Reader:
                 if decl.type == "const_declaration":
                     specs = [s for s in decl.named_children if s.type == "const_spec"]
                     typed = [text(s.child_by_field_name("type")) for s in specs if s.child_by_field_name("type")]
-                    is_enum = any(c.type == "iota" for s in specs for c in _walk(s)) or (
-                        len(typed) >= 2 and len(set(typed)) == 1)
-                    if is_enum and typed:
+                    if any(c.type == "iota" for s in specs for c in _walk(s)) and typed:
                         self.sf.enums.setdefault(typed[0], []).extend(
                             text(s.child_by_field_name("name")) for s in specs)
+                        continue
+                    by_type: dict[str, list[str]] = {}  # a typed set of values: `TypeX Type = "x"` for each x
+                    for s in specs:
+                        t = s.child_by_field_name("type")
+                        if t is not None:
+                            by_type.setdefault(text(t), []).append(text(s.child_by_field_name("name")))
+                    enums = {t: ns for t, ns in by_type.items() if len(ns) >= 2}
+                    for t, ns in enums.items():
+                        self.sf.enums.setdefault(t, []).extend(ns)
+                        p = name_prefix(ns)
+                        self.sf.facts.append(Fact("constant", f"{t} values", rel, line_of(decl),
+                                                  "values: " + ", ".join(n[len(p):] for n in ns), omittable=False))
+                    specs = [s for s in specs if text(s.child_by_field_name("type")) not in enums]
+                    if not specs:
+                        continue
+                    names = [text(s.child_by_field_name("name")) for s in specs]
+                    prefix = name_prefix(names)
+                    strings = all(s.child_by_field_name("value") is not None and
+                                  "string" in s.child_by_field_name("value").type + "".join(
+                                      c.type for c in s.child_by_field_name("value").named_children) for s in specs)
+                    if len(specs) >= 3 and prefix and strings:  # TypeBillingPaid, TypeAccountLocked, ...: one set
+                        f = Fact("constant", f"{prefix} values", rel, line_of(decl),
+                                 "values: " + ", ".join(n[len(prefix):] for n in names), omittable=False)
+                        self.sf.facts.append(f)
                         continue
                     for s in specs:
                         v = s.child_by_field_name("value")
@@ -579,7 +601,15 @@ class Reader:
                     v = c.child_by_field_name("value")
                     if c.type == "switch_case" and v is not None and v.type in ("string", "template_string"):
                         cases.append((text(v).strip("'\"`"), line_of(c), c))
+            cases = [c for c in cases if c[0].strip()]
             if len(cases) < 3:
+                continue
+            # a dispatch hands each case to the system's own code (insert_coin, c.handleCoin); a switch that only
+            # picks a value (a signing algorithm, a format) is no way in
+            leads = sum(1 for _, _, b in cases if b is not None and any(
+                c.type in ("call", "call_expression") and c.child_by_field_name("function") is not None
+                and text(c.child_by_field_name("function")).split(".")[-1] in self.calls for c in _walk(b)))
+            if leads * 3 < len(cases) * 2:
                 continue
             for value, line, branch in cases:
                 calls = [(text(c.child_by_field_name("function")), line_of(c)) for c in _walk(branch)
@@ -678,6 +708,18 @@ def field_of(n, lang: str, recv: str) -> str:
         if obj is not None and text(obj) in ({"self", "cls", "this"} | ({recv} if recv else set())):
             return text(name)
     return ""
+
+
+def name_prefix(names: list[str]) -> str:
+    """The camelCase words all names start with: TypeBillingPaid, TypeAccountLocked -> Type ("" when none)."""
+    parts = [re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", n) for n in names]
+    common = []
+    for ws in zip(*parts):
+        if len(set(ws)) != 1:
+            break
+        common.append(ws[0])
+    prefix = "".join(common)
+    return prefix if prefix and all(len(n) > len(prefix) for n in names) else ""
 
 
 def enum_value(value: str, values: list[str]) -> str | None:

@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 
-from .check import Result, check
+from .check import Result, check, contained
+from .compare import alike, wordset
 from .doc import system_doc
 from .extract import Extraction, extract
 from .notation import LEGEND, Issue, Spec, format_system, parse
@@ -31,6 +33,40 @@ def _write(path: str, text: str) -> None:
         f.write(text)
 
 
+# findings that can contradict a requirement; the rest (unread code, repeated constants) stay in review.md
+CONTRADICTS = {"missing-guard", "ignored-result", "race", "stale-fallback", "security", "mixed-result", "encoding",
+               "off-by-one", "boundary"}
+
+
+def attach_findings(s, findings: list[tuple[str, str, int, str]]) -> None:
+    """A finding that contradicts a requirement is an open question on it: one per check and category, naming
+    every place. A finding about a call (`no userSvc.IsActionAllowed`, `first result of X discarded`) goes to the
+    requirement that names what the call does; any other to the requirement whose lines hold it."""
+    for r in s.reqs:  # findings of an earlier review, kept in the spec it was rebuilt from, are found again below
+        r.issues = [i for i in r.issues if not re.match(r"\[[\w-]+\] ", i.text)]
+    groups: dict[tuple[str, str, str], list[str]] = {}
+    for cat, rel, line, why in findings:
+        if cat not in CONTRADICTS:
+            continue
+        m = re.search(r"(?:\bof|\bno)\s+([A-Za-z_]\w*\.[\w.]+|[A-Z]\w*[a-z]\w*)\b", why)  # a call, not "no limit"
+        callee = m.group(1) if m else ""
+        if callee:
+            cw = frozenset(w for w in wordset(callee.split(".")[-1]) if w not in ("is", "get", "set", "check"))
+            r = next((r for r in s.reqs if cw and contained(cw, wordset(r.text)) or
+                      cw and sum(1 for w in cw if any(alike(w, x) for x in wordset(r.text))) * 2 >= len(cw)), None)
+            text = re.sub(r";.*$", "", re.sub(r"\d+ (other )?(caller|sibling)\(?s\)?", "its other callers", why))
+        else:
+            r = next((r for r in s.reqs if r.at and r.at.start and r.at.covers(rel, line) and r.at.end - r.at.start <= 60), None)
+            text = why
+        if r is not None:
+            groups.setdefault((r.id, cat, text), []).append(f"{os.path.basename(rel)}:{line}")
+    for (rid, cat, text), where in groups.items():
+        r = s.req(rid)
+        q = f"[{cat}] {text} ({', '.join(where)})"
+        if not any(q == i.text for i in r.issues):
+            r.issues.append(Issue(q))
+
+
 def write_outputs(out_dir: str, repo: str | None, spec: Spec, facts: dict[str, SystemFacts], results: dict[str, Result],
                   with_review: bool = False) -> dict:
     spec_dir = os.path.join(out_dir, "spec")
@@ -40,11 +76,8 @@ def write_outputs(out_dir: str, repo: str | None, spec: Spec, facts: dict[str, S
     if with_review and repo:
         text, found = review(repo, spec, facts)
         _write(os.path.join(out_dir, "review.md"), text)
-        for s in spec.systems:  # a finding on a requirement's lines is an open question on it
-            for cat, rel, line, why in found.get(s.name, []):
-                r = next((r for r in s.reqs if r.at and r.at.start and r.at.covers(rel, line) and r.at.end - r.at.start <= 60), None)
-                if r is not None and not any(why in i.text for i in r.issues):
-                    r.issues.append(Issue(f"[{cat}] {why}"))
+        for s in spec.systems:
+            attach_findings(s, found.get(s.name, []))
     for s in spec.systems:
         _write(os.path.join(spec_dir, f"{s.name}.c2s"), format_system(s))
     _write(os.path.join(out_dir, "LEGEND.md"), LEGEND)
@@ -57,11 +90,30 @@ def write_outputs(out_dir: str, repo: str | None, spec: Spec, facts: dict[str, S
 
 
 def run(repo_path: str, out_dir: str, llm, label: str, groups: list[list[str]] | None = None, rounds: int = 4,
-        workers: int = 4, with_review: bool = False) -> dict:
+        workers: int = 4, with_review: bool = False, progress=None) -> dict:
+    """progress(stage, done, total), when given: bspec_facts, then bspec_model (the round asking the model, of
+    `rounds`) or, with several systems, bspec_systems (how many are finished), then bspec_write."""
+    def report(stage: str, done: int = 0, total: int = 0) -> None:
+        if progress is not None:
+            progress(stage, done, total)
+
     repo = os.path.abspath(repo_path)
+    report("bspec_facts")
     _, found = systems(repo, groups)
+    finished = []
+
+    def one(sf):
+        ex = extract(llm, repo, sf, label, rounds,
+                     on_round=(lambda n: report("bspec_model", n, rounds)) if len(found) == 1 else None)
+        finished.append(sf.name)
+        if len(found) > 1:
+            report("bspec_systems", len(finished), len(found))
+        return ex
+
+    report(*(("bspec_model", 1, rounds) if len(found) == 1 else ("bspec_systems", 0, len(found))))
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        done: list[Extraction] = list(pool.map(lambda sf: extract(llm, repo, sf, label, rounds), found))
+        done: list[Extraction] = list(pool.map(one, found))
+    report("bspec_write")
     spec = Spec()
     facts: dict[str, SystemFacts] = {}
     results: dict[str, Result] = {}
