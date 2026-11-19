@@ -50,7 +50,8 @@ class RunRequest(BaseModel):
     exclude: list[str] = Field(default_factory=list)
     workers: int = Field(default=4, ge=1, le=16)
     max_module_chars: int = Field(default=DEFAULT_MODULE_CHARS, ge=5_000, le=400_000)
-    profile: str = Field(default="sysml", pattern="^(sysml|exhaustive)$")  # see pipeline.PROFILES
+    profile: str = Field(default="sysml", pattern="^(sysml|exhaustive|bspec)$")  # bspec: the compact system document
+    modules: list[str] = Field(default_factory=list)  # bspec: folders inside the repo to read (default every folder)
     followup: bool = True  # exhaustive profile only
     entries: list[str] = Field(default_factory=list)  # extra entry-point globs for dead-code detection
     assets: bool = True  # include prompts, templates, reference files and CI/CD
@@ -228,6 +229,20 @@ class RunManager:
             logger.info("run %s: %s (%s)", run_id, repo, label)
             # The budget sits below the cache, so answers for unchanged code stay free after the cap.
             llm = with_cache(with_budget(llm, req.max_cost), label, enabled=req.cache, path=self.cache_path)
+            if req.profile == "bspec":  # the compact behaviour spec and its system document, instead of requirements
+                from ..bspec import run as run_bspec
+                progress("bspec", 0, 0)
+                got = run_bspec(repo, out_dir, llm, label, [m for m in req.modules if m.strip()] or None,
+                                workers=req.workers)
+                size = got["size"]
+                meta["summary"] = {"bspec": True, "modules": len(got["modules"]), "lines": size["lines"],
+                                   "chars": size["chars"], "rules": size["rules"], "issues": size["issues"],
+                                   "uncovered_exits": size["uncovered_exits"], "lint_hits": size["lint_hits"],
+                                   "not_extracted": got["not_extracted"],
+                                   "cost_usd": (got.get("usage") or {}).get("cost_usd")}
+                progress("done", 0, 0)
+                meta["status"] = "done"
+                return
             # the design needs only the source: it is read while the requirements are written, and joined after
             from ..design import load_libraries, read_design, supported, write_design
             load_libraries()  # before a second thread imports them
@@ -501,6 +516,31 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
             raise HTTPException(404, "this run has no system design: its code is in a language the design reader "
                                      "does not handle yet, or it ran before the design existed")
         return FileResponse(path, filename=f"system-design-{run_id}.{ext}")
+
+    @app.get("/api/runs/{run_id}/bspec/{name}")
+    def bspec_file(run_id: str, name: str) -> Response:
+        """A bspec run's outputs: the system document, the review and size reports, or spec_and_sysml.zip."""
+        out = mgr._dir(run_id)
+        if name == "spec_and_sysml.zip":
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for sub in ("spec", "sysml"):
+                    for f in sorted(os.listdir(os.path.join(out, sub))) if os.path.isdir(os.path.join(out, sub)) else []:
+                        z.write(os.path.join(out, sub, f), f"{sub}/{f}")
+                for f in ("system_doc.md", "review.md", "size_report.md", "LEGEND.md"):
+                    if os.path.isfile(os.path.join(out, f)):
+                        z.write(os.path.join(out, f), f)
+            return Response(buf.getvalue(), media_type="application/zip",
+                            headers={"Content-Disposition": f'attachment; filename="bspec-{run_id}.zip"'})
+        if name not in ("system_doc.md", "review.md", "size_report.md"):
+            raise HTTPException(404, "system_doc.md, review.md, size_report.md or spec_and_sysml.zip")
+        path = os.path.join(out, name)
+        if not os.path.isfile(path):
+            raise HTTPException(404, "this run has no " + name)
+        with open(path, encoding="utf-8") as f:
+            return Response(f.read(), media_type="text/markdown; charset=utf-8")
 
     @app.get("/api/runs/{run_id}/model.kpar")
     def model_kpar(run_id: str) -> FileResponse:

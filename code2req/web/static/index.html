@@ -221,6 +221,13 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
   <a class="btn" id="kparBtn" aria-disabled="true" title="The model itself, checked against the code: in SysModeler, Import project (.kpar)">Model (.kpar)</a>
 </header>
 <div class="options" id="options" hidden>
+  <label for="mode">What to make
+    <select class="field" id="mode">
+      <option value="bspec">Compact system document (bspec)</option>
+      <option value="sysml">Requirements + system design</option>
+    </select></label>
+  <label class="grow" for="modules">Folders inside the repo (comma-separated; bspec only, empty = every folder)
+    <input class="field" id="modules" placeholder="app/services/credits, app/api/auth"></label>
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
     <input class="field" id="exclude" placeholder="*_test.go, migrations/*"></label>
   <label for="workers">Parallel modules
@@ -387,6 +394,8 @@ $("#runForm").onsubmit = async e => {
     cache: $("#cache").checked,
     keep_clone: $("#keepClone").checked,
     max_cost: +$("#maxCost").value > 0 ? +$("#maxCost").value : null,
+    profile: $("#mode").value,
+    modules: $("#modules").value.split(",").map(s => s.trim()).filter(Boolean),
   };
   $("#runBtn").disabled = true;
   try {
@@ -401,7 +410,7 @@ $("#runForm").onsubmit = async e => {
 
 async function openRun(id) {
   clearInterval(S.poll);
-  Object.assign(S, { runId: id, run: null, result: null, reviews: {}, sel: null, log: [], logNext: 0, src: new Map() });
+  Object.assign(S, { runId: id, run: null, result: null, doc: null, review: null, docTab: "doc", reviews: {}, sel: null, log: [], logNext: 0, src: new Map() });
   $("#runSelect").value = id;
   await refresh();
   if (S.run && ACTIVE.includes(S.run.status)) S.poll = setInterval(refresh, 1500);
@@ -414,7 +423,16 @@ async function refresh() {
     const lg = await api(`/api/runs/${id}/log?since=${S.logNext}`);
     S.log.push(...lg.lines); S.logNext = lg.next;
   } catch (err) { $("#status").innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
-  if (S.run.status === "done") {
+  if (S.run.status === "done" && S.run.summary?.bspec) {
+    clearInterval(S.poll);
+    if (!S.doc) {
+      const r = await fetch(`/api/runs/${id}/bspec/system_doc.md`);
+      S.doc = r.ok ? await r.text() : "(no system document)";
+      const v = await fetch(`/api/runs/${id}/bspec/review.md`);
+      S.review = v.ok ? await v.text() : "";
+      loadRuns();
+    }
+  } else if (S.run.status === "done") {
     clearInterval(S.poll);
     if (!S.result) {
       [S.result, S.reviews] = await Promise.all([api(`/api/runs/${id}/result`), api(`/api/runs/${id}/reviews`)]);
@@ -432,7 +450,7 @@ function render() {
                              ["#designTxtBtn", "system_design.txt"], ["#designPdfBtn", "system_design.pdf"],
                              ["#kparBtn", "model.kpar"]]) {
     const exp = $(btn);
-    const ready = S.run?.status === "done" && (!/^(system_design|model\.kpar)/.test(path) || S.run?.design);
+    const ready = S.run?.status === "done" && !S.run?.summary?.bspec && (!/^(system_design|model\.kpar)/.test(path) || S.run?.design);
     if (ready) { exp.href = `/api/runs/${S.runId}/${path}`; exp.setAttribute("aria-disabled", "false"); }
     else { exp.removeAttribute("href"); exp.setAttribute("aria-disabled", "true"); }
   }
@@ -443,8 +461,45 @@ function render() {
   if (S.run?.status === "stopping") sb.textContent = "Stopping…";
   else if (stopArmed !== S.runId) sb.textContent = "Stop run";
   if (!S.run) return;
-  if (S.run.status === "done" && S.result) renderWorkspace();
+  if (S.run.status === "done" && S.run.summary?.bspec && S.doc !== null) renderDoc();
+  else if (S.run.status === "done" && S.result) renderWorkspace();
   else renderRun();
+}
+
+/* ---------- bspec: the system document ---------- */
+function md(text) {  // the few Markdown forms the document uses: headings, lists (nested by indent), tables, paragraphs
+  const out = [], lines = (text || "").split("\n");
+  let para = [];
+  const flush = () => { if (para.length) { out.push(`<p>${inline(para.join(" "))}</p>`); para = []; } };
+  const inline = t => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i], h = ln.match(/^(#{1,4})\s+(.*)$/), li = ln.match(/^(\s*)(?:[-*]|\d+\.)\s+(.*)$/);
+    if (h) { flush(); out.push(`<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`); }
+    else if (li) { flush(); out.push(`<div class="li" style="margin-left:${li[1].length * 0.6 + 0.4}em">${inline(ln.trim())}</div>`); }
+    else if (/^\|/.test(ln)) { flush(); if (!/^\|[-\s|]+\|$/.test(ln)) out.push(`<div class="li mono">${inline(ln)}</div>`); }
+    else if (!ln.trim()) flush();
+    else para.push(ln.trim());
+  }
+  flush();
+  return out.join("");
+}
+
+function renderDoc() {
+  const s = S.run.summary, id = S.runId;
+  const cost = s.cost_usd != null ? ` · $${s.cost_usd.toFixed(4)}` : "";
+  const warn = s.not_extracted?.length ? ` · <span class="err">not extracted: ${esc(s.not_extracted.join(", "))}</span>` : "";
+  const tab = (k, label) => `<button class="btn ${S.docTab === k ? "primary" : ""}" type="button" data-tab="${k}">${label}</button>`;
+  $("#body").innerHTML = `<section class="run" style="overflow:auto">
+    <div>${s.modules} module(s) · ${s.lines} spec lines · ${s.rules} rules · ${s.issues} open issues ·
+      <b>${s.uncovered_exits}</b> uncovered exits · <b>${s.lint_hits}</b> lint hits${cost}${warn}</div>
+    <div style="display:flex; gap:.5em; flex-wrap:wrap; margin:.6em 0">
+      ${tab("doc", "System document")} ${tab("review", "Review")}
+      <a class="btn" href="/api/runs/${id}/bspec/system_doc.md" download="system_doc-${id}.md">Download system_doc.md</a>
+      <a class="btn" href="/api/runs/${id}/bspec/spec_and_sysml.zip">Download spec + SysML (.zip)</a>
+    </div>
+    <article class="doc" style="max-width:60em; line-height:1.5">${md(S.docTab === "review" ? S.review : S.doc)}</article>
+  </section>`;
+  $("#body").querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { S.docTab = b.dataset.tab; renderDoc(); });
 }
 
 function renderStatus() {
