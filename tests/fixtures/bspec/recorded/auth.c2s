@@ -1,0 +1,26 @@
+auth  @app/api/auth
+  when  serves signup, login, token refresh and password endpoints
+  rule body  JSON body decodes  !err -> 400  ~httputil.DecodeJSONBody
+  rule guard(action, data, ip)  action is allowed  !err -> fail  ~userSvc.IsActionAllowed
+  rule verifyOTP(email, otpId, otp, purpose)  OTP verified  !err -> fail  ~userSvc.VerifyOTP
+  POST /auth/login/credentials {email,password} -> 200  body; ip = clientIP; guard(login, {email}, ip) !err -> fail; sign in !err -> fail  @credentials.go:17-44
+  POST /auth/login/google {access_token} -> 200  body; oauth google login !err -> fail  @:47-58
+  POST /auth/signup {email,name,password,otp_id,otp} -> 201  body; ip = clientIP; guard(signup, {email}, ip) !err -> fail; verifyOTP(email, otp_id, otp, signup) !err -> fail; sign up !err -> fail  @:61-86
+  POST /auth/token/refresh {refresh_token} -> 200  body; refresh token !err -> fail  @:89-101
+  PUT /auth/password/reset {email,otp_id,otp,new_password,confirm_password} -> 200  body; ip = clientIP; guard(passReset, {email}, ip) !err -> fail; verifyOTP(email, otp_id, otp, passwordReset) !err -> fail; set password !err -> fail; get user by email !err -> fail; create login response !err -> fail  @password.go:17-51
+  POST /auth/verification-otps/request {email,purpose,user_id} -> 201  body; no email or bad purpose -> 400; ip = clientIP; guard(sendOTP, {email,purpose}, ip) !err -> fail; send OTP !err -> fail  @verification.go:17-56
+  clientIP(r) -> ip  @helpers.go:9-22
+    X-Forwarded-For header present -> return first part
+    X-Real-IP header present -> return it
+    parse RemoteAddr -> return addr
+    return host
+  BearerToken(r) -> token  @:25-31
+    Authorization header starts with "bearer " -> return trimmed after prefix
+    return ""
+  ? [missing-guard] @credentials.go:47 no userSvc.IsActionAllowed, which 4 siblings call
+  ? [ignored-result] @:70 first result of userSvc.IsActionAllowed discarded; 1 other caller(s) check it
+  ? [missing-guard] @:89 no userSvc.IsActionAllowed, which 4 siblings call
+  ? [security] @helpers.go:10 client-supplied IP header trusted
+  ? [security] @:14 client-supplied IP header trusted
+  ? [ignored-result] @password.go:24 first result of userSvc.IsActionAllowed discarded; 1 other caller(s) check it
+  ? [ignored-result] @verification.go:35 first result of userSvc.IsActionAllowed discarded; 1 other caller(s) check it

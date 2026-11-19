@@ -328,7 +328,32 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
     b.add_argument("-v", "--verbose", action="store_true")
 
+    bs = sub.add_parser("bspec", help="write the compact behaviour spec (spec/*.c2s), its SysML (sysml/), review.md and "
+                                      "size_report: one model step per module, checked against the code")
+    bs.add_argument("target", nargs="?", help="repo folder (git URL not supported here)")
+    bs.add_argument("--out", default="bspec-out")
+    bs.add_argument("--module", action="append", metavar="FOLDER",
+                    help="extract only this folder (repo-relative) or module name (repeatable; default every folder)")
+    bs.add_argument("--from-spec", metavar="DIR", help="no model: rebuild sysml/ and the reports from the .c2s files "
+                                                       "in DIR (with TARGET, the checks run against its code too)")
+    bs.add_argument("--compare", metavar="JSON", help="an earlier run's requirements.json to compare sizes with")
+    bs.add_argument("--rounds", type=int, default=3, help="model rounds per module, the first and its repairs (default 3)")
+    bs.add_argument("--workers", type=int, default=4)
+    bs.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model (default DeepSeek)")
+    bs.add_argument("--max-cost", type=float, default=6.0, metavar="USD", help="stop paid model calls at this cost (default 6)")
+    bs.add_argument("--no-cache", action="store_true")
+    bs.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
+    bs.add_argument("-v", "--verbose", action="store_true")
+
     args = p.parse_args(argv)
+    if args.cmd == "bspec" and args.from_spec:  # no model needed
+        from code2req.bspec import from_spec
+        total = from_spec(args.from_spec, args.out, args.target, args.compare)
+        print(f"wrote {args.out}: {total['lines']} spec lines, {total['chars']} chars, "
+              f"{total['uncovered_exits']} uncovered exit(s), {total['lint_hits']} lint hit(s)")
+        return 0
+    if args.cmd == "bspec" and not (args.target and os.path.isdir(args.target)):
+        p.error("bspec needs a repo folder (or --from-spec DIR)")
     if args.cmd == "eval" and not args.sysml and not args.baseline:
         p.error("eval needs --baseline (or --sysml)")
     setup_logging(args.verbose)
@@ -369,6 +394,23 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         p.error(str(e))
     logging.getLogger("code2req").info("llm: %s", label)
+
+    if args.cmd == "bspec":
+        from code2req.bspec import run as run_bspec
+        try:
+            summary = run_bspec(args.target, args.out, with_cache(with_budget(llm, args.max_cost), label,
+                                                                  enabled=not args.no_cache),
+                                label, args.module, args.rounds, args.workers, args.compare)
+        except ValueError as e:
+            p.error(str(e))
+        s = summary["size"]
+        print(f"wrote {args.out}: {len(summary['modules'])} module(s), {s['lines']} spec lines, {s['chars']} chars, "
+              f"{s['rules']} rules, {s['uncovered_exits']} uncovered exit(s), {s['lint_hits']} lint hit(s)"
+              + (f"; not extracted: {', '.join(summary['not_extracted'])}" if summary["not_extracted"] else ""))
+        cost = (summary.get("usage") or {}).get("cost_usd")
+        if cost is not None:
+            print(f"cost: ${cost:.4f}")
+        return 0
 
     if args.cmd == "design":
         with open(os.path.join(args.run, "requirements.json"), encoding="utf-8") as f:

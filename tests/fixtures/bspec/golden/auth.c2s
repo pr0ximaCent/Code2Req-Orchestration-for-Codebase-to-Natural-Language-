@@ -1,0 +1,14 @@
+auth  @app/api/auth
+  rule body  JSON body decodes  !err -> 400  ~httputil.DecodeJSONBody
+  rule guard(action)  action allowed for (email, ip)  !err -> fail  ~userSvc.IsActionAllowed  ? [unnamed-check] @credentials.go:26 what it checks -> app/domains/user/
+  rule otp(purpose)  otp matches unexpired (email, otpId, purpose)  !err -> fail  ~userSvc.VerifyOTP
+  POST /auth/login/credentials {email,password} -> 200  body; guard(login); sign in !err -> fail  @credentials.go:17-44
+  POST /auth/login/google {access_token} -> 200  body; google login !err -> fail  @:47-58  ? [missing-guard] @:47 no action guard
+  POST /auth/signup {email,name,password,otp_id,otp} -> 201  body; guard(signup); otp(signup); create user !err -> fail  @:61-86  ? [ignored-result] @:70 allowed=false not rejected
+  POST /auth/token/refresh {refresh_token} -> 200  body; issue tokens !err -> fail  @:89-101  ? [missing-guard] @:89 no action guard
+  PUT /auth/password/reset {email,otp_id,otp,new_password,confirm_password} -> 200  body; guard(reset); otp(reset); set password !err -> fail; user = by email !err -> fail; login response !err -> fail  @password.go:17-51  ? [ignored-result] @:24 allowed=false not rejected
+  POST /auth/verification-otps/request {email,purpose} -> 201  body; email=="" or bad purpose -> 400; guard(send-otp); otpId = send otp !err -> fail  @verification.go:17-56  ? [ignored-result] @:35 allowed=false not rejected
+  clientIp = XFF[0] ?? X-Real-IP ?? addr(RemoteAddr) ?? RemoteAddr  @helpers.go:9-22  ? [security] @:10 X-Forwarded-For is client-set, spoofable
+  bearerToken = no "bearer " prefix -> ""; header[7:]  @:25-31
+  ? [security] @helpers.go:14 X-Real-IP is client-set too
+  ? [dead-code] @password.go:17 confirm_password never compared
