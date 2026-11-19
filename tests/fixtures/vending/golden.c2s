@@ -2,7 +2,7 @@ system VendingMachine                                            @code/vending/
   actor Customer, Operator
   part CoinSlot, Shelves, SlotMotor, Controller, TempSensor
   item Coin {value}
-  cfg coins = {5,10,25} cents, tempRange = 2..8 °C, motorTries = 3
+  cfg coins = {5,10,25} cents, tempRange = 2..8 °C, motorTries = 3, slots = {price cents, stock} per slot
   req VM-1 accept only coins in coins; push any other coin back
   req VM-2 add each accepted coin to the credit
   req VM-3 sell a slot only if credit >= price(slot) and stock(slot) > 0; otherwise sell nothing and keep the credit
@@ -23,9 +23,9 @@ system VendingMachine                                            @code/vending/
     Idle -(temp outside tempRange)-> OutOfService
     Credited -(temp outside tempRange / returnCredit)-> OutOfService
     OutOfService -(temp in tempRange)-> Idle
-  usecase BuyItem: Customer -> insertCoin+, select, collect item, collect change
-  usecase CancelPurchase: Customer -> insertCoin+, cancel, collect credit
-  usecase Restock: Operator -> open, refill, close
+  usecase BuyItem: Customer -> insertCoin+, select, [doc-only] collect item, [doc-only] collect change
+  usecase CancelPurchase: Customer -> insertCoin+, cancel, [doc-only] collect credit
+  usecase Restock: Operator -> [doc-only] open, refill, [doc-only] close
   omit eventLogEncoding: serialization
   omit moneyFormat: formatting
   omit motorPause: implementation
