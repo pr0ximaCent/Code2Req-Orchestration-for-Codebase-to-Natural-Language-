@@ -147,6 +147,57 @@ def check(spec: Spec, m: Module, facts: ModuleFacts, repo: RepoFacts) -> Result:
                 if s.ref in rules and s.exit is not None and s.exit.default:
                     res.lint.append(f"{o.name}: `{s.text}!` marks a rule, whose failing the default already covers; "
                                     f"drop the `!`")
+    # state the module keeps: one `state` line each
+    named = {n for n, _ in m.state}
+    for var, rel, line, what in facts.state:
+        if var not in named:
+            res.lint.append(f"missing `state {var}  <what it holds>` ({os.path.basename(rel)}:{line} keeps {what[:40]})")
+    # the reason a code comment gives: a `#` on the operation that traces that function
+    for fn_name, rel, line in facts.commented:
+        if any(h == fn_name for h, _ in facts.folds):
+            continue
+        ops = [o for o in m.ops if o.at and o.at.file == rel and o.at.start <= line + 1 <= o.at.end + 1]
+        if ops and not any(o.rationale or any(x.rationale for x in walk(o.steps)) for o in ops):
+            res.lint.append(f"{ops[0].name}: the comment above {fn_name} ({os.path.basename(rel)}:{line - 1}) says why; "
+                            f"keep it as `# <reason>` on the operation or its step")
+    # not too small: what a function does (state it writes, functions it calls) must be in its operation's steps
+    for fn_name, rel, line, kind, target in facts.effects:
+        ops = [o for o in m.ops if o.at and o.at.file == rel and o.at.start <= line <= o.at.end]
+        if not ops:
+            continue
+        said = " ".join(x.text + " " + x.ref + " " + x.cond + " " + (x.exit.cond if x.exit else "") + " " + x.loop
+                        for o in ops for x in walk(o.steps)).lower()
+        said_words = set(re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", said)))
+        state_said = {n.lower() for n, _ in m.state if n.lower() in said.replace(" ", "")}
+        keys = [w for w in re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", target.split(".")[-1]).lower())
+                if len(w) > 2 and w not in ("get", "set", "the", "for", "and", "locked")]
+        hit = target.split(".")[-1].lower() in said.replace(" ", "") or target.lower() in state_said or \
+            (keys and sum(k in said_words or k.rstrip("s") in said_words for k in keys) * 2 >= len(keys))
+        if not hit:
+            what = f"writes {target}" if kind == "write" else f"calls {target}"
+            res.lint.append(f"{ops[0].name}: a step is missing: {fn_name} {what} ({os.path.basename(rel)}:{line}); "
+                            f"say it in a few plain words")
+    # a folded helper's behaviour must be said in its caller
+    by_name = {o.name: o for o in m.ops}
+    for helper, into in facts.folds:
+        caller = by_name.get(into) or by_name.get(into.split(".")[-1])
+        if caller is None:
+            continue
+        said = " ".join(x.text + " " + (x.exit.cond if x.exit else "") + " " + x.cond for x in walk(caller.steps)).lower()
+        keys = [w for w in re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", helper).lower())
+                if w not in ("locked", "get", "set", "do", "make", "the", "of", "to", "from")]
+        if keys and not any(k in said for k in keys):
+            res.lint.append(f"{caller.name}: {helper} is folded into it; say what it does in a step "
+                            f"({' '.join(keys)})")
+    # a branch that goes on is `if X:` with indented steps, not a dangling `X:` or a bare condition
+    for o in m.ops:
+        for x in walk(o.steps):
+            if x.text and not x.loop and (x.text.endswith(":") or re.fullmatch(r"[\w ]{1,30}\.", x.text)) and not x.exit:
+                res.lint.append(f"{o.name}: {x.text!r} is a branch: write `if <condition>:` and indent its steps")
+            if x.text and re.search(r"\s=\s", x.text):
+                res.lint.append(f"{o.name}: {x.text!r} assigns inside a step; write `name = what` as the step, or plain words")
+            if x.cond and CODE_COPY.search(x.cond):
+                res.lint.append(f"{o.name}: `if {x.cond}:` is code; write the condition in plain words")
     fns = {RepoFacts.fn_name(f): f for f in facts.fns}
     for helper, into in facts.folds:
         f = fns.get(helper)
@@ -174,7 +225,10 @@ def explicit_exits(op: Op, rules: dict[str, Rule] | None = None) -> list[Stated]
     """The exits an operation states, in order. An exit written on a rule's application restates the rule's
     own exit (or the default) and is not counted again."""
     out = []
+    inside = {id(c) for b in walk(op.steps) if b.cond or b.otherwise for c in walk(b.children)}
     for s in walk(op.steps):
+        if s.returns and s.exit is None and id(s) in inside:  # a return in an `if` block ends the operation early
+            out.append(Stated(s.at.start if s.at else 0, f"return {s.text}".strip(), False, (), "guard"))
         if s.exit is not None and not (rules and s.ref in rules):
             out.append(Stated(s.at.start if s.at else 0, f"{s.text}!" if s.exit.default else
                               f"{s.exit.cond} -> {', '.join(s.exit.actions)}", s.exit.default, tuple(s.exit.actions),

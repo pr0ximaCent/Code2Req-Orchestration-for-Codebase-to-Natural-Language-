@@ -18,7 +18,7 @@ from .notation import CATEGORIES, LEGEND, Spec, SpecError, format_module, parse
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "8"
+PROMPT_VERSION = "11"
 
 SYSTEM = LEGEND + """
 You write the behaviour spec of ONE module of a codebase in this notation, from its code. The spec is turned
@@ -48,7 +48,12 @@ Write:
   listed `(differs)` get their own `!err -> ...` or `cond -> ...`. A rule needs no exit of its own when the
   default applies to it. Returns listed under PASS-UP are the function's normal end: write no exit for them.
 - FOLDS: a helper listed there has one caller, no exits and no effects: never give it a line of its own; say
-  what it does inside its caller's step (`t = transcript of msgs, each turn truncated`). `->` always ends the operation: a conditional step that does not
+  what it does inside its caller's step (`t = transcript of msgs, each turn truncated`; `credits in flight = the
+  cost of every unfinished message, in credits`).
+- STATE: write one `state <name>  <what it holds>` line for each variable listed under STATE, in plain words
+  (`state userCreditCache  each user's balance and when it expires`).
+- REASONS: for each function listed under COMMENTED, keep the reason its comment gives as `# <reason>` on the
+  line of the operation (or the step) it explains, in a few words (`# fails closed: no balance, no run`). `->` always ends the operation: a conditional step that does not
   end it is written `write ai line if text`, never `text -> write ai line`.
 - Open issues as `? [category] @file:line <short text> [-> package/]`: a possible bug or gap (a sibling
   endpoint missing a guard the others have, a result ignored, an off-by-one, bytes vs characters, a
@@ -63,7 +68,8 @@ WRITE PLAIN WORDS, NEVER CODE. The spec becomes a system document engineers read
 Steps, conditions and actions are short plain phrases: no dotted names (h.svc, req.Email), no operators (==, !=,
 <=, &&, ||), no brackets, braces or call syntax, no nil/null. Leave out locking, logging details, copying and
 formatting: they are not behaviour. Name things by what they are (the cached balance, the message's usage).
-A conditional step that does not end the operation is `step if condition`. Put `!err -> ...` on the SAME line as
+A conditional step that does not end the operation is `step if condition`; several steps that run only when
+something holds are a block: `if condition:` with the steps indented below, then optionally `else:` with its own. Put `!err -> ...` on the SAME line as
 its step. Applying a rule by name (`guard(signup)`) and calling an operation by name are fine.
   code:  res = h.userSvc.SignIn(r.Context(), req.Email, req.Password)    plain:  sign in!
   code:  cacheMutex.Lock(); cached, ok := cache[userID]; unlock           plain:  read the cached balance
@@ -78,12 +84,17 @@ orders  @app/api/orders
   !err -> fail
   rule auth(role)  caller has role  !err -> 403  ~authz.Require  ? [unresolved] @handler.go:24 roles not read -> app/authz/
   rule body  JSON body decodes  !err -> 400  ~httputil.Decode  ? [unresolved] @handler.go:21 decoding not read -> app/core/httputil/
+  state openCarts  each user's cart until checkout
   POST /orders {items,coupon} -> 201  body; auth(buyer); more than maxItems items -> 422; total = price(items); save order!  @handler.go:20-48
   DELETE /orders/{id} -> 204  auth(admin); cancel order!  @:51-63  ? [missing-guard] @:51 no owner check
   price(items) -> total  @pricing.go:10-31
     each i in items:
       add quantity times unit price
     no coupon -> return total
+    if the buyer is new:
+      add the welcome discount
+    else:
+      add loyalty points
     look up the coupon !err -> return total  # an unknown coupon is ignored, not an error
     return total less the coupon rate
   region = X-Region header ?? defaultRegion  @helpers.go:5-12
@@ -92,7 +103,12 @@ orders  @app/api/orders
 
 Answer with the spec only, in one ```c2s block."""
 
-KEYWORD = re.compile(r"^(\s*)(?:fn|func|def|cond|if|call|step)\s+(?=\S)")
+KEYWORD = re.compile(r"^(\s*)(?:fn|func|def|cond|call|step|if(?=\s.*[^:\s]\s*$))\s+(?=\S)")  # `if X:` is a block
+
+
+LOCK_ONLY = re.compile(r"(?i)^\s{4,}(?:(?:un)?lock\w*(?:\(\))?|defer\b.*|(?:acquire|release|take|hold|lock|unlock)\b"
+                       r"[\w\s']*\b(?:lock|mutex)\b.*|(?:un)?lock the \w+(?: \w+)?)\s*$")  # a step that only locks
+LOCK_OP = re.compile(r"(?i)^\s{2}(?:un)?lock\w*\s*(?:\([^)]*\))?\s*=.*$")  # a helper that only locks
 
 
 def normalize(text: str) -> str:
@@ -100,6 +116,8 @@ def normalize(text: str) -> str:
     (fn, cond, call), an exit or trace on a line of its own (joined to the line above), issue text in <...>."""
     out: list[str] = []
     for raw in text.splitlines():
+        if LOCK_ONLY.match(raw) or LOCK_OP.match(raw):  # locking is how the code is safe, not behaviour: dropped
+            continue
         line = KEYWORD.sub(r"\1", raw.rstrip())
         line = re.sub(r"(=\s*)call\s+", r"\1", line)
         body = line.strip()
@@ -165,6 +183,12 @@ def user_prompt(repo: RepoFacts, mf: ModuleFacts, label: str) -> str:
             by_fn.setdefault(f"{e.fn} ({os.path.basename(e.file)})", []).append(
                 f"{e.line}" + (f" after {e.owner}" if e.owner else "") + tag)
         out += [f"  {fn}: {', '.join(xs)}" for fn, xs in by_fn.items()]
+    if mf.state:
+        out.append("STATE (kept between calls; one `state` line each): "
+                   + ", ".join(f"{v} ({os.path.basename(f)}:{n})" for v, f, n, _ in mf.state))
+    if mf.commented:
+        out.append("COMMENTED (keep the comment's reason as `# ...`): "
+                   + ", ".join(f"{fn} {os.path.basename(f)}:{n}" for fn, f, n in mf.commented))
     if mf.passups:
         out.append("PASS-UP (a final `return ..., err`; implicit, no exit): "
                    + ", ".join(f"{fn} {os.path.basename(f)}:{n}" for f, n, fn in mf.passups))

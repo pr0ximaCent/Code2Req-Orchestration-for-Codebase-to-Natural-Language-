@@ -88,6 +88,8 @@ class ModuleWriter:
         for k, v in sorted(m.def_args):
             out.append(f"{IND}:>> {camel(k)} = {literal(v)};")
         names = Names({camel(k) for k, _ in m.def_args})
+        for n, t in sorted(m.state):  # what the module keeps between calls
+            out.append(f"{IND}attribute {names(camel(n))} {{ doc /* {comment('state: ' + t)} */ }}")
         for c in sorted(m.cfg, key=lambda c: c.key):
             names(camel(c.key))
             out.append(IND + cfg_line(c))
@@ -187,7 +189,24 @@ class Flow:
         name = self.names(ident("exit " + " ".join(actions), 5))
         return name, f"action {name} {{ doc /* {comment(', '.join(actions))} */ }}"
 
+    def branch(self, s: Step) -> tuple[str, list[str]]:
+        """An `if cond:` block (and its `else:`) as a nested action: a decide on the condition's guard, each branch an
+        action whose own body is its steps. An exit inside a branch ends that branch's action."""
+        name = self.names(ident("if " + s.cond, 5))
+        g = self.guard(s.cond)
+        els = self.elses.get(id(s))
+        out = [f"action {name} {{", f"{IND}doc /* {comment('if ' + s.cond)} */", f"{IND}first start;", f"{IND}then decide;",
+               f"{IND * 2}if {g} then yes;", f"{IND * 2}else {'no' if els is not None else 'done'};"]
+        for label, steps in [("yes", s.children)] + ([("no", els.children)] if els is not None else []):
+            inner = Flow(self.w, self.op, Names())
+            body = inner.body(steps)
+            out += [f"{IND}action {label} {{"] + [IND * 2 + ln for ln in inner.guards() + body] + [f"{IND}}}", f"{IND}then done;"]
+        out.append("}")
+        return name, out
+
     def step_node(self, s: Step) -> tuple[str, list[str]]:
+        if s.cond:
+            return self.branch(s)
         if s.text or s.assign or s.loop or s.returns:
             return self.node(s)
         name = self.names(ident("check " + s.exit.cond, 5) if s.exit else "step")  # a bare `cond -> actions`
@@ -199,6 +218,11 @@ class Flow:
         lines: list[str] = ["first start;"]
         attach = "then "  # how the next node joins: a succession from the last line, or "" as a decide's target
         ready = None  # the next step's node, named when a decide pointed at it
+        self.elses = getattr(self, "elses", {})
+        for a, b in zip(steps, steps[1:]):  # an `else:` belongs to the `if` before it
+            if a.cond and b.otherwise:
+                self.elses[id(a)] = b
+        steps = [x for x in steps if not x.otherwise]
         for i, s in enumerate(steps):
             last = i + 1 == len(steps)
             if s.fallback:

@@ -13,7 +13,7 @@ METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 # what an open issue may be tagged with: what kind of problem the code shows
 CATEGORIES = ("missing-guard", "ignored-result", "unused-input", "duplicated-constant", "mixed-result", "unresolved",
               "boundary", "unnamed-check", "encoding", "inconsistency", "security", "off-by-one", "error-handling",
-              "dead-code", "other")
+              "dead-code", "race", "stale-fallback", "other")
 # calls a step may make without the spec defining them
 BUILTINS = {"len", "trim", "lower", "upper", "join", "split", "min", "max", "int", "str", "names", "sort",
             "count", "now", "hash", "uuid", "format", "parse", "fail", "return"}
@@ -41,6 +41,8 @@ One line per distinct behaviour. Indentation (2 spaces) is nesting. `@` traces a
 | `step!` | The step can fail, handled by the module default |
 | `ruleName`, `ruleName(arg)` | Applies a shared rule |
 | `each v !in X, filter:` + indented steps | Loop |
+| `if <cond>:` + indented steps, then `else:` + indented steps | Branch that goes on (no exit) |
+| `state name  <what it holds>` | State the module keeps between calls |
 | `a ?? b ?? c` | Fallback chain: the first that holds |
 | `return x` | Normal exit with a value |
 | `@file:lines`, `@:lines` | Trace (`@:` = the file of the last trace) |
@@ -99,6 +101,8 @@ class Step:
     args: list[str] = field(default_factory=list)
     exit: Exit | None = None
     loop: str = ""  # an each step: its header
+    cond: str = ""  # an `if cond:` block: its condition (children are the steps it runs)
+    otherwise: bool = False  # an `else:` block, after an `if` block
     children: list[Step] = field(default_factory=list)
     fallback: list[str] = field(default_factory=list)
     returns: bool = False
@@ -160,6 +164,7 @@ class Module:
     def_args: list[tuple[str, str]] = field(default_factory=list)  # (attribute, value); a flag's value is "true"
     when: list[str] = field(default_factory=list)
     default: Exit | None = None  # the module's `!err -> actions` line
+    state: list[tuple[str, str]] = field(default_factory=list)  # (name, what it holds)
     cfg: list[Cfg] = field(default_factory=list)
     rules: list[Rule] = field(default_factory=list)
     ops: list[Op] = field(default_factory=list)
@@ -322,6 +327,13 @@ class Parser:
         text = text.strip()
         if not text:
             raise self.err(line, "empty step")
+        if text == "else:":
+            s.otherwise = True
+            return s
+        m = re.match(r"if\s+(.+?):$", text)
+        if m:
+            s.cond = m.group(1).strip()
+            return s
         m = re.match(r"each\s+(.+?):\s*(.*)$", text)
         if m:
             s.loop = m.group(1).strip()
@@ -397,6 +409,12 @@ class Parser:
         rest = rest.strip()
         if word == "when":
             m.when.append(rest)
+            return None
+        if word == "state":
+            st = re.match(r"([A-Za-z_]\w*)\s+(.+)$", rest)
+            if st is None:
+                raise self.err(line, f"state wants a name and what it holds: {body!r}")
+            m.state.append((st.group(1), st.group(2).strip()))
             return None
         if word == "cfg":
             for kv in split_top(rest, ","):
@@ -541,7 +559,7 @@ class Parser:
             for s in new:
                 s.at = s.at or at
             (parent.steps if isinstance(parent, Op) else parent.children).extend(new)
-            if len(new) == 1 and new[0].loop:
+            if len(new) == 1 and (new[0].loop or new[0].cond or new[0].otherwise):
                 stack.append((depth, new[0]))
 
     def resolve(self) -> None:
@@ -624,6 +642,10 @@ def parse(files: dict[str, str], known: set[str] | None = None) -> Spec:
 def step_text(s: Step) -> str:
     if s.loop:
         return f"each {s.loop}:"
+    if s.cond:
+        return f"if {s.cond}:"
+    if s.otherwise:
+        return "else:"
     out = (f"{s.assign} = " if s.assign else "") + ("return " if s.returns else "") + s.text
     out = out.strip()
     if s.exit and s.exit.default:
@@ -666,6 +688,7 @@ def format_module(m: Module, defs: dict[str, Def] | None = None) -> str:
     lines += [f"  when  {w}" for w in m.when]
     if m.cfg:
         lines.append("  cfg   " + ", ".join(f"{c.key}={c.raw}" for c in m.cfg))
+    lines += [f"  state {n}  {t}" for n, t in m.state]
     if m.default:
         lines.append("  !err -> " + ", ".join(m.default.actions))
     for r in m.rules:

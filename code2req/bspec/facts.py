@@ -86,6 +86,9 @@ class ModuleFacts:
     folds: list[tuple[str, str]] = field(default_factory=list)  # (helper, the operation it folds into)
     passups: list[tuple[str, int, str]] = field(default_factory=list)  # (file, line, fn): `return ..., err` ending a fn
     default_handling: str = ""  # the handling most error exits share, when 2+ do
+    state: list[tuple[str, str, int, str]] = field(default_factory=list)  # (var, file, line, type or value): kept between calls
+    commented: list[tuple[str, str, int]] = field(default_factory=list)  # (fn, file, line): a function a comment explains
+    effects: list[tuple[str, str, int, str, str]] = field(default_factory=list)  # (fn, file, line, kind, target)
     default_count: int = 0
     source_hash: str = ""
 
@@ -177,7 +180,10 @@ class RepoFacts:
             top = max(sorted(set(errs)), key=errs.count)
             if errs.count(top) >= 2:
                 mf.default_handling, mf.default_count = top, errs.count(top)
+        mf.state = self.state_vars(mf)
+        mf.commented = self.commented(mf)
         mf.folds = self.folds(mf)
+        mf.effects = self.effects(mf)
         mf.passups = self.passups(mf)
         mf.suspects = self.suspects(mf)
         mf.contracts = self.contracts_of(d)
@@ -262,6 +268,7 @@ class RepoFacts:
             rel, line = rf.lines[0]
             out.append(("unresolved", rel, line, f"{rf.callee} is not in this module; what it checks is not read"))
         out += self.unused_inputs(mf) + self.duplicated_constants(mf) + self.mixed_results(mf)
+        out += self.unread_packages(mf) + self.gate_races(mf) + self.stale_fallbacks(mf)
         fns = {self.fn_name(f): f for f in mf.fns}
         for rf in mf.rules:
             # a result one caller checks and another discards
@@ -294,6 +301,122 @@ class RepoFacts:
                         any("len(" in self.outline.line(fn.file, k) for k in range(fn.line, fn.end + 1)):
                     out.append(("encoding", fn.file, n, "string cut by bytes; can split a UTF-8 character"))
         return sorted(set(out), key=lambda s: (s[1], s[2], s[0]))
+
+    def state_vars(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """Package-level variables the module keeps between calls (Go): caches, maps, counters, rates. Locks, error
+        values and the literals of shared contracts are not state."""
+        out = []
+        for rel in mf.files:
+            if self.outline.files[rel].lang != "go":
+                continue
+            for n in _walk(self.outline.roots[rel], stop={"function_declaration", "method_declaration"}):
+                if n.type != "var_spec":
+                    continue
+                name = text(n.child_by_field_name("name"))
+                typ = text(n.child_by_field_name("type"))
+                val = " ".join(text(n.child_by_field_name("value")).split())
+                what = typ or val
+                if not name or name == "_" or re.search(r"sync\.|Mutex|errors\.New|fmt\.Errorf", what) \
+                        or re.match(r"\w+\.\w+\{", val):
+                    continue
+                out.append((name, rel, n.start_point[0] + 1, what[:80]))
+        return out
+
+    def effects(self, mf: ModuleFacts) -> list[tuple[str, str, int, str, str]]:
+        """What each function does that the spec must say: writes to the module's state (`m[k] = v`, `delete(m, k)`,
+        `v = ...`) and calls to other functions of the module or to other packages of ours (not trivial ones, not
+        locking, not helpers folded into it, which their caller says)."""
+        state = [v for v, _, _, _ in mf.state]
+        folded = {h for h, _ in mf.folds}
+        mine = {f.name for f in mf.fns}
+        out = []
+        for f in mf.fns:
+            if f.name in folded:
+                continue
+            seen = set()
+            for n in range(f.line + 1, f.end + 1):
+                ln = self.outline.line(f.file, n)
+                for v in state:
+                    if re.search(r"\bdelete\(\s*" + v + r"\b|\b" + v + r"\b(\[[^\]]*\])?\s*(=(?!=)|\+=|-=|\+\+)", ln) \
+                            and ("write", v) not in seen:
+                        seen.add(("write", v))
+                        out.append((self.fn_name(f), f.file, n, "write", v))
+            imports = self.import_map(f.file)
+            for callee, n in f.calls:
+                segs = callee.split(".")
+                target = ""
+                if len(segs) == 1 and segs[0] in mine and segs[0] not in folded and segs[0] != f.name:
+                    target = segs[0]
+                elif len(segs) == 2 and segs[0] in imports and self.own_dir(imports[segs[0]]) is not None \
+                        and not TRIVIAL_FIRST.match(segs[0]):
+                    target = callee
+                if target and not re.search(r"(?i)(^|\.)(un)?lock$", target) and ("call", target) not in seen:
+                    seen.add(("call", target))
+                    out.append((self.fn_name(f), f.file, n, "call", target))
+        return out
+
+    def commented(self, mf: ModuleFacts) -> list[tuple[str, str, int]]:
+        """Functions with a comment right above them: the comment is the reason the spec must keep."""
+        out = []
+        for f in mf.fns:
+            above = self.outline.line(f.file, f.line - 1).strip()
+            if above.startswith(("//", "#", "*", "/*")) and len(above) > 3:
+                out.append((self.fn_name(f), f.file, f.line))
+        return out
+
+    def unread_packages(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """Each package of our own code the module calls (not through a rule): what it does there is not read."""
+        ruled = {r.callee.split(".")[0] for r in mf.rules}
+        seen, out = set(), []
+        for f in mf.fns:
+            imports = self.import_map(f.file)
+            for callee, line in sorted(f.calls, key=lambda c: c[1]):
+                alias = callee.split(".")[0]
+                if "." not in callee or alias in ruled or alias not in imports or TRIVIAL_FIRST.match(alias):
+                    continue
+                d = self.own_dir(imports[alias])
+                if d is None or d == mf.dir or d in seen:
+                    continue
+                seen.add(d)
+                out.append(("unresolved", f.file, line, f"{callee} is in {d}/, not read"))
+        return out
+
+    def gate_races(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """A gate (Check*/Can*/Allow*/Ensure*) that refuses with an error but reserves nothing: callers that run it
+        at the same time all pass before any of them has spent."""
+        out = []
+        for f in mf.fns:
+            if not re.match(r"(?i)(check|can|allow|ensure)[A-Z_]", f.name) or not mf.state:
+                continue
+            body = [self.outline.line(f.file, n) for n in range(f.line, f.end + 1)]
+            if any(re.search(r"return\s+Err\w+", x) for x in body) and \
+                    any(re.search(r"\b" + v + r"\b", " ".join(body)) for v, _, _, _ in mf.state):
+                out.append(("race", f.file, f.line, f"{f.name} reserves nothing: concurrent callers can all pass"))
+        return out
+
+    def stale_fallbacks(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
+        """`if err != nil { ... if !ok { return } }` with no other return: on failure the old value is used, with no
+        age limit."""
+        out = []
+        for f in mf.fns:
+            lines = [self.outline.line(f.file, n) for n in range(f.line, f.end + 1)]
+            for i, ln in enumerate(lines):
+                if not re.search(r"if\s+\w*[eE]rr\w*\s*!=\s*nil\s*\{", ln):
+                    continue
+                depth, block = 0, []
+                for x in lines[i:]:
+                    depth += x.count("{") - x.count("}")
+                    block.append(x)
+                    if depth <= 0:
+                        break
+                inner = "\n".join(block[1:])
+                nested = re.search(r"if\s+!\w+\s*\{[^}]*return", inner)
+                level = len(ln) - len(ln.lstrip("\t")) + 1  # the err branch's own statements, not nested ones
+                outer_returns = [x for x in block[1:] if len(x) - len(x.lstrip("\t")) == level and x.strip().startswith("return")]
+                if nested and not outer_returns:
+                    out.append(("stale-fallback", f.file, f.line + i,
+                                "on failure the cached value is kept and used, with no limit on its age"))
+        return out
 
     def unused_inputs(self, mf: ModuleFacts) -> list[tuple[str, str, int, str]]:
         """A request field decoded into a variable and never read in that function."""
