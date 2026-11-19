@@ -1,0 +1,7 @@
+system ConversationContext  @app/chatbot/agents/historymanager/
+  actor Router
+  cfg depth = 5 turns, turnLimit = 4000 bytes
+  req HM-1 when a message depends on earlier turns, recover the context it needs from the last depth turns and hand it back to the router; never answer the user
+  req HM-2 with no earlier turns, return no context and do not ask the model
+  req HM-3 each turn carries user text, attachment names, assistant text and file actions, each cut to turnLimit
+  activity RecoverContext: load turns -> build transcript -> [empty] return none | ask LITE model -> return context

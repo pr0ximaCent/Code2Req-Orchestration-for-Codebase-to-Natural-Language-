@@ -179,13 +179,15 @@ def write_run_spec(run_dir: str) -> int:
     return 0
 
 
-def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: str) -> int:
-    """The system design for a finished run: what `code2req design` and the end of every analyze write."""
+def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: str, reader: str = "llm",
+                     design: dict | None = None) -> int:
+    """The system design for a finished run: what `code2req design` and the end of every analyze write. design:
+    one already read beside the requirements."""
     from code2req.design import supported, write_design
     if supported(repo) is None:
-        print("system design: not written (the design reader handles Go services today)")
+        print("system design: not written (no Go, Python, TypeScript, JavaScript, Java or C# source found)")
         return 0
-    s = write_design(run_dir, repo, llm, title=title, target=target)
+    s = write_design(run_dir, repo, llm, title=title, target=target, reader=reader, design=design)
     if s is None:
         return 0
     print(f"system design: {s['components']} components in {s['subsystems']} subsystems, {s['actors']} external systems, "
@@ -194,6 +196,8 @@ def write_run_design(run_dir: str, repo: str, llm, title: str | None, target: st
           f"({s['left_out']} left out); {s['chars']:,} characters, largest section {s['largest']:,}")
     print(f"wrote {os.path.join(run_dir, 'system_design.md')}, system_design.txt"
           + (", system_design.pdf" if s["pdf"] else "") + " and design.json")
+    print(f"wrote the model: {s['sysml_files']} SysML files in {os.path.join(run_dir, 'system_model')} and "
+          f"{s['kpar']} (import it into SysModeler: Import project, .kpar)")
     return 0
 
 
@@ -249,7 +253,11 @@ def main(argv: list[str] | None = None) -> int:
     dz.add_argument("--repo", help="the source folder (default: the one the run read)")
     dz.add_argument("--title", help="the system's name (default: the repo's name)")
     dz.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=ENV_HELP)
-    dz.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model that splits the requirements (default DeepSeek)")
+    dz.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model that reads the design and splits the "
+                    "requirements (default DeepSeek)")
+    dz.add_argument("--reader", choices=("llm", "go"), default="llm",
+                    help="llm: the model reads any language, code checks it (default); go: hand-written rules for Go services")
+    dz.add_argument("--max-cost", type=float, default=6.0, metavar="USD", help="stop paid model calls at this cost (default 6)")
     dz.add_argument("-v", "--verbose", action="store_true")
 
     v = sub.add_parser("eval", help="run a slice of the code and compare it with a baseline run")
@@ -320,7 +328,53 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
     b.add_argument("-v", "--verbose", action="store_true")
 
+    bs = sub.add_parser("bspec", help="write the system spec (spec/*.c2s) and system_doc.md: the model the code was "
+                                      "built to implement, one model step per system, checked against the code")
+    bs.add_argument("target", nargs="?", help="repo folder (git URL not supported here)")
+    bs.add_argument("--out", default="bspec-out")
+    bs.add_argument("--system", action="append", metavar="FOLDERS",
+                    help="one system made of these comma-separated folders (repeatable; default: the whole repo when "
+                         "it is small, else one system per folder)")
+    bs.add_argument("--review", action="store_true", help="also run the code detectors and write review.md")
+    bs.add_argument("--from-spec", metavar="DIR", help="no model: rebuild system_doc.md and the reports from the .c2s "
+                                                       "files in DIR (with TARGET, the checks run against its code too)")
+    bs.add_argument("--rounds", type=int, default=4, help="model rounds per system, the first and its repairs (default 4)")
+    bs.add_argument("--workers", type=int, default=4)
+    bs.add_argument("--model", default=os.getenv("CODE2REQ_MODEL"), help="model (default DeepSeek)")
+    bs.add_argument("--max-cost", type=float, default=6.0, metavar="USD", help="stop paid model calls at this cost (default 6)")
+    bs.add_argument("--no-cache", action="store_true")
+    bs.add_argument("--env-file", default=os.getenv("CODE2REQ_ENV_FILE"), help=env_help)
+    bs.add_argument("-v", "--verbose", action="store_true")
+
+    cmp_ = sub.add_parser("compare", help="compare two models element by element (SysML file, folder or .kpar, or a "
+                                          ".c2s spec): recall, precision and every unmatched item")
+    cmp_.add_argument("a", help="the reference model (golden, or the model built from the original document)")
+    cmp_.add_argument("b", help="the model to score")
+    cmp_.add_argument("--out", help="folder for compare.md and compare.json (default: print the markdown)")
+    cmp_.add_argument("--names", default="A,B", help="labels for the two models (default A,B)")
+
     args = p.parse_args(argv)
+    groups = [g.split(",") for g in (getattr(args, "system", None) or [])] or None
+    if args.cmd == "compare":  # no model needed
+        from code2req.bspec.compare import compare, markdown, read_model, run as run_compare
+        names = tuple((args.names.split(",") + ["B"])[:2])
+        if args.out:
+            rep = run_compare(args.a, args.b, args.out, names)
+            print(f"wrote {args.out}/compare.md: " + ", ".join(
+                f"{k} {v['recall'] if v['recall'] is not None else '-'}/{v['precision'] if v['precision'] is not None else '-'}"
+                for k, v in rep["kinds"].items()) + " (recall/precision)")
+        else:
+            a, b = read_model(args.a), read_model(args.b)
+            print(markdown(a, b, compare(a, b), names))
+        return 0
+    if args.cmd == "bspec" and args.from_spec:  # no model needed
+        from code2req.bspec import from_spec
+        total = from_spec(args.from_spec, args.out, args.target, groups, args.review)
+        print(f"wrote {args.out}: {total['lines']} spec lines, {total['chars']} chars, {total['behaviours']} behaviours, "
+              f"{total['dropped']} dropped fact(s), {total['lint_hits']} lint hit(s)")
+        return 0
+    if args.cmd == "bspec" and not (args.target and os.path.isdir(args.target)):
+        p.error("bspec needs a repo folder (or --from-spec DIR)")
     if args.cmd == "eval" and not args.sysml and not args.baseline:
         p.error("eval needs --baseline (or --sysml)")
     setup_logging(args.verbose)
@@ -362,13 +416,31 @@ def main(argv: list[str] | None = None) -> int:
         p.error(str(e))
     logging.getLogger("code2req").info("llm: %s", label)
 
+    if args.cmd == "bspec":
+        from code2req.bspec import run as run_bspec
+        try:
+            summary = run_bspec(args.target, args.out, with_cache(with_budget(llm, args.max_cost), label,
+                                                                  enabled=not args.no_cache),
+                                label, groups, args.rounds, args.workers, args.review)
+        except ValueError as e:
+            p.error(str(e))
+        s = summary["size"]
+        print(f"wrote {args.out}: {len(summary['systems'])} system(s), {s['lines']} spec lines, {s['chars']} chars, "
+              f"{s['behaviours']} behaviours, {s['dropped']} dropped fact(s), {s['lint_hits']} lint hit(s)"
+              + (f"; not extracted: {', '.join(summary['not_extracted'])}" if summary["not_extracted"] else ""))
+        cost = (summary.get("usage") or {}).get("cost_usd")
+        if cost is not None:
+            print(f"cost: ${cost:.4f}")
+        return 0
+
     if args.cmd == "design":
         with open(os.path.join(args.run, "requirements.json"), encoding="utf-8") as f:
             stats = json.load(f).get("stats", {})
         repo = args.repo or stats.get("repo", "")
         if not os.path.isdir(repo):
             p.error(f"no source folder: {repo or '(not recorded)'}; pass --repo")
-        return write_run_design(args.run, repo, with_cache(llm, label), args.title, stats.get("target", ""))
+        return write_run_design(args.run, repo, with_cache(with_budget(llm, args.max_cost), label), args.title,
+                                stats.get("target", ""), args.reader)
 
     if args.cmd == "bench":
         rows = []
@@ -402,6 +474,17 @@ def main(argv: list[str] | None = None) -> int:
             print(line)
     # The budget sits below the cache, so answers for unchanged code stay free after the cap.
     llm = with_cache(with_budget(llm, args.max_cost), label, enabled=not args.no_cache)
+    design_box: dict = {}
+    reading = None
+    if args.cmd == "analyze" and not args.no_design:  # the design needs only the source: read beside the requirements
+        import threading
+
+        from code2req.design import load_libraries, read_design, supported
+        if supported(repo):
+            load_libraries()  # before a second thread imports them
+            reading = threading.Thread(daemon=True, target=lambda: design_box.update(design=read_design(
+                repo, llm, args.title, args.target.strip().strip('"'))))
+            reading.start()
     report = run(repo, args.out, llm, label, args.workers, args.exclude, args.max_module_chars,
                  target=args.target.strip().strip('"'),
                  followup=not args.no_followup, entries=args.entry, include_assets=not args.no_assets,
@@ -410,7 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "eval":
         return write_eval(args, report.to_json())
     if not args.no_design:  # before a clone is pruned: the design reads every source file
-        write_run_design(args.out, repo, llm, args.title, args.target.strip().strip('"'))
+        if reading is not None:
+            reading.join()
+        write_run_design(args.out, repo, llm, args.title, args.target.strip().strip('"'), design=design_box.get("design"))
     if is_git_url(args.target.strip().strip('"')) and not args.keep_clone:
         kept, removed = prune_clone(repo, referenced_files(report))
         print(f"clone pruned to the {kept} files the result cites ({removed} removed, git data dropped)")

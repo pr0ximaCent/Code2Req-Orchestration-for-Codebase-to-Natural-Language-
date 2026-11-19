@@ -100,7 +100,9 @@ class LiteLLM:
         pooled = self.model.startswith("gemini/") and bool(gemini_keys())
 
         last: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
+        attempt, limited_until = 0, time.monotonic() + RATE_LIMIT_PATIENCE
+        while attempt < self.max_retries:
+            attempt += 1
             key = None
             if pooled:
                 keys = [k for k in gemini_keys() if k not in self._dead_keys]
@@ -118,6 +120,11 @@ class LiteLLM:
                     self._dead_keys.add(key)
                     logger.warning("gemini key parked for this run: %s",
                                    "daily quota used up" if "PerDay" in str(e) else "invalid key")
+                # a per-minute token limit is the quota, not a fault: wait it out (for a while) without using an attempt
+                if is_rate_limit(e) and not key and time.monotonic() < limited_until:
+                    attempt -= 1
+                    time.sleep(retry_wait(e, 2))
+                    continue
                 if attempt < self.max_retries:
                     time.sleep(retry_wait(e, attempt))
         raise RuntimeError(f"LLM call failed after {self.max_retries} attempts: {_short_error(last)}")
@@ -396,6 +403,15 @@ def key_is_dead(err: Exception) -> bool:
     """The key itself is the problem (invalid, or its daily quota is gone): retrying it is useless."""
     text = f"{type(err).__name__} {err}"
     return "AuthenticationError" in text or "API_KEY_INVALID" in text or "PerDay" in text
+
+
+RATE_LIMIT_PATIENCE = 180.0  # seconds a call keeps waiting out a per-minute limit before attempts count again
+
+
+def is_rate_limit(err: Exception | None) -> bool:
+    """A per-minute limit (Azure's tokens per minute): it clears by waiting. A daily quota does not."""
+    text = f"{type(err).__name__} {err}" if err else ""
+    return ("RateLimitError" in text or "rate limit" in text.lower()) and "PerDay" not in text
 
 
 def retry_wait(err: Exception | None, attempt: int) -> float:

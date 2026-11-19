@@ -11,6 +11,8 @@ import json
 import os
 import re
 
+from .names import words
+
 LIMIT = 9000  # characters per subsection: one answer of SysModeler's document reader is 12,000
 
 
@@ -37,7 +39,18 @@ class Md:
         """Groups of lines under one heading; split into "(part n of m)" when they outgrow one answer.
         groups: [(subheading or "", [lines])]."""
         chunks, cur, size = [], [], 0
-        for sub, lines in groups:
+        split = []
+        for sub, lines in groups:  # a group bigger than one answer goes on under its heading, "(continued)"
+            pieces, piece, n = [], [], len(sub) + 4
+            for x in lines:
+                if piece and not x.startswith((" ", "\t")) and n + len(x) + 1 > LIMIT:  # never inside an item
+                    pieces.append(piece)
+                    piece, n = [], len(sub) + 16
+                piece.append(x)
+                n += len(x) + 1
+            pieces.append(piece)
+            split += [(sub if k == 0 or not sub else f"{sub} (continued)", p) for k, p in enumerate(pieces)]
+        for sub, lines in split:
             n = sum(len(x) + 1 for x in lines) + len(sub) + 4
             if cur and size + n > LIMIT:
                 chunks.append(cur)

@@ -1,0 +1,24 @@
+system HistoryManager  @app/chatbot/agents/historymanager/
+  doc Recovers context from earlier messages in a thread so the main agent can understand follow-ups and pronouns.
+  actor User, MainAgent
+  part HistoryLoader, TranscriptBuilder, Llm
+  item ChatMessage {userMessage, response, attachmentNames, messageID}
+  cfg historyDepth = 5 messages  @agent.go:17
+  cfg maxTurnChars = 4000 characters  @:18
+  req HM-1 recover context from the last historyDepth messages of the thread; if loading fails or no usable transcript exists, return empty context  @:21-37
+  req HM-2 truncate each message text to maxTurnChars  @:99-103
+  req HM-3 register as agent "history-manager" that reroutes the request with recovered context  @spec.go:9-24
+  req HM-4 the agent returns no answer itself; it only recovers context and reroutes  @:22
+  usecase RecoverContext: MainAgent -> send user message and thread info, receive recovered context  @agent.go:20-48
+  activity BuildTranscript: load messages -> skip current -> for each message: format user text, attachments, assistant text -> join with newlines  @:51-78
+  activity BuildBlocks: for each block: if text block add text, if tool block add [action filename]  @:80-97
+  activity RecoverContext: load messages -> if no usable transcript return empty -> build transcript -> send prompt with user message and history to Llm (LITE model) -> return response  @:20-48
+  HistoryLoader satisfies HM-1
+  TranscriptBuilder satisfies HM-2
+  omit agent.Register: wiring
+  omit slog.Error, slog.Warn: logging
+  omit strings.NewReplacer, strings.TrimSpace: formatting
+  ? how LoadHistory works -> app/services/chat/
+  ? how Llm.RunWithoutStream works -> app/chatbot/llm/
+  ? what agent.ChatContext contains -> app/chatbot/agent/
+  ? what agent.Request and agent.Result contain -> app/chatbot/agent/

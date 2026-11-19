@@ -1,0 +1,35 @@
+system Auth  @app/api/auth/
+  doc Handles user signup, login (credentials and Google OAuth), token refresh, password reset, and OTP verification requests.
+  actor User
+  part UserService, BillingService
+  item VerificationOTP {otp_id, otp}
+  item TokenPair {access_token, refresh_token}
+  item Email
+  item Password
+  item Name
+  item GoogleAccessToken
+  item RefreshToken
+  item OTPID
+  item Purpose
+  req AUTH-1 block an action (login, signup, password reset, send OTP) when the user's action rate or other constraints are exceeded  @credentials.go:26-35  ? how IsActionAllowed decides -> app/domains/user/
+  req AUTH-2 verify a one-time password before signup or password reset; reject if invalid  @:74-77  ? how VerifyOTP works -> app/domains/user/
+  usecase SignUp: User -> request verification OTP, verify OTP, provide email/name/password, receive token pair  @:61-85
+  usecase LoginWithCredentials: User -> provide email and password, receive token pair  @:17-43
+  usecase LoginWithGoogle: User -> provide Google access token, receive token pair  @:47-57
+  usecase RefreshToken: User -> provide refresh token, receive new token pair  @:89-100
+  usecase ResetPassword: User -> request verification OTP, verify OTP, provide new password, receive token pair  @password.go:17-50
+  usecase RequestVerificationOTP: User -> provide email and purpose, receive OTP ID  @verification.go:17-55
+  omit clientIP: implementation
+  omit BearerToken: implementation
+  omit DecodeJSONBody: implementation
+  omit response.WriteError, response.JSON, response.Error: implementation
+  omit httputil: implementation
+  omit billingSvc: wiring
+  ? how IsActionAllowed decides -> app/domains/user/
+  ? how VerifyOTP works -> app/domains/user/
+  ? how OAuthGoogleLogin works -> app/domains/user/
+  ? how Refresh works -> app/domains/user/
+  ? how SendOTP works -> app/domains/user/
+  ? how SetPassword works -> app/domains/user/
+  ? how GetUserByEmail works -> app/domains/user/
+  ? how CreateLoginResponse works -> app/domains/user/

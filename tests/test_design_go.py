@@ -8,7 +8,6 @@ import re
 import pytest
 
 from code2req.design import fix_route_text, settings_used, title_for, write_design
-from code2req.design.atomize import broken, check
 from code2req.design.golang import Design, Flow
 from code2req.design.render import render, steps_lines
 
@@ -145,13 +144,55 @@ def test_requirements_say_which_settings_they_use_with_the_defaults(design):
     assert f'listen on the configured port. Uses: `portValue : String = "8080"` ({used[0]["id"]}' in md
 
 
-def test_a_statement_joining_two_actions_is_asked_again_but_kept():
-    inp = [{"id": "R-1", "text": "The A component shall accept POST /x and return the draft."}]
-    joined = [{"id": "R-1", "source": "R-1", "name": "X", "text": "The A component shall accept POST /x and return the draft."}]
-    assert any("joins two actions" in p for p in check(inp, joined)) and broken(check(inp, joined)) == []
-    split = [{"id": "R-1-1", "source": "R-1", "name": "X", "text": "The A component shall accept POST /x."},
-             {"id": "R-1-2", "source": "R-1", "name": "Y", "text": "When a POST /x request arrives, the A component shall return the draft."}]
-    assert check(inp, split) == []
+def test_the_design_is_written_as_sysml_with_its_ids(design):
+    from code2req.design.sysml import Writer
+    files = Writer(dict(design, requirements=[{"id": "CODE-ORDERS-001", "name": "StoreNewOrder", "kind": "functional",
+                                               "subject": "OrdersService", "text": "The OrdersService component shall store a new order.",
+                                               "uses": [], "attributes": []}])).files()
+    text = "\n".join(files.values())
+    for c in design["components"]:
+        assert f"part def <'{c['id']}'> {c['def']}" in text
+    for a in design["activities"]:
+        assert f"action def <'{a['id']}'>" in text
+    assert text.count("connect ") == len(design["connections"])  # each connection once, through ports
+    assert "interface <'CONN_" in text and "port api : Types::" in text
+    sm = design["state_machines"][0]
+    assert f"state def <'{sm['id']}'>" in text and "accept ChargeFails" in text
+    assert "occurrence def <'SEQ_" in text and "event occurrence send1" in text
+    assert "requirement def <'CODE-ORDERS-001'> StoreNewOrder" in text and "subject ordersService : OrdersService::OrdersServiceDef" in text
+    assert 'attribute <\'VAL_01\'> portValue : String = "8080";' in text
+    # no name declared twice in one body: the parser warns on duplicates
+    for rel, body in files.items():
+        for block in re.findall(r"\{([^{}]*)\}", body):
+            names = re.findall(r"^\s*(?:then )?(?:action|merge|decide|attribute|port|part|state) (?:<'[^']+'> )?(\w+)", block, re.M)
+            assert len(names) == len(set(names)), (rel, names)
+
+
+def test_an_activity_is_steps_decisions_and_merges():
+    from code2req.design.sysml import Writer
+    d = Design(FIXTURE, report(), "Orders").build()
+    text = Writer(dict(d, requirements=[])).files()["system/orders/orders_service/orders_service.sysml"]
+    body = text[text.index("action def <'"):]
+    rec = body[body.index("Reconcile {"):]
+    rec = rec[:rec.index("\n    }")]
+    assert "first start;" in rec and "then done;" in rec
+    assert "attribute cancelled : Boolean" in rec and "if idInSeen then skipToNext" in rec
+    assert "if charge.failed then" in rec and "out attribute failed : Boolean" in rec
+    assert "merge merge" in rec
+
+
+def test_the_model_is_a_project_archive_sysmodeler_imports(tmp_path, design):
+    import hashlib
+    import zipfile
+    from code2req.design.sysml import write_kpar, write_sysml
+    files = write_sysml(dict(design, requirements=[]), str(tmp_path / "model"))
+    path = write_kpar(files, str(tmp_path / "Orders.kpar"), "Orders")
+    z = zipfile.ZipFile(path)
+    meta = json.loads(z.read(".meta.json"))
+    assert json.loads(z.read(".project.json"))["version"] == "v2"
+    assert meta["index"]["Types"] == "model/system/types.sysml"
+    for rel, sums in meta["checksum"].items():
+        assert hashlib.sha256(z.read(rel)).hexdigest() == sums[0]["value"]
 
 
 def test_route_text_is_checked_against_the_routes(design):
@@ -176,7 +217,7 @@ class EchoLLM:
 def test_write_design_writes_the_documents(tmp_path):
     with open(tmp_path / "requirements.json", "w", encoding="utf-8") as f:
         json.dump(report(), f)
-    s = write_design(str(tmp_path), FIXTURE, EchoLLM(), title="Orders")
+    s = write_design(str(tmp_path), FIXTURE, EchoLLM(), title="Orders", reader="go")
     assert s["components"] >= 5 and s["requirements"] == 2
     with open(tmp_path / "design.json", encoding="utf-8") as f:
         d = json.load(f)

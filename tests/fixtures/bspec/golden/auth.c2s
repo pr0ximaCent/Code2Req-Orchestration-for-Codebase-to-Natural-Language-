@@ -1,0 +1,10 @@
+system Auth  @app/api/auth/
+  actor Client
+  item Otp {email, purpose: signup | reset}
+  req AUTH-1 refuse actions the action limiter blocks (login, signup, reset, request OTP)  ? enforced only on login
+  req AUTH-2 signup and password reset require an unexpired OTP for the same email and purpose
+  req AUTH-3 client IP is taken from X-Forwarded-For, then X-Real-IP, then the connection  ? spoofable without a trusted proxy
+  usecase SignUp: Client -> request OTP(signup), submit details + OTP -> account created
+  usecase LogIn: Client -> email + password | Google token -> logged in
+  usecase ResetPassword: Client -> request OTP(reset), submit new password + OTP -> logged in
+  usecase RefreshSession: Client -> refresh token -> new tokens

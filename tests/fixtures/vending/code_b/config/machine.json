@@ -1,0 +1,12 @@
+{
+  "accepted_coins": [5, 10, 25],
+  "safe_temperature": { "min_c": 2, "max_c": 8 },
+  "motor": { "tries": 3, "pause_ms": 250 },
+  "slots": [
+    { "id": "A1", "name": "Salted Crisps", "price_cents": 125, "stock": 5 },
+    { "id": "A2", "name": "Pretzels", "price_cents": 100, "stock": 3 },
+    { "id": "B1", "name": "Chocolate Bar", "price_cents": 150, "stock": 4 },
+    { "id": "B2", "name": "Granola Bar", "price_cents": 90, "stock": 2 }
+  ],
+  "journal_path": "var/journal.jsonl"
+}

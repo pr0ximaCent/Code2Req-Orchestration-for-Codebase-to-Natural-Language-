@@ -50,7 +50,9 @@ class RunRequest(BaseModel):
     exclude: list[str] = Field(default_factory=list)
     workers: int = Field(default=4, ge=1, le=16)
     max_module_chars: int = Field(default=DEFAULT_MODULE_CHARS, ge=5_000, le=400_000)
-    profile: str = Field(default="sysml", pattern="^(sysml|exhaustive)$")  # see pipeline.PROFILES
+    profile: str = Field(default="sysml", pattern="^(sysml|exhaustive|bspec)$")  # bspec: the compact system document
+    modules: list[str] = Field(default_factory=list)  # bspec: the folders of one system (default the whole repo)
+    review: bool = False  # bspec: also run the code detectors and write review.md
     followup: bool = True  # exhaustive profile only
     entries: list[str] = Field(default_factory=list)  # extra entry-point globs for dead-code detection
     assets: bool = True  # include prompts, templates, reference files and CI/CD
@@ -211,7 +213,10 @@ class RunManager:
 
         def progress(stage: str, done: int, total: int) -> None:
             with meta_lock:
-                meta["progress"] = {"stage": stage, "done": done, "total": total}
+                if stage.startswith("design"):  # the design is read beside the requirements: its own track
+                    meta["design_progress"] = {"stage": stage, "done": done, "total": total}
+                else:
+                    meta["progress"] = {"stage": stage, "done": done, "total": total}
                 _write_json(meta_path, meta)
 
         try:
@@ -225,19 +230,53 @@ class RunManager:
             logger.info("run %s: %s (%s)", run_id, repo, label)
             # The budget sits below the cache, so answers for unchanged code stay free after the cap.
             llm = with_cache(with_budget(llm, req.max_cost), label, enabled=req.cache, path=self.cache_path)
+            if req.profile == "bspec":  # the compact behaviour spec and its system document, instead of requirements
+                from ..bspec import run as run_bspec
+                folders = [m.strip() for m in req.modules if m.strip()]
+                got = run_bspec(repo, out_dir, llm, label, [folders] if folders else None, workers=req.workers,
+                                with_review=req.review, progress=progress)
+                size = got["size"]
+                meta["summary"] = {"bspec": True, "systems": got["systems"], "lines": size["lines"], "chars": size["chars"],
+                                   "requirements": size["requirements"], "transitions": size["transitions"],
+                                   "usecases": size["usecases"], "behaviours": size["behaviours"],
+                                   "dropped": size["dropped"], "lint_hits": size["lint_hits"], "review": req.review,
+                                   "not_extracted": got["not_extracted"],
+                                   "cost_usd": (got.get("usage") or {}).get("cost_usd")}
+                progress("done", 0, 0)
+                meta["status"] = "done"
+                return
+            # the design needs only the source: it is read while the requirements are written, and joined after
+            from ..design import load_libraries, read_design, supported, write_design
+            load_libraries()  # before a second thread imports them
+            design_box: dict = {}
+
+            def read() -> None:
+                try:
+                    design_box["design"] = read_design(repo, llm, target=meta["target"], progress=progress)
+                except Exception:  # noqa: BLE001 - the requirements stand without the design
+                    logger.exception("run %s: system design not read", run_id)
+                    design_box["failed"] = True
+
+            reading = threading.Thread(target=read, daemon=True) if supported(repo) else None
+            if reading is not None:
+                progress("design_map", 0, 0)
+                reading.start()
             report = run_pipeline(repo, out_dir, llm, label, req.workers,
                                   req.exclude or None, req.max_module_chars, progress=progress,
                                   followup=req.followup, entries=req.entries or None,
                                   include_assets=req.assets, target=meta["target"],
                                   stop=self.stops[run_id], profile=req.profile)
-            try:  # the system design reads every source file: before a clone is pruned
-                from ..design import supported, write_design
-                if supported(repo):
-                    progress("design", 0, 0)
-                    meta["design"] = write_design(out_dir, repo, llm, target=meta["target"])
-                    logger.info("system design written: %s", meta["design"])
+            try:  # before a clone is pruned: the design read every source file
+                if reading is not None:
+                    reading.join()
+                    if design_box.get("design") is not None:
+                        progress("design_write", 0, 0)
+                        meta["design"] = write_design(out_dir, repo, llm, target=meta["target"], design=design_box["design"])
+                        logger.info("system design written: %s", meta["design"])
+                        progress("design_done", 0, 0)
             except Exception:  # noqa: BLE001 - the requirements stand without the design
                 logger.exception("run %s: system design not written", run_id)
+            progress("done", 0, 0)
             if is_git_url(meta["target"]) and not req.keep_clone:
                 kept, removed = prune_clone(repo, referenced_files(report))
                 logger.info("clone pruned to the %d files the result cites (%d removed)", kept, removed)
@@ -477,8 +516,42 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
         path = os.path.join(mgr._dir(run_id), f"system_design.{ext}")
         if not os.path.isfile(path):
             raise HTTPException(404, "this run has no system design: its code is in a language the design reader "
-                                     "does not handle yet (Go services today), or it ran before the design existed")
+                                     "does not handle yet, or it ran before the design existed")
         return FileResponse(path, filename=f"system-design-{run_id}.{ext}")
+
+    @app.get("/api/runs/{run_id}/bspec/{name}")
+    def bspec_file(run_id: str, name: str) -> Response:
+        """A bspec run's outputs: the system document, the coverage, review and size reports, or spec.zip."""
+        out = mgr._dir(run_id)
+        if name == "spec.zip":
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                spec_dir = os.path.join(out, "spec")
+                for f in sorted(os.listdir(spec_dir)) if os.path.isdir(spec_dir) else []:
+                    z.write(os.path.join(spec_dir, f), f"spec/{f}")
+                for f in ("system_doc.md", "coverage.md", "review.md", "size_report.md", "LEGEND.md"):
+                    if os.path.isfile(os.path.join(out, f)):
+                        z.write(os.path.join(out, f), f)
+            return Response(buf.getvalue(), media_type="application/zip",
+                            headers={"Content-Disposition": f'attachment; filename="bspec-{run_id}.zip"'})
+        if name not in ("system_doc.md", "coverage.md", "review.md", "size_report.md"):
+            raise HTTPException(404, "system_doc.md, coverage.md, review.md, size_report.md or spec.zip")
+        path = os.path.join(out, name)
+        if not os.path.isfile(path):
+            raise HTTPException(404, "this run has no " + name)
+        with open(path, encoding="utf-8") as f:
+            return Response(f.read(), media_type="text/markdown; charset=utf-8")
+
+    @app.get("/api/runs/{run_id}/model.kpar")
+    def model_kpar(run_id: str) -> FileResponse:
+        """The model itself, as a SysModeler project archive: Import project (.kpar) in SysModeler."""
+        d = mgr._dir(run_id)
+        found = [f for f in os.listdir(d) if f.endswith(".kpar")] if os.path.isdir(d) else []
+        if not found:
+            raise HTTPException(404, "this run has no model: it has no system design")
+        return FileResponse(os.path.join(d, found[0]), filename=found[0], media_type="application/zip")
 
     @app.get("/api/health")
     def health() -> dict:
