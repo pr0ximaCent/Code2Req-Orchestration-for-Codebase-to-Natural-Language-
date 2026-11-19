@@ -1,290 +1,329 @@
-"""The compact behaviour spec (code2req/bspec): notation parser, code facts, checks, the deterministic SysML
-writer, the extraction loop and the reports. The golden specs (fixtures/bspec/golden) are hand-written from the
-fixture code; the recorded ones (fixtures/bspec/recorded) are DeepSeek's answers, played back by a fake model."""
-import json
+"""The system spec (code2req/bspec): notation, code facts, coverage and lint, the extraction loop, the system
+document, the reports and the prompt's isolation from the test systems. The goldens (fixtures/vending/golden.c2s,
+fixtures/bspec/golden) are written from the system documents, not the code; the recorded specs
+(fixtures/bspec/recorded) are DeepSeek's answers from live runs, played back by a fake model."""
 import os
 import re
+import shutil
+import subprocess
+import sys
 
 import pytest
 
 from code2req.bspec import from_spec, run
-from code2req.bspec.check import check, compare
-from code2req.bspec.extract import PROMPT_VERSION, normalize, user_prompt
-from code2req.bspec.facts import RepoFacts
-from code2req.bspec.notation import SpecError, format_module, parse
-from code2req.bspec.sysml import write as write_sysml
+from code2req.bspec.check import check
+from code2req.bspec.compare import compare, from_spec as model_of, read_model
+from code2req.bspec.doc import system_doc
+from code2req.bspec.extract import SYSTEM, extract, normalize, user_prompt
+from code2req.bspec.notation import SpecError, format_system, parse
+from code2req.bspec.sysfacts import systems
 
-HERE = os.path.join(os.path.dirname(__file__), "fixtures", "bspec")
-CASES = {"auth": "app/api/auth", "historymanager": "app/chatbot/agents/historymanager"}
+FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+VENDING = os.path.join(FIX, "vending")
+CASES = {  # name: (repo, --system folders, golden)
+    "vending": (os.path.join(VENDING, "code"), None, os.path.join(VENDING, "golden.c2s")),
+    "auth": (os.path.join(FIX, "bspec", "auth"), None, os.path.join(FIX, "bspec", "golden", "auth.c2s")),
+    "historymanager": (os.path.join(FIX, "bspec", "historymanager"), [["app/chatbot/agents/historymanager"]],
+                       os.path.join(FIX, "bspec", "golden", "historymanager.c2s")),
+}
 
 
-def text(*parts):
-    with open(os.path.join(HERE, *parts), encoding="utf-8") as f:
+def read(path):
+    with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+def one(text, where="x.c2s"):
+    return parse({where: text}).systems[0]
 
 
 @pytest.fixture(scope="module")
 def facts():
-    out = {}
-    for name, d in CASES.items():
-        repo = RepoFacts(os.path.join(HERE, name))
-        out[name] = (repo, repo.module(d))
-    return out
+    return {name: systems(repo, groups)[1][0] for name, (repo, groups, _) in CASES.items()}
 
 
-def shared(mf):
-    return "".join(c.def_line() + "\n" for c in mf.contracts)
-
-
-def golden(name, mf):
-    body = "\n".join(ln for ln in text("golden", f"{name}.c2s").splitlines() if not ln.startswith("def "))
-    return parse({"_shared.c2s": shared(mf), f"{name}.c2s": body})
+def recorded(name):
+    return read(os.path.join(FIX, "bspec", "recorded", f"{name}.c2s"))
 
 
 class Playback:
     """A model that answers every prompt with the given texts in turn (the last one repeats)."""
 
     def __init__(self, *answers):
-        self.answers, self.prompts = list(answers), []
+        self.answers, self.prompts, self.systems = list(answers), [], []
 
     def complete(self, system, user, json_mode=False):
+        self.systems.append(system)
         self.prompts.append(user)
         return "```c2s\n" + self.answers[min(len(self.prompts), len(self.answers)) - 1] + "```"
 
 
-# ------------------------------------------------------------------------------------------------ parser
+# ------------------------------------------------------------------------------------------------ notation
 @pytest.mark.parametrize("name", CASES)
-def test_canonical_text_reads_back_to_itself(name, facts):
-    spec = golden(name, facts[name][1])
-    once = format_module(spec.module(name))
-    again = format_module(parse({"_shared.c2s": shared(facts[name][1]), "x.c2s": once}).module(name))
-    assert once == again
+def test_golden_and_recorded_specs_read_back_to_themselves(name):
+    for text in (read(CASES[name][2]), recorded(name)):
+        s = one(text)
+        once = format_system(s)
+        assert format_system(one(once)) == once
 
 
-@pytest.mark.parametrize("spec_text, message", [
-    ("m  @a\n  POST /x {a} -> 200  otpp(1)  @f.go:1-2\n", "undefined rule or operation 'otpp'"),
-    ("m  @a\n  rule r(p)  q  ~x.Y\n  GET /x -> 200  r  @f.go:1-2\n", "rule r takes 1 argument(s), got 0"),
-    ("m : Missing  @a\n", "undefined def Missing"),
-    ("m  @a\n  ? [nonsense] @f.go:3 x\n", "unknown issue category [nonsense]"),
-    ("m  @a\n  this is not notation\n", "cannot read 'this is not notation'"),
-    ("m  @a\n   odd indent\n", "indent with 2 spaces"),
-    ("m  @a\n  f(x) -> y  @f.go:9-3\n", "ends before it starts"),
-    ("m  @a\n  f(x)  @:3\n", "no earlier file"),
-    ("  POST /x -> 200  @f.go:1\n", "outside a module"),
+def test_state_machine_use_cases_activities_and_doc_only_steps_read_as_written():
+    s = one(read(CASES["vending"][2]))
+    m = s.machines[0]
+    assert m.owner == "Controller" and m.states == ["Idle", "Credited", "Dispensing", "OutOfService"]
+    t = m.transitions[2]
+    assert (t.src, t.event, t.guard, t.effect, t.tgt) == ("Credited", "select", "credit >= price and stock > 0", "push",
+                                                         "Dispensing")
+    buy = s.usecases[0]
+    assert buy.actor == "Customer" and [(x.text, x.doc_only) for x in buy.steps] == [
+        ("insertCoin+", False), ("select", False), ("collect item", True), ("collect change", True)]
+    assert [c.key for c in s.cfg] == ["coins", "tempRange", "motorTries", "slots"] and s.cfg[1].unit == "°C"
+    hm = one(read(CASES["historymanager"][2]))
+    nodes = hm.activities[0].nodes
+    assert [n.text for n in nodes[:2]] == ["load turns", "build transcript"]
+    assert nodes[2].cond == "empty" and nodes[2].then[0].text == "return none"
+    assert [n.text for n in nodes[2].other] == ["ask LITE model", "return context"]
+
+
+def test_star_means_every_other_state():
+    m = one("system G\n  state Gate:\n    Closed -(ticket)-> Open\n    * -(fault)-> Fault\n").machines[0]
+    assert [(t.src, t.tgt) for t in m.expanded()] == [("Closed", "Open"), ("Closed", "Fault"), ("Open", "Fault")]
+
+
+def test_traces_are_read_from_the_system_folder():
+    s = one("system G  @./\n  req G-1 open  @gate.py:10-15,20-22\n  req G-2 close  @:30\n")
+    assert s.base == "" and (s.reqs[0].at.file, s.reqs[0].at.start, s.reqs[0].at.end) == ("gate.py", 10, 22)
+    assert s.reqs[1].at.file == "gate.py"
+    s = one("system G  @app/gate/\n  req G-1 open  @rules.py:3\n")
+    assert s.reqs[0].at.file == "app/gate/rules.py"
+
+
+@pytest.mark.parametrize("bad, says", [
+    ("system G\n  req open the gate\n", "an ID like VM-1"),
+    ("system G\n  state Gate:\n    Closed -> Open\n", "A -(event[guard] / effect)-> B"),
+    ("system G\n  usecase Leave: drive out\n", "usecase Name: Actor -> step"),
+    ("system G\n  frobnicate the gate\n", "unknown line"),
+    ("system G\n  req G-1 a\n  req G-1 b\n", "written twice"),
 ])
-def test_parser_rejects_with_the_line(spec_text, message):
+def test_parse_errors_name_the_line(bad, says):
     with pytest.raises(SpecError) as e:
-        parse({"bad.c2s": spec_text})
-    assert message in str(e.value)
-    assert re.match(r"bad\.c2s:\d+: ", str(e.value))
+        parse({"g.c2s": bad})
+    assert says in str(e.value) and "g.c2s:" in str(e.value)
 
 
-def test_parser_reads_every_row_of_the_notation():
-    spec = parse({"_s.c2s": "def Agent {route, skipFollowUp}  @a/agent.go:1-9\n", "m.c2s": """\
-m : Agent(route=r1, skipFollowUp)  @app/m
-  # why the module exists
-  when  something holds
-  cfg   depth=5, turnMax=4000B, on=true
-  rule guard(action)  allowed  !err -> 403  ~svc.Allowed
-  POST /x {a,b} -> 201  guard(make); n = create !err -> fail  @h.go:1-20  ? [missing-guard] @:3 no check
-  f(a) -> out  @f.go:1-30
-    v = db.load(a) !err -> log.error, fail
-    v == "" -> return ""  # nothing to do
-    each i !in v, keep:
-      add i
-    return v
-  ip = A ?? B ?? C  @f.go:31-40
-"""})
-    m = spec.module("m")
-    assert m.def_name == "Agent" and m.def_args == [("route", "r1"), ("skipFollowUp", "true")]
-    assert [(c.key, c.value, c.unit, c.type) for c in m.cfg] == [
-        ("depth", "5", "", "Integer"), ("turnMax", "4000", "bytes", "Integer"), ("on", "true", "", "Boolean")]
-    assert m.rules[0].exit.actions == ["403"] and m.rules[0].callee == "svc.Allowed"
-    post, f, ip = m.ops
-    assert (post.method, post.path, post.fields, post.status) == ("POST", "/x", ["a", "b"], "201")
-    assert post.steps[0].ref == "guard" and post.steps[0].args == ["make"] and post.steps[1].exit.kind == "err"
-    assert [s.exit.kind if s.exit else "" for s in f.steps] == ["err", "guard", "", ""]
-    assert f.steps[1].rationale == "nothing to do" and f.steps[2].loop and f.steps[2].children[0].text == "add i"
-    assert ip.steps[0].fallback == ["A", "B", "C"]
-    assert m.issues[0].category == "missing-guard" and m.issues[0].at.file == "app/m/h.go" and m.issues[0].at.start == 3
-
-
-def test_normalize_undoes_slips_of_form():
-    assert normalize("  fn Run(a) -> b  @x.go:1-3\n    m = call chat.Load(x)\n      !err -> fail\n"
-                     "  ? [encoding] @:3 <cuts bytes> -> app/x/\n") == \
-        "  Run(a) -> b  @x.go:1-3\n    m = chat.Load(x)  !err -> fail\n  ? [encoding] @:3 cuts bytes -> app/x/\n"
+def test_model_noise_is_normalized_before_parsing():
+    out = normalize("  req A-1 block an action password.go:24-27, verification.go:35  @credentials.go:26-35\n")
+    assert out == "  req A-1 block an action  @credentials.go:26-35\n"
 
 
 # ------------------------------------------------------------------------------------------------ facts
-def test_auth_facts(facts):
-    _, mf = facts["auth"]
-    assert [r.callee for r in mf.rules] == ["httputil.DecodeJSONBody", "userSvc.IsActionAllowed", "userSvc.VerifyOTP"]
-    login = {e.line: e.owner for e in mf.exits if e.fn == "Handler.LoginCredentials"}
-    assert login == {20: "httputil.DecodeJSONBody", 29: "userSvc.IsActionAllowed", 34: "userSvc.IsActionAllowed",
-                     40: "userSvc.SignIn"}  # 34 is `if !isActionAllowed`: traced back to the call that set it
-    assert not any(e.fn == "Handler.LoginCredentials" and e.line == 43 for e in mf.exits)  # the last statement
-    assert {(c, os.path.basename(f), n) for c, f, n, _ in mf.suspects} == {
-        ("missing-guard", "credentials.go", 47), ("missing-guard", "credentials.go", 89),
-        ("ignored-result", "credentials.go", 70), ("ignored-result", "password.go", 24),
-        ("ignored-result", "verification.go", 35), ("security", "helpers.go", 10), ("security", "helpers.go", 14)}
+def test_vending_facts(facts):
+    sf = facts["vending"]
+    got = {(f.kind, f.name, f.omittable) for f in sf.facts}
+    assert {("entry", "command coin", True), ("entry", "command pick", True), ("entry", "command quit", True),
+            ("state", "Machine.mode", False), ("state", "Machine.credit", False), ("state", "Shelves._slots", False),
+            ("constant", "COIN_VALUES", False), ("constant", "MOTOR_TRIES", False), ("constant", "SLOTS", False),
+            ("constant", "MOTOR_PAUSE_S", True), ("constant", "EVENT_LOG_PATH", True),
+            ("interface", "console", True), ("interface", "file", False)} <= got
+    assert not any(f.name == "main" for f in sf.facts)  # main only wires the commands
+    assert sf.enums == {"Mode": ["IDLE", "CREDITED", "DISPENSING", "FAULT"]}
 
 
-def test_historymanager_facts(facts):
-    _, mf = facts["historymanager"]
-    assert mf.rules == []  # no own callee of 2+ operations; slog, fmt and strings never count
-    assert [(e.line, e.owner) for e in mf.exits] == [(26, "chatsvc.LoadHistory"), (36, ""), (46, "llm.RunWithoutStream"),
-                                                     (101, "")]
-    c = mf.contracts[0]
-    assert c.why == "registered"  # passed to agent.Register
-    assert c.def_line() == "def Agent {route, summary, whenToUse, examples, run, skipFollowUp, changesProject}  " \
-                           "@app/chatbot/agent/registry.go:47-68"
-    assert c.values["route"] == '"history-manager"' and c.values["skipFollowUp"] == "true"
-    assert "app/services/chat/" in mf.boundaries
+def test_state_changes_and_the_values_they_come_from(facts):
+    got = {(c.fn, tuple(c.srcs or ()), c.tgt) for c in facts["vending"].changes}
+    assert got == {("insert_coin", ("IDLE", "CREDITED"), "CREDITED"), ("select", ("CREDITED",), "DISPENSING"),
+                   ("select", ("DISPENSING",), "IDLE"),  # a sale, and the jam's refund through _pay_back's default
+                   ("cancel", ("CREDITED",), "IDLE"), ("on_temperature", ("FAULT",), "IDLE"),
+                   ("on_temperature", ("IDLE", "CREDITED", "DISPENSING"), "FAULT")}
 
 
-def test_prompt_key_names_model_version_and_source(facts, tmp_path):
-    repo, mf = facts["historymanager"]
-    first = user_prompt(repo, mf, "DeepSeek-V4-Flash").splitlines()[0]
-    assert first == f"key: model=DeepSeek-V4-Flash prompt=bspec-{PROMPT_VERSION} source=sha256:{mf.source_hash}"
-    import shutil
-    copy = tmp_path / "hm"
-    shutil.copytree(os.path.join(HERE, "historymanager"), copy)
-    agent = copy / "app/chatbot/agents/historymanager/agent.go"
-    agent.write_text(agent.read_text(encoding="utf-8").replace("historyDepth = 5", "historyDepth = 6"), encoding="utf-8")
-    assert RepoFacts(str(copy)).module(CASES["historymanager"]).source_hash != mf.source_hash  # a code change re-extracts
+def test_routes_lead_to_their_handlers_and_shared_checks_are_found(facts):
+    sf = facts["auth"]
+    routes = {f.name: f for f in sf.facts if f.name.startswith("route ")}
+    assert len(routes) == 6 and routes["route POST /auth/signup"].detail == "calls Signup"
+    assert routes["route POST /auth/signup"].targets[0][0].endswith("credentials.go")
+    assert {c for c, _ in sf.shared} == {"userSvc.IsActionAllowed", "userSvc.VerifyOTP"}  # JSON decoding is plumbing
+    assert "app/domains/user/" in sf.unread and not sf.of("interface")
+
+
+def test_constants_that_limit_behaviour_cannot_be_left_out(facts):
+    sf = facts["historymanager"]
+    assert {(f.name, f.omittable) for f in sf.of("constant")} == {("historyDepth", False), ("maxTurnChars", False)}
+    assert any(f.name == "registered by agent.Register" for f in sf.of("entry"))
+
+
+def test_a_small_repo_is_one_system_and_system_folders_can_be_chosen():
+    _, ss = systems(CASES["vending"][0])
+    assert len(ss) == 1 and ss[0].dirs == ["", "vending"]
+    _, ss = systems(CASES["historymanager"][0], [["app/chatbot/agents/historymanager"]])
+    assert ss[0].dirs == ["app/chatbot/agents/historymanager"]
+    with pytest.raises(ValueError):
+        systems(CASES["vending"][0], [["nowhere"]])
 
 
 # ------------------------------------------------------------------------------------------------ checks
 @pytest.mark.parametrize("name", CASES)
-def test_golden_passes_every_check(name, facts):
-    repo, mf = facts[name]
-    spec = golden(name, mf)
-    res = check(spec, spec.module(name), mf, repo)
-    assert res.problems() == []
-    assert res.coverage.uncovered == [] and res.coverage.extra == []
-    assert len(res.coverage.covered) == len(mf.exits)
+def test_recorded_answers_cover_every_fact_and_pass_lint(name, facts):
+    s = one(recorded(name))
+    r = check(s, facts[name], CASES[name][0])
+    assert r.problems() == [] and not r.coverage.dropped and not r.coverage.bad_omits
 
 
-def test_checks_catch_what_is_wrong(facts):
-    repo, mf = facts["auth"]
-    good = "\n".join(text("golden", "auth.c2s").splitlines())
-    bad = (good.replace("  rule otp(purpose)  otp matches unexpired (email, otpId, purpose)  !err -> fail  ~userSvc.VerifyOTP\n", "")
-           .replace("otp(signup)", "verify otp").replace("otp(reset)", "verify otp")
-           .replace("body; issue tokens !err -> fail", "body; issue tokens")
-           .replace("  ? [security] @:10 X-Forwarded-For is client-set, spoofable", "")
-           .replace("sign in !err -> fail", "res = h.userSvc.SignIn(r.Context()) !err -> fail"))
-    spec = parse({"auth.c2s": bad})
-    probs = "\n".join(check(spec, spec.module("auth"), mf, repo).problems())
-    assert "userSvc.VerifyOTP is called by 2 operations" in probs  # a callee of 2+ operations is no rule
-    assert "step 'verify otp' is inline in POST /auth/signup and PUT /auth/password/reset" in probs
-    assert "exit at app/api/auth/credentials.go:97" in probs  # refresh's error return is in no explicit exit
-    assert "missing issue: `? [security] @helpers.go:10" in probs
-    assert "copies code" in probs
+def test_the_vending_golden_maps_every_behavioural_fact_of_implementation_a(facts):
+    r = check(one(read(CASES["vending"][2])), facts["vending"], CASES["vending"][0])
+    mapped = {f.name for f, _ in r.coverage.mapped}
+    assert {"Machine.mode", "Machine.credit", "COIN_VALUES", "TEMP_LOW_C", "TEMP_HIGH_C", "MOTOR_TRIES", "SLOTS",
+            "command coin", "command pick", "command cancel", "command fill"} <= mapped
+    # written from SYSTEM.md, the golden names the fault state as the document does, not as the code does
+    assert any("takes the value FAULT" in p for p in r.problems())
 
 
-def test_a_trace_over_a_whole_function_covers_none_of_its_exits(facts):
-    repo, mf = facts["historymanager"]
-    lazy = text("golden", "historymanager.c2s").replace(
-        "  trunc(s) = len(s)<=turnMax -> s; s[:turnMax] + \" …[truncated]\"  @:99-104",
-        "  trunc(s) = s[:turnMax] + \" …[truncated]\"  @:99-104")
-    spec = parse({"h.c2s": lazy})
-    res = check(spec, spec.module("historymanager"), mf, repo)
-    assert [(os.path.basename(e.file), e.line) for e in res.coverage.uncovered] == [("agent.go", 101)]
+def test_coverage_refuses_to_omit_state_and_reports_what_is_dropped(facts):
+    bare = "system V
+  part Machine
+  req V-1 sell things
+"
+    r = check(one(bare), facts["vending"], CASES["vending"][0])
+    assert {"MOTOR_TRIES", "Machine.credit", "command coin", "file"} <= {f.name for f in r.coverage.dropped}
+    assert any(p.startswith("not in the model: constant MOTOR_TRIES") for p in r.problems())
+    r = check(one(bare + "  omit credit, mode, tries, quit: implementation
+"), facts["vending"], CASES["vending"][0])
+    assert {f.name for f, _ in r.coverage.bad_omits} >= {"Machine.credit", "Machine.mode", "MOTOR_TRIES"}
+    assert {f.name for f, _ in r.coverage.omitted} == {"command quit"}  # an entry may be left out
+    assert any("drives behaviour" in p for p in r.problems())
 
 
-# ------------------------------------------------------------------------------------------------ SysML
-def test_sysml_is_byte_identical_and_order_free(facts):
-    texts = {"_shared.c2s": shared(facts["historymanager"][1])}
-    for name in CASES:
-        texts[f"{name}.c2s"] = "\n".join(ln for ln in text("golden", f"{name}.c2s").splitlines() if not ln.startswith("def "))
-    a = write_sysml(parse(texts))
-    b = write_sysml(parse(dict(reversed(list(texts.items())))))
-    assert a == b and list(a) == ["_shared.sysml", "auth.sysml", "historymanager.sysml"]
+def test_state_changes_must_be_transitions(facts):
+    text = recorded("vending").replace("    Credited -(valid coin / add credit)-> Credited\n", "")
+    if text == recorded("vending"):  # the recorded wording of the self-loop
+        text = re.sub(r"    Credited -\([^)]*coin[^)]*\)-> Credited\n", "", text)
+    r = check(one(text), facts["vending"], CASES["vending"][0])
+    assert any("a transition back to the same state" in p for p in r.problems())
 
 
-def test_sysml_covers_every_row_of_the_notation(facts):
-    _, mf = facts["historymanager"]
-    files = write_sysml(parse({"_shared.c2s": shared(mf), "h.c2s": text("golden", "historymanager.c2s").split("\n", 2)[2],
-                               "a.c2s": text("golden", "auth.c2s")}))
-    hm, auth, sh = files["historymanager.sysml"], files["auth.sysml"], files["_shared.sysml"]
-    assert "metadata def CodeTrace" in sh and "part def Agent {" in sh
-    assert "part def Historymanager :> Agent {" in hm and ':>> route = "history-manager";' in hm and ":>> skipFollowUp = true;" in hm
-    assert "doc /* when: message depends on earlier turns" in hm
-    assert "attribute turnMax : Integer = 4000 { doc /* unit: bytes */ }" in hm
-    assert "action def RecoverContext {" in hm and "in ctx;" in hm and "out history;" in hm
-    assert "if loadHistory.failed then exitLogErrorFail;" in hm and "if tEmpty then exitLogWarnReturn;" in hm
-    assert "doc /* each m !in current" in hm  # a loop
-    assert '@CodeTrace { :>> file = "app/chatbot/agents/historymanager/agent.go"; :>> lines = "20-49"; }' in hm
-    assert "// REVIEW: [encoding] app/chatbot/agents/historymanager/agent.go:103" in hm
-    assert "item def PostAuthSignupBody {" in auth and "in item body : PostAuthSignupBody;" in auth
-    assert "out attribute status : Integer = 201;" in auth
-    assert "requirement def Otp {" in auth and "attribute purpose : String;" in auth
-    assert 'requirement postAuthSignupOtp : Otp { :>> purpose = "signup"; }' in auth
-    assert "satisfy postAuthSignupOtp by auth;" in auth
-    assert "if xff0Holds then xff0;" in auth  # a fallback chain, in order
-    sections = ["part def Auth", "item def", "action def", "requirement def", "requirement postAuth", "satisfy", "// REVIEW"]
-    assert [auth.index(s) for s in sections] == sorted(auth.index(s) for s in sections)
+@pytest.mark.parametrize("line, says", [
+    ("  part HandleCoinV2\n", "implementation name"),
+    ("  part userSvc\n", "a code name"),
+    ("  item LoginRequest {email}\n", "request or response body"),
+    ("  usecase Buy: Customer -> call on_temperature, POST /buy\n", "is code"),
+    ("  req V-9 call self.shelves.take_one(code) when COIN_VALUES allow\n", "reads as code"),
+    ("  req V-9 TODO: will be added in a later version\n", "as-built only"),
+    ("  omit plans: not implemented\n", "is not a reason"),
+])
+def test_lint_keeps_the_model_at_system_level(line, says, facts):
+    r = check(one(recorded("vending") + line), facts["vending"], CASES["vending"][0])
+    assert any(says in p for p in r.problems()), r.problems()
+
+
+def test_lint_rejects_invented_states_and_requirements_that_follow_one_function(facts):
+    text = recorded("historymanager") + "  state HistoryLoader:\n    Idle -(load)-> Loaded\n"
+    r = check(one(text), facts["historymanager"], CASES["historymanager"][0])
+    assert any("there is no state machine" in p for p in r.problems())
+    steps = "".join(f"  req V-{20 + i} step {i}  @vending/machine.py:{40 + i}\n" for i in range(4))
+    r = check(one(recorded("vending") + steps), facts["vending"], CASES["vending"][0])
+    assert any("all trace into Machine.select" in p for p in r.problems())
 
 
 # ------------------------------------------------------------------------------------------------ extraction
 @pytest.mark.parametrize("name", CASES)
-def test_recorded_answer_is_the_golden_spec(name, facts, tmp_path):
-    """DeepSeek's recorded answer, played back: same rules, endpoints and traced functions as the golden, every
-    exit covered, no duplication, about the golden's size, and every issue the code itself points at."""
-    repo, mf = facts[name]
-    model = Playback(text("recorded", f"{name}.c2s"))
-    summary = run(os.path.join(HERE, name), str(tmp_path), model, "fake", [CASES[name]])
-    assert len(model.prompts) <= 3
-    cand = parse({f: (tmp_path / "spec" / f).read_text(encoding="utf-8") for f in os.listdir(tmp_path / "spec")
-                  if f != "index.c2s"})
-    diff = compare(golden(name, mf), cand, name, mf)
-    assert diff["rules"] == diff["endpoints"] == diff["functions"] == []
-    res = check(cand, cand.module(name), mf, repo)
-    assert res.coverage.uncovered == []
-    assert not [p for p in res.lint if p.startswith("duplication") or p.startswith("missing issue")]
-    gold = len(format_module(golden(name, mf).module(name)).splitlines())
-    assert summary["size"]["lines"] <= 2 * gold
+def test_a_recorded_answer_is_accepted_in_one_round(name, facts):
+    llm = Playback(recorded(name))
+    ex = extract(llm, CASES[name][0], facts[name], "fake")
+    assert ex.rounds == 1 and ex.history == [0] and ex.text == format_system(one(recorded(name)))
 
 
-@pytest.mark.xfail(reason="judgement issues no detector finds (off-by-one, error passed on, unnamed check) depend on "
-                          "the model's recall; see review.md of a live run", strict=True)
-@pytest.mark.parametrize("name", CASES)
-def test_recorded_answer_flags_every_golden_issue(name, facts):
-    _, mf = facts[name]
-    cand = parse({"_shared.c2s": shared(mf), f"{name}.c2s": text("recorded", f"{name}.c2s")})
-    assert compare(golden(name, mf), cand, name, mf)["issues"] == []
+def test_a_rejected_answer_is_repaired_with_its_problems(facts):
+    broken = recorded("vending").replace("  cfg motorTries = 3  @:6\n", "")
+    llm = Playback(broken, recorded("vending"))
+    ex = extract(llm, CASES["vending"][0], facts["vending"], "fake")
+    assert ex.rounds == 2 and ex.history[-1] == 0
+    assert "REPAIR ROUND 1" in llm.prompts[1] and "HandleCoinV2: an implementation name" in llm.prompts[1]
 
 
-def test_repair_round_sends_the_problems_back(facts, tmp_path):
-    good = text("recorded", "auth.c2s")
-    broken = good.replace("  POST /auth/token/refresh {refresh_token} -> 200  body; refresh token !err -> fail  @:89-101\n", "")
-    model = Playback(broken, good)
-    run(os.path.join(HERE, "auth"), str(tmp_path), model, "fake", [CASES["auth"]])
-    assert len(model.prompts) == 2
-    assert "IT WAS REJECTED" in model.prompts[1] and "credentials.go:97" in model.prompts[1]
-    assert "## Round 2" in (tmp_path / "extract" / "auth.md").read_text(encoding="utf-8")
+def test_an_unreadable_answer_keeps_the_best_round(facts):
+    llm = Playback(recorded("vending"), "system ???\n")
+    ex = extract(llm, CASES["vending"][0], facts["vending"], "fake", rounds=1)
+    assert ex.model is not None and ex.history == [0]
 
 
-def test_outputs_and_size_report(facts, tmp_path):
-    old = tmp_path / "requirements.json"
-    old.write_text(json.dumps({"requirements": [{"text": "x" * 300}] * 7}), encoding="utf-8")
-    run(os.path.join(HERE, "auth"), str(tmp_path / "out"), Playback(text("recorded", "auth.c2s")), "fake",
-        [CASES["auth"]], compare=str(old))
+def test_run_writes_the_document_and_the_reports(tmp_path, facts):
     out = tmp_path / "out"
-    for f in ("LEGEND.md", "review.md", "size_report.md", "size_report.json", "bspec.json", "spec/index.c2s",
-              "spec/_shared.c2s", "spec/auth.c2s", "sysml/auth.sysml", "sysml/_shared.sysml"):
+    summary = run(CASES["auth"][0], str(out), Playback(recorded("auth")), "fake", with_review=True)
+    assert summary["systems"] == ["Auth"] and summary["size"]["dropped"] == 0
+    for f in ("spec/Auth.c2s", "LEGEND.md", "system_doc.md", "coverage.md", "size_report.json", "size_report.md",
+              "review.md", "extract/Auth.md", "bspec.json"):
         assert (out / f).is_file(), f
-    rep = json.loads((out / "size_report.json").read_text(encoding="utf-8"))
-    row = rep["modules"][0]
-    assert row["rules"] == 3 and row["uncovered_exits"] == 0 and row["lint_hits"] == 0
-    assert rep["old"]["requirements"] == 7 and rep["chars_vs_old"] == round(rep["total"]["chars"] / 2100, 3)
-    assert (out / "spec" / "index.c2s").read_text(encoding="utf-8") == "auth  @app/api/auth\n"
-    assert "| ignored-result | app/api/auth/password.go:24 |" in (out / "review.md").read_text(encoding="utf-8")
+    assert "## How it behaves" in (out / "system_doc.md").read_text(encoding="utf-8")
+    assert "| entry route POST /auth/signup |" in (out / "coverage.md").read_text(encoding="utf-8")
+    assert "## Auth" in (out / "review.md").read_text(encoding="utf-8")
 
 
-def test_from_spec_rebuilds_the_same_sysml_without_a_model(tmp_path):
-    first = tmp_path / "a"
-    run(os.path.join(HERE, "auth"), str(first), Playback(text("recorded", "auth.c2s")), "fake", [CASES["auth"]])
-    from_spec(str(first / "spec"), str(tmp_path / "b"), os.path.join(HERE, "auth"))
-    for f in os.listdir(first / "sysml"):
-        assert (first / "sysml" / f).read_bytes() == (tmp_path / "b" / "sysml" / f).read_bytes()
+def test_from_spec_rebuilds_without_a_model(tmp_path):
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+    (spec_dir / "auth.c2s").write_text(recorded("auth"), encoding="utf-8")
+    total = from_spec(str(spec_dir), str(tmp_path / "out"), CASES["auth"][0])
+    assert total["requirements"] == len(one(recorded("auth")).reqs) and total["dropped"] == 0
+    with pytest.raises(ValueError):
+        from_spec(str(spec_dir), str(tmp_path))
+
+
+# ------------------------------------------------------------------------------------------------ document
+def test_the_document_reads_like_a_system_description():
+    doc = system_doc(parse({"g": read(CASES["vending"][2])}))
+    sysmd = read(os.path.join(VENDING, "SYSTEM.md"))
+    for heading in ("## People who use it", "## What it contains", "## Settings", "## How it behaves"):
+        assert heading in doc and heading in sysmd
+    assert "- Coins: 5, 10 and 25 cents." in doc
+    assert "In credited, on insert coin (if valid): add value to credit, then stay in credited." in doc
+    assert "collect item (not shown in the code)" in doc
+    assert not re.search(r"\b[a-z]+[A-Z]\w*\b", doc.split("## States")[0])  # no camelCase left in the prose
+    assert doc == system_doc(parse({"g": read(CASES["vending"][2])}))
+
+
+# ------------------------------------------------------------------------------------------------ comparison
+def test_the_recorded_vending_answer_against_the_golden():
+    res = compare(read_model(CASES["vending"][2]), model_of(parse({"r": recorded("vending")})))
+    for kind in ("state", "transition", "requirement", "usecase", "attribute"):
+        assert res[kind].recall == 1.0, kind
+    renamed = [m for m in res["state"].matches if m.rule == "transitions"]
+    assert [(m.a.name, m.b.name) for m in renamed] == [("OutOfService", "Fault")]
+    assert {e.name for e, _ in res["usecase"].doc_only} == set()  # doc-only steps sit inside use cases
+    assert any("doc-only steps" in n for m in res["usecase"].matches for n in m.notes)
+
+
+# ------------------------------------------------------------------------------------------------ isolation
+def five_grams(text):
+    w = re.findall(r"[a-z0-9]+", text.lower())
+    return {" ".join(w[i:i + 5]) for i in range(len(w) - 4)}
+
+
+@pytest.mark.parametrize("code", ["code", "code_b"])
+def test_no_prompt_holds_the_system_document_or_the_golden(code):
+    repo = os.path.join(VENDING, code)
+    _, ss = systems(repo)
+    prompts = [SYSTEM] + [user_prompt(repo, sf, "fake") for sf in ss]
+    sysmd, golden = read(os.path.join(VENDING, "SYSTEM.md")), read(CASES["vending"][2])
+    for p in prompts:
+        assert not five_grams(p) & five_grams(sysmd)
+        for line in golden.splitlines():
+            body = re.sub(r"\s+@\S+$", "", line.strip())
+            if len(body) > 25:
+                assert body not in p
+    for word in ("vending", "snack", "coin", "golden"):  # the worked example is a parking gate
+        assert word not in SYSTEM.lower()
+    assert all("SYSTEM.md" not in f and "golden" not in f for sf in ss for f in sf.files)
+
+
+# ------------------------------------------------------------------------------------------------ fixtures
+def test_implementation_a_does_what_the_system_document_says():
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"], cwd=VENDING,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.skipif(shutil.which("go") is None, reason="implementation B is Go: its behaviour tests need the go tool")
+def test_implementation_b_does_what_the_system_document_says():
+    r = subprocess.run(["go", "test", "-count=1", "./..."], cwd=os.path.join(VENDING, "tests_b"),
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr

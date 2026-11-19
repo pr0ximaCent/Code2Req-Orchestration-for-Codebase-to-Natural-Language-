@@ -1,144 +1,140 @@
-"""Code to spec: the one model step. One call per module, then repair rounds until the spec parses and passes
-check.py (no bad trace, no missing rule, no duplication, every early exit explicit), or the rounds run out.
+"""Code to spec: the one model step. One call per system, then repair rounds until the spec parses and passes
+check.py (every fact in the model or omitted, lint clean), or the rounds run out; the best round is kept.
 
-The prompt shows the module's code with line numbers and what facts.py found: the early exits with the call
-each follows, the callees that must be rules, the shared contract and its def line, the packages not read.
-Answers are cached by the run's CachedLLM; the first line of the user prompt names the model, the prompt
-version and a hash of the module's source, so the cache key holds all three and a code change re-extracts."""
+The prompt shows the system's code with line numbers and what sysfacts.py found (entry points, state, constants,
+interfaces), and asks for the model the code was built to implement, in domain terms. The worked example is a
+parking gate: it is not a system code2req is tested on, and no test system ever appears in the prompt's text.
+Answers are cached by the run's CachedLLM; the first line of the user prompt names the model, the prompt version
+and the source hash, so a change to any of them asks again."""
 from __future__ import annotations
 
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 
 from .check import Result, check
-from .facts import ModuleFacts, RepoFacts
-from .notation import CATEGORIES, LEGEND, Spec, SpecError, format_module, parse
+from .notation import LEGEND, OMIT_REASONS, Spec, SpecError, System, format_system, parse
+from .sysfacts import SystemFacts
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "11"
+PROMPT_VERSION = "14"
+RETRY_WAITS = (5, 20, None)  # seconds before trying a failed model call again; None: give up
 
 SYSTEM = LEGEND + """
-You write the behaviour spec of ONE module of a codebase in this notation, from its code. The spec is turned
-into a SysML v2 model by a fixed program, so it must say every behaviour once and nothing else.
+You read a codebase and write back the system model it was built to implement: what a systems engineer would have
+modelled in SysML before the code existed (requirements, actors, parts, states, use cases, activities), in domain
+terms. The model must read as if the code had been written from it. It is not a description of the code: no
+functions, branches, error returns or bugs, unless they change what the system does as seen from outside.
 
-Write:
-- The module line first, exactly as given (with its def and trace). Fill the def's arguments from the
-  literal the code gives: short values as k=v, true booleans as bare flags; leave out prose fields
-  (summaries, examples, functions). Put what the prose says the module is for in one `when` line.
-- `cfg` for constants that set behaviour (limits, depths, sizes, timeouts), with units.
-- A `rule` for EVERY callee listed under RULES, once, ending in `~<callee>` exactly as listed. Give it a
-  parameter for what differs between callers (a purpose, an action kind). If its failure ends the caller
-  (an exit follows the call), give the rule `!err -> <actions>`. Operations then apply it by name:
-  `guard(signup)`. Never write a rule's call inline.
-- Every operation: an endpoint line for each route handler (method, path as registered, JSON body fields as
-  the code names them, success status), a `fn(ins) -> out` block for a function with several steps, a
-  `name(params) = ...` line for a small helper. Steps are short verbs (`create user`, `otpId = send otp`).
-  One line per distinct behaviour; group helpers that only format into the operation that uses them.
-- Traces: every operation and rule line ends with `@file:a-b` (file relative to the module folder, `@:a-b`
-  for the file of the previous trace). The range is the function's own lines.
-- EXITS: every early return listed under EXITS must be an explicit exit of the operation whose trace holds
-  it: `step !err -> actions` when the call before it failed, `cond -> actions` for a condition, an
-  alternative of `a ?? b`, or the application of a rule with an exit whose callee is the call it follows
-  (the rule covers every exit after its call). Count them: the explicit exits of an operation, in order,
-  must match its listed exits one for one. When DEFAULT HANDLING is given, write it once as the module line
-  `!err -> fail` and mark each step whose exit is listed `(default)` with `!` (`create user!`); only exits
-  listed `(differs)` get their own `!err -> ...` or `cond -> ...`. A rule needs no exit of its own when the
-  default applies to it. Returns listed under PASS-UP are the function's normal end: write no exit for them.
-- FOLDS: a helper listed there has one caller, no exits and no effects: never give it a line of its own; say
-  what it does inside its caller's step (`t = transcript of msgs, each turn truncated`; `credits in flight = the
-  cost of every unfinished message, in credits`).
-- STATE: write one `state <name>  <what it holds>` line for each variable listed under STATE, in plain words
-  (`state userCreditCache  each user's balance and when it expires`).
-- REASONS: for each function listed under COMMENTED, keep the reason its comment gives as `# <reason>` on the
-  line of the operation (or the step) it explains, in a few words (`# fails closed: no balance, no run`). `->` always ends the operation: a conditional step that does not
-  end it is written `write ai line if text`, never `text -> write ai line`.
-- Open issues as `? [category] @file:line <short text> [-> package/]`: a possible bug or gap (a sibling
-  endpoint missing a guard the others have, a result ignored, an off-by-one, bytes vs characters, a
-  client-supplied header trusted), or behaviour that depends on code not shown (name the package from
-  PACKAGES NOT READ after `->`). If the code doesn't say what a check checks, `? [unnamed-check]`.
-  Categories: """ + ", ".join(CATEGORIES) + """.
-Never write: "shall", the module's name inside lines, "or an error" (exits are explicit), types the body
-fields imply, debug logging, TODOs or planned designs (only what the code does now), guesses about code not
-shown (write a `?` instead).
+RULES
+- Domain names, not function names: take them from routes, enums, identifiers, comments, UI text and log
+  messages (insertTicket, Fault, Leave), never handleTicketV2, processRequest, fmtMoney.
+- Implementation detail disappears: parsing and serialisation, logging, error plumbing, retries, caching,
+  dependency wiring, formatting helpers. Leave each out with an `omit` line (reasons: """ + ", ".join(OMIT_REASONS) + """).
+- One requirement per observable behaviour or constraint. Several entry points obeying the same rule are one
+  requirement that names them. A requirement states the rule and what happens otherwise ("open only for a paid
+  ticket; otherwise show the fee"): refusals that end the same way are one requirement, whatever message each
+  shows, not one requirement per rejected case. Checks of malformed input (an unknown
+  code, a negative amount) are implementation unless the outside sees a behaviour of its own. Write requirements
+  as short statements in domain words ("shall" is implied); use the cfg names for limits; no code (no dotted names,
+  no CONSTANT_NAMES, no function names, no operators other than in a constraint). A requirement is a rule the system
+  obeys, not a use case said again: "sign in with a password" is the use case; its requirement is the rule it
+  obeys ("lock the account after 5 failed sign-ins"). The steps a function takes, in order, are an activity.
+- A state machine only where the code keeps such a value (listed under STATE CHANGES or as a state fact); a
+  function that runs its steps and returns has no states.
+- States come from values that change over time and drive behaviour (status fields, enums, flags, modes, counters
+  with thresholds). Name the states after the values the code sets, in PascalCase domain words (an enum OPEN gives
+  Open, WAITING_FOR_PAYMENT gives WaitingForPayment).
+  Transitions come from the events that change them, with their guards and effects. `*` means from every state.
+- Use cases come from the entry points grouped by actor goal (routes, commands, UI actions, message handlers,
+  timers, sensor callbacks), not one per entry point. Steps are what the actor does and gets.
+- Activities only for multi-step behaviour whose order matters. Their steps are actions in domain words, never
+  function names (load turns, not loadHistory).
+- Items are the domain things exchanged or stored (a ticket, a payment, a one-time code), not request or response
+  bodies.
+- A value set again while it already holds (a second payment while Paying) is a transition back to the same state.
+- Settings and constants that change behaviour are `cfg` entries with units.
+- As-built only: TODOs and plans are not requirements. When behaviour depends on code you were not shown, write an
+  open question `? ... -> package/` naming the package that would answer it; never invent it.
+- Mark a step the code cannot show (a physical action, a person's decision) with [doc-only].
+- Every FACT listed in the prompt must be in the model: named (its words in an element) or traced (an element's
+  @trace on its line), or left out with `omit name: reason`. Facts marked MUST cannot be omitted.
+- Trace each requirement, state machine, use case and cfg line to the lines that show it (@file:lines, one range,
+  paths as the listing gives them). List requirement IDs one by one (PG-1, PG-2), never as a range.
 
-WRITE PLAIN WORDS, NEVER CODE. The spec becomes a system document engineers read; the code is only evidence.
-Steps, conditions and actions are short plain phrases: no dotted names (h.svc, req.Email), no operators (==, !=,
-<=, &&, ||), no brackets, braces or call syntax, no nil/null. Leave out locking, logging details, copying and
-formatting: they are not behaviour. Name things by what they are (the cached balance, the message's usage).
-A conditional step that does not end the operation is `step if condition`; several steps that run only when
-something holds are a block: `if condition:` with the steps indented below, then optionally `else:` with its own. Put `!err -> ...` on the SAME line as
-its step. Applying a rule by name (`guard(signup)`) and calling an operation by name are fine.
-  code:  res = h.userSvc.SignIn(r.Context(), req.Email, req.Password)    plain:  sign in!
-  code:  cacheMutex.Lock(); cached, ok := cache[userID]; unlock           plain:  read the cached balance
-  code:  !ok || now > cached.expiry -> refresh                            plain:  refresh the balance if missing or expired
-  code:  email == "" || !purpose.IsValid() -> 400                         plain:  no email or invalid purpose -> 400
-  code:  !err -> return Balance{}, err                                    plain:  !err -> fail
-
-A complete example, for a different module (pricing.go has price at lines 10-31, helpers.go region at 5-12):
+EXAMPLE (a parking gate; illustration only)
+code:
+### settings.py
+   1  RATE_PER_HOUR = 2.50   # dollars
+   2  GRACE_MINUTES = 15
+   3  OPEN_SECONDS = 8
+### gate.py
+   1  import logging
+   2  from enum import Enum
+   3  from .settings import RATE_PER_HOUR, GRACE_MINUTES, OPEN_SECONDS
+   4  log = logging.getLogger("gate")
+   5  class GateState(Enum):
+   6      CLOSED = 1; OPEN = 2; FAULT = 3
+   7  class Gate:
+   8      def __init__(self, barrier, display, timer):
+   9          self.barrier, self.display, self.timer, self.state = barrier, display, timer, GateState.CLOSED
+  10      def on_ticket(self, ticket):  # the ticket reader calls this
+  11          if self.state is not GateState.CLOSED:
+  12              return self.display.show("please wait")
+  13          if not ticket.paid_at:
+  14              log.info("unpaid ticket %s", ticket.plate)
+  15              return self.display.show(fmt_money(hours(ticket.entered_at) * RATE_PER_HOUR))
+  16          if minutes_since(ticket.paid_at) > GRACE_MINUTES:
+  17              return self.display.show("grace time over, pay again")
+  18          self.barrier.raise_(); self.state = GateState.OPEN
+  19          self.timer.start(OPEN_SECONDS, self.close)
+  20      def on_car_passed(self):
+  21          self.close()
+  22      def close(self):
+  23          self.barrier.lower(); self.state = GateState.CLOSED
+  24      def on_fault(self, code):
+  25          self.state = GateState.FAULT; alert_attendant(code)
+  26      def reset(self):
+  27          if self.state is GateState.FAULT:
+  28              self.state = GateState.CLOSED
+  29  def fmt_money(x):
+  30      return f"${x:.2f}"
+spec:
 ```c2s
-orders  @app/api/orders
-  cfg   maxItems=50
-  !err -> fail
-  rule auth(role)  caller has role  !err -> 403  ~authz.Require  ? [unresolved] @handler.go:24 roles not read -> app/authz/
-  rule body  JSON body decodes  !err -> 400  ~httputil.Decode  ? [unresolved] @handler.go:21 decoding not read -> app/core/httputil/
-  state openCarts  each user's cart until checkout
-  POST /orders {items,coupon} -> 201  body; auth(buyer); more than maxItems items -> 422; total = price(items); save order!  @handler.go:20-48
-  DELETE /orders/{id} -> 204  auth(admin); cancel order!  @:51-63  ? [missing-guard] @:51 no owner check
-  price(items) -> total  @pricing.go:10-31
-    each i in items:
-      add quantity times unit price
-    no coupon -> return total
-    if the buyer is new:
-      add the welcome discount
-    else:
-      add loyalty points
-    look up the coupon !err -> return total  # an unknown coupon is ignored, not an error
-    return total less the coupon rate
-  region = X-Region header ?? defaultRegion  @helpers.go:5-12
-  ? [boundary] @pricing.go:24 coupon expiry not checked here -> app/domains/coupons/
+system ParkingGate  @gate/
+  doc Lets cars leave a car park once their ticket is paid.
+  actor Driver, Attendant
+  part Gate, Barrier, Display, TicketReader
+  item Ticket {plate, enteredAt, paidAt}
+  cfg ratePerHour = 2.50 dollars, grace = 15 min, openTime = 8 s  @settings.py:1-3
+  req PG-1 open the barrier only for a paid ticket whose payment is no older than grace  @gate.py:13-18
+  req PG-2 for an unpaid ticket, show the fee: hours since entry times ratePerHour  @:13-15
+  req PG-3 after grace has passed since payment, ask the driver to pay again  @:16-17
+  req PG-4 close the barrier when the car has passed, or openTime after opening  @:19-23
+  req PG-5 ignore tickets while the barrier is open or the gate is in fault  @:11-12
+  req PG-6 on a fault, stop and alert the attendant; only a reset returns the gate to service  @:24-28  ? how a fault is detected -> gate/sensors/
+  state Gate:  @gate.py:5-6
+    Closed -(ticket[PG-1] / raise barrier)-> Open
+    Open -(car passed / lower barrier)-> Closed
+    Open -(after openTime / lower barrier)-> Closed
+    * -(fault / alert attendant)-> Fault
+    Fault -(reset)-> Closed
+  usecase Leave: Driver -> [doc-only] pay at the pay station, insert ticket, drive out  @gate.py:10-21
+  usecase ClearFault: Attendant -> reset the gate  @:26-28
+  Gate satisfies PG-1, PG-4, PG-5, PG-6
+  omit fmt_money: formatting
+  omit unpaid ticket log: logging
 ```
 
 Answer with the spec only, in one ```c2s block."""
 
-KEYWORD = re.compile(r"^(\s*)(?:fn|func|def|cond|call|step|if(?=\s.*[^:\s]\s*$))\s+(?=\S)")  # `if X:` is a block
-
-
-LOCK_ONLY = re.compile(r"(?i)^\s{4,}(?:(?:un)?lock\w*(?:\(\))?|defer\b.*|(?:acquire|release|take|hold|lock|unlock)\b"
-                       r"[\w\s']*\b(?:lock|mutex)\b.*|(?:un)?lock the \w+(?: \w+)?)\s*$")  # a step that only locks
-LOCK_OP = re.compile(r"(?i)^\s{2}(?:un)?lock\w*\s*(?:\([^)]*\))?\s*=.*$")  # a helper that only locks
-
-
-def normalize(text: str) -> str:
-    """Slips of form a fixed rule can undo, before the strict parser reads the spec: a keyword before a line
-    (fn, cond, call), an exit or trace on a line of its own (joined to the line above), issue text in <...>."""
-    out: list[str] = []
-    for raw in text.splitlines():
-        if LOCK_ONLY.match(raw) or LOCK_OP.match(raw):  # locking is how the code is safe, not behaviour: dropped
-            continue
-        line = KEYWORD.sub(r"\1", raw.rstrip())
-        line = re.sub(r"(=\s*)call\s+", r"\1", line)
-        body = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
-        if out and ((body.startswith("!err") and indent >= 4) or re.fullmatch(r"@\S+", body)):  # indent 2: the default
-            out[-1] = out[-1].rstrip() + "  " + body
-            continue
-        d = re.match(r"(\S.*?|  (?:when|cfg)\s.*?)\s{2,}(!err\s*->.*)$", line)
-        if d and not body.startswith(("rule ", "!err")) and not re.match(r"\s*(GET|POST|PUT|PATCH|DELETE)\b", line):
-            out += [d.group(1).rstrip(), "  " + d.group(2).strip()]  # the default written on the module or when line
-            continue
-        m = re.match(r"(\s*\?\s*(?:\[[\w-]+\]\s*)?(?:@\S+\s*)?)<(.*)>(\s*->\s*\S+/)?\s*$", line)
-        if m:
-            line = m.group(1) + m.group(2) + (m.group(3) or "")
-        out.append(line)
-    return "\n".join(out) + "\n"
-
 
 @dataclass
 class Extraction:
-    module: str
+    system: str
     text: str = ""  # the spec as the model wrote it (best round)
     spec: Spec | None = None
     result: Result | None = None
@@ -147,6 +143,10 @@ class Extraction:
     history: list[int] = field(default_factory=list)  # problems per round
     attempts: list[tuple[str, list[str]]] = field(default_factory=list)  # every round: (answer, its problems)
 
+    @property
+    def model(self) -> System | None:
+        return self.spec.systems[0] if self.spec and self.spec.systems else None
+
 
 def numbered(repo: str, rel: str) -> str:
     with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as f:
@@ -154,60 +154,35 @@ def numbered(repo: str, rel: str) -> str:
     return "\n".join(f"{i:4d}  {ln}" for i, ln in enumerate(lines, 1))
 
 
-def header_line(mf: ModuleFacts) -> str:
-    c = mf.contracts[0] if mf.contracts else None
-    at = f"@{mf.dir}" if not c else f"@{c.file_used}"
-    return f"{mf.name}" + (f" : {c.name}(...)" if c else "") + f"  {at}"
+def local(sf: SystemFacts, rel: str) -> str:
+    return rel[len(sf.base) + 1:] if sf.base and rel.startswith(sf.base + "/") else rel
 
 
-def user_prompt(repo: RepoFacts, mf: ModuleFacts, label: str) -> str:
-    out = [f"key: model={label} prompt=bspec-{PROMPT_VERSION} source=sha256:{mf.source_hash}", "",
-           f"MODULE {mf.name}, folder {mf.dir}/", f"MODULE LINE: {header_line(mf)}"]
-    if mf.contracts:
-        out.append("SHARED CONTRACT (already defined; use its name in the module line):")
-        for c in mf.contracts:
-            vals = ", ".join(f"{k}={v[:80]}" for k, v in c.values.items())
-            out.append(f"  {c.def_line()}   ({c.why}: {c.type_ref} at {c.file_used}:{c.line_used}; literal: {vals})")
-    if mf.rules:
-        out.append("RULES (called from 2+ operations: one rule each, ending in ~callee):")
-        out += [f"  ~{r.callee}  called by {', '.join(r.callers)}" + ("; an exit follows it" if r.guarded else "")
-                for r in mf.rules]
-    if mf.default_handling:
-        out.append(f"DEFAULT HANDLING ({mf.default_count} error exits do the same): {mf.default_handling[:120]}")
-    if mf.exits:
-        out.append("EXITS (early or error returns; each must be explicit):")
-        by_fn: dict[str, list[str]] = {}
-        for e in mf.exits:
-            tag = "" if not mf.default_handling or not e.err else \
-                " (default)" if e.handling == mf.default_handling else " (differs)"
-            by_fn.setdefault(f"{e.fn} ({os.path.basename(e.file)})", []).append(
-                f"{e.line}" + (f" after {e.owner}" if e.owner else "") + tag)
-        out += [f"  {fn}: {', '.join(xs)}" for fn, xs in by_fn.items()]
-    if mf.state:
-        out.append("STATE (kept between calls; one `state` line each): "
-                   + ", ".join(f"{v} ({os.path.basename(f)}:{n})" for v, f, n, _ in mf.state))
-    if mf.commented:
-        out.append("COMMENTED (keep the comment's reason as `# ...`): "
-                   + ", ".join(f"{fn} {os.path.basename(f)}:{n}" for fn, f, n in mf.commented))
-    if mf.passups:
-        out.append("PASS-UP (a final `return ..., err`; implicit, no exit): "
-                   + ", ".join(f"{fn} {os.path.basename(f)}:{n}" for f, n, fn in mf.passups))
-    if mf.folds:
-        out.append("FOLDS (no line of their own; describe inside the caller's step): "
-                   + ", ".join(f"{h} into {i}" for h, i in mf.folds))
-    out.append("FUNCTIONS: " + "; ".join(f"{repo.fn_name(f)} {os.path.basename(f.file)}:{f.line}-{f.end}" for f in mf.fns))
-    if mf.suspects:
-        out.append("SUSPECTS (flag each as a `?` line at that location, with that category):")
-        out += [f"  [{c}] {os.path.basename(rel)}:{line}  {why}" for c, rel, line, why in mf.suspects]
-    if mf.boundaries:
-        out.append("PACKAGES NOT READ (our own code this module calls): " + ", ".join(mf.boundaries))
-    folded = {(f.file, f.line): into for f in mf.fns for h, into in mf.folds if repo.fn_name(f) == h}
-    for rel in mf.files:
-        listing = numbered(repo.repo, rel).splitlines()
-        for (frel, line), into in folded.items():
-            if frel == rel:
-                listing[line - 1] += f"    <<< FOLDED into {into}: no line of its own"
-        out += ["", f"### {rel[len(mf.dir) + 1:] if mf.dir else rel}", "\n".join(listing)]
+def user_prompt(repo: str, sf: SystemFacts, label: str) -> str:
+    base = sf.base + "/" if sf.base else ""
+    out = [f"key: model={label} prompt=bspec-{PROMPT_VERSION} source=sha256:{sf.source_hash}", "",
+           f"SYSTEM: the code in {', '.join((d or '.') + '/' for d in sf.dirs)}. Name the system in domain terms.",
+           f"SYSTEM LINE: system <Name>  @{base or './'}",
+           "Paths in traces are as the listing below gives them.", "",
+           "FACTS (each must be in the model, or left out with `omit name: reason`; MUST = cannot be left out):"]
+    for f in sf.facts:
+        must = "MUST " if not f.omittable else ""
+        out.append(f"  {f.kind:9} {must}{f.name}  {local(sf, f.file)}:{f.line}" + (f"  {f.detail[:110]}" if f.detail else ""))
+    if sf.enums:
+        out.append("ENUMS: " + "; ".join(f"{k} = {', '.join(v)}" for k, v in sorted(sf.enums.items())))
+    if sf.changes:
+        out.append("STATE CHANGES (each is a transition; the event is what makes the function run):")
+        out += [f"  {c.fn} sets {c.state.split('.')[-1]} to {c.tgt}"
+                + (f" from {', '.join(c.srcs)}" if c.srcs else " (from the values its checks allow)")
+                + f"  {local(sf, c.file)}:{c.line}" for c in sf.changes]
+    if sf.shared:
+        out.append("SHARED CHECKS (applied by several entry points: one requirement each, naming them):")
+        out += [f"  {callee}  applied by {', '.join(callers)}" for callee, callers in sf.shared]
+    if sf.unread:
+        out.append("OUR OWN PACKAGES NOT SHOWN (behaviour that depends on them is an open question `? ... -> package/`): "
+                   + ", ".join(sf.unread))
+    for rel in sf.files:
+        out += ["", f"### {local(sf, rel)}", numbered(repo, rel)]
     return "\n".join(out)
 
 
@@ -216,16 +191,27 @@ def spec_block(answer: str) -> str:
     return (m.group(1) if m else answer).strip("\n") + "\n"
 
 
-def evaluate(text: str, shared: str, mf: ModuleFacts, repo: RepoFacts) -> tuple[Spec | None, Result | None, str]:
+def normalize(text: str) -> str:
+    """What models write around the notation: tabs, a 4-space indent for system members, blank trailing spaces."""
+    lines = [ln.replace("\t", "    ").rstrip() for ln in text.splitlines()]
+    # file references written into a statement (`... password.go:24-27, verification.go:35`) are traces, not text
+    lines = [re.sub(r"\s{3,}(?=[@?])", "  ", FILE_REFS.sub("", ln)) if ln.lstrip().startswith(("req ", "usecase ", "activity "))
+             else ln for ln in lines]
+    return "\n".join(lines) + "\n"
+
+
+FILE_REFS = re.compile(r"(?<![@\w/])\s*\(?[\w/.-]+\.(?:go|py|ts|tsx|js|jsx|java|cs)(?::\d+(?:-\d+)?)?"
+                       r"(?:\s*,\s*(?:[\w/.-]+\.(?:go|py|ts|tsx|js|jsx|java|cs))?:?\d+(?:-\d+)?)*\)?(?=\s|$|,)")
+
+
+def evaluate(text: str, sf: SystemFacts, repo: str) -> tuple[Spec | None, Result | None, str]:
     try:
-        spec = parse({"_shared.c2s": shared, f"{mf.name}.c2s": text}, known={f.name for f in mf.fns})
+        spec = parse({f"{sf.name}.c2s": text})
     except SpecError as e:
         return None, None, str(e)
-    m = spec.module(mf.name)
-    if m is None:
-        names = ", ".join(x.name for x in spec.modules if not x.name.startswith("_")) or "none"
-        return spec, None, f"the spec has no module {mf.name} (it has: {names})"
-    return spec, check(spec, m, mf, repo), ""
+    if len(spec.systems) != 1:
+        return spec, None, f"write exactly one `system` (found {len(spec.systems)})"
+    return spec, check(spec.systems[0], sf, repo), ""
 
 
 def problems_of(ex: Extraction) -> list[str]:
@@ -234,20 +220,27 @@ def problems_of(ex: Extraction) -> list[str]:
     return ex.result.problems() if ex.result else []
 
 
-def extract(llm, repo: RepoFacts, mf: ModuleFacts, shared: str, label: str, rounds: int = 5) -> Extraction:
-    base = user_prompt(repo, mf, label)
+def extract(llm, repo: str, sf: SystemFacts, label: str, rounds: int = 4) -> Extraction:
+    base = user_prompt(repo, sf, label)
     best: Extraction | None = None
     attempts: list[tuple[str, list[str]]] = []
     prompt = base
     for n in range(1, rounds + 1):
-        try:
-            answer = llm.complete(SYSTEM, prompt)
-        except Exception as e:  # budget or network: keep the best answer so far
-            log.warning("bspec %s: model call failed: %s", mf.name, e)
+        answer = None
+        for wait in RETRY_WAITS:  # a failed call is tried again; budget or a lasting outage keeps the best so far
+            try:
+                answer = llm.complete(SYSTEM, prompt)
+                break
+            except Exception as e:
+                log.warning("bspec %s round %d: model call failed: %s", sf.name, n, e)
+                if "budget" in str(e).lower() or wait is None:
+                    break
+                time.sleep(wait)
+        if answer is None:
             break
         text = normalize(spec_block(answer))
-        spec, result, error = evaluate(text, shared, mf, repo)
-        ex = Extraction(mf.name, text, spec, result, error, n)
+        spec, result, error = evaluate(text, sf, repo)
+        ex = Extraction(sf.name, text, spec, result, error, n)
         probs = problems_of(ex)
         attempts.append((text, probs))
         ex.history = (best.history if best else []) + [len(probs)]
@@ -257,15 +250,15 @@ def extract(llm, repo: RepoFacts, mf: ModuleFacts, shared: str, label: str, roun
             best.history = ex.history
         if not probs:
             break
-        log.info("bspec %s round %d: %d problem(s)", mf.name, n, len(probs))
+        log.info("bspec %s round %d: %d problem(s)", sf.name, n, len(probs))
         # repair the best answer so far, not the last: a round that fixes some problems and adds others is dropped
-        prompt = (base + "\n\nYOUR PREVIOUS ANSWER (rejected):\n```c2s\n" + best.text + "```\nIT WAS REJECTED FOR "
+        prompt = (base + f"\n\nREPAIR ROUND {n}. YOUR PREVIOUS ANSWER (rejected):\n```c2s\n" + best.text + "```\nIT WAS REJECTED FOR "
                   "THESE PROBLEMS. Change only what they name and keep everything else as it is; answer the whole spec "
                   "again:\n" + "\n".join(f"- {p}" for p in problems_of(best)[:40]))
     if best is None:
-        best = Extraction(mf.name, error="no answer from the model")
+        best = Extraction(sf.name, error="no answer from the model")
     best.rounds = len(best.history)
     best.attempts = attempts
-    if best.spec is not None and best.spec.module(mf.name) is not None:
-        best.text = format_module(best.spec.module(mf.name))
+    if best.model is not None:
+        best.text = format_system(best.model)
     return best

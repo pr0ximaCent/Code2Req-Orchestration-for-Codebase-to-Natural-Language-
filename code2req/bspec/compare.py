@@ -23,6 +23,7 @@ between the same two states matches on its ends alone."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import zipfile
@@ -36,6 +37,7 @@ will may can should when while if then else only any all each every per as into 
 has have def system""".split())
 NOISE = {"event": {"signal", "event", "evt", "trigger", "received", "on"}, "state": {"state", "mode", "status"},
          "requirement": {"requirement", "req"}}
+CONTAINED = 0.6  # a requirement whose words (by weight) are this much inside another is part of it
 THRESHOLD = {"requirement": 0.3, "actor": 0.5, "part": 0.5, "item": 0.5, "usecase": 0.5, "attribute": 0.5}
 MODIFIERS = {"public", "private", "protected", "abstract", "variation", "readonly", "derived", "end", "ref", "in", "out",
              "inout", "individual", "snapshot", "timeslice", "standard", "library", "parallel", "nonunique", "ordered"}
@@ -53,6 +55,8 @@ def stem(w: str) -> str:
         w = w[:-2]
     elif len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
         w = w[:-1]
+    if len(w) > 3 and w[-1] == w[-2] and w[-1] not in "aeiouls":  # jammed -> jamm -> jam, dropped -> drop
+        w = w[:-1]
     return w[:-1] if len(w) > 4 and w.endswith("e") else w
 
 
@@ -66,7 +70,8 @@ def wordset(text: str, noise: set[str] = frozenset()) -> frozenset[str]:
 
 
 def numbers(text: str) -> frozenset[str]:
-    return frozenset(str(float(n)).rstrip("0").rstrip(".") for n in re.findall(r"(?<![\w.])\d+(?:\.\d+)?", text or ""))
+    text = (text or "").replace("..", " ")  # a range: 2..8
+    return frozenset(str(float(n)).rstrip("0").rstrip(".") for n in re.findall(r"(?<![\w.])\d+(?:\.\d+)?", text))
 
 
 def alike(a: str, b: str) -> bool:
@@ -432,13 +437,52 @@ def model_texts(path: str) -> dict[str, str]:
 
 
 def read_model(path: str) -> Model:
-    if path.endswith(".c2s"):  # a spec: through its own SysML, so both sides are read the same way
-        from . import sysml
-        from .notation import ANY, parse
-        with open(path, encoding="utf-8") as fh:
-            spec = parse({os.path.basename(path): fh.read()}, known=ANY)
-        return read_texts(sysml.write(spec), path)
+    """A SysML model (file, folder, .kpar), or a spec: a .c2s file or a folder of them (a run's spec/)."""
+    specs = [path] if path.endswith(".c2s") else sorted(
+        os.path.join(path, f) for f in os.listdir(path) if f.endswith(".c2s")) if os.path.isdir(path) else []
+    if specs:
+        from .notation import parse
+        texts = {}
+        for p in specs:
+            with open(p, encoding="utf-8") as fh:
+                texts[os.path.basename(p)] = fh.read()
+        return from_spec(parse(texts), path)
     return read_texts(model_texts(path), path)
+
+
+def from_spec(spec, source: str = "") -> Model:
+    """A spec's elements, as the reader would find them in its SysML: a requirement per req, a cfg entry an
+    attribute, each state machine's states and its transitions with `*` written out."""
+    m = Model(source)
+    for s in spec.systems:
+        m.systems.append(s.name)
+        for r in s.reqs:
+            text = " ".join([r.text] + r.constraints)
+            m.elements.append(Element("requirement", r.id, wordset(text, NOISE["requirement"]), text, s.name, r.id,
+                                      r.doc_only))
+        actors = {a.name for a in s.actors}
+        for a in s.actors:
+            m.elements.append(Element("actor", a.name, wordset(a.name), doc_only=a.doc_only))
+        for p in s.parts:
+            if p.name not in actors:
+                m.elements.append(Element("part", p.name, wordset(p.name), doc_only=p.doc_only))
+        for it in s.items:
+            m.elements.append(Element("item", it.name, wordset(it.name), doc_only=it.doc_only))
+        for c in s.cfg:
+            m.elements.append(Element("attribute", c.key, wordset(c.key), f"{c.value} {c.unit}".strip(), s.name))
+        for mach in s.machines:
+            for st in mach.states:
+                m.elements.append(Element("state", st, wordset(st, NOISE["state"]), owner=mach.owner))
+            for t in mach.expanded():
+                m.elements.append(Element("transition", "", wordset(f"{t.event} {t.guard}", NOISE["event"]),
+                                          owner=mach.owner, src=t.src, tgt=t.tgt, event=t.event, guard=t.guard,
+                                          effect=t.effect, doc_only=t.doc_only))
+        for u in s.usecases:
+            el = Element("usecase", u.name, wordset(u.name), owner=s.name, doc_only=u.doc_only)
+            el.actors = [u.actor]
+            el.steps = [(x.text, x.doc_only) for x in u.steps]
+            m.elements.append(el)
+    return m
 
 
 def read_texts(texts: dict[str, str], source: str = "") -> Model:
@@ -503,13 +547,40 @@ def greedy(pairs: list[tuple[float, int, int, str]], used_a: set[int], used_b: s
     return out
 
 
+def weights(texts: list[frozenset[str]]) -> dict[str, float]:
+    """How much a shared word says: a word few requirements use (restock) more than one most use (credit)."""
+    n = len(texts)
+    df: dict[str, int] = {}
+    for t in texts:
+        for w in t:
+            df[w] = df.get(w, 0) + 1
+    return {w: math.log(1 + n / c) for w, c in df.items()}
+
+
+def wdice(a: frozenset[str], b: frozenset[str], wt: dict[str, float]) -> float:
+    if not a or not b:
+        return 0.0
+    hit_a = sum(wt.get(x, 1.0) for x in a if any(alike(x, y) for y in b))
+    hit_b = sum(wt.get(y, 1.0) for y in b if any(alike(y, x) for x in a))
+    return (hit_a + hit_b) / (sum(wt.get(x, 1.0) for x in a) + sum(wt.get(y, 1.0) for y in b))
+
+
+def within(a: frozenset[str], b: frozenset[str], wt: dict[str, float]) -> float:
+    """How much of a's meaning b holds: the weight of a's words found in b over all of a's."""
+    if not a:
+        return 0.0
+    return sum(wt.get(x, 1.0) for x in a if any(alike(x, y) for y in b)) / sum(wt.get(x, 1.0) for x in a)
+
+
 def match_named(kind: str, a: list[Element], b: list[Element]) -> KindResult:
     res = KindResult(kind)
     pairs = []
+    wt: dict[str, float] = {}  # every word counts the same: weighting rare words lost paraphrased matches
     for i, x in enumerate(a):
         for j, y in enumerate(b):
-            exact = words(x.name) == words(y.name) and x.name
-            s = 1.0 if exact else dice(x.words, y.words)
+            # a requirement is what it says: its ID or generated name is no evidence
+            exact = kind != "requirement" and words(x.name) == words(y.name) and x.name
+            s = 1.0 if exact else wdice(x.words, y.words, wt) if kind == "requirement" else dice(x.words, y.words)
             if s >= THRESHOLD[kind]:
                 pairs.append((s, i, j, "name" if exact else "words"))
             elif kind == "attribute" and len(numbers(x.text)) >= 2 and numbers(x.text) == numbers(y.text):
@@ -531,6 +602,20 @@ def match_named(kind: str, a: list[Element], b: list[Element]) -> KindResult:
         res.matches.append(m)
     if kind == "attribute":  # one setting written as several (tempRange = 2..8 against tempLow = 2, tempHigh = 8)
         split_matches(res, a, b, ua, ub)
+    if kind == "requirement":  # one requirement that says what two say: each of the two is in it
+        for side, (xs, ys, ux) in enumerate(((a, b, ua), (b, a, ub))):
+            for i, x in enumerate(xs):
+                if i in ux:
+                    continue
+                best = max(range(len(ys)), key=lambda j: within(x.words, ys[j].words, wt), default=None)
+                if best is not None and within(x.words, ys[best].words, wt) >= CONTAINED:
+                    ux.add(i)
+                    (ub if side == 0 else ua).add(best)
+                    m = Match(x, ys[best], "contained", round(within(x.words, ys[best].words, wt), 3)) if side == 0 else \
+                        Match(ys[best], x, "contained", round(within(x.words, ys[best].words, wt), 3))
+                    m.notes.append(("A's" if side == 0 else "B's") + " requirement is part of a broader one on the "
+                                   "other side; shared: " + ", ".join(shared(x.words, ys[best].words)))
+                    res.matches.append(m)
     res.only_a = [x for i, x in enumerate(a) if i not in ua]
     res.only_b = [y for j, y in enumerate(b) if j not in ub]
     return res
@@ -644,10 +729,13 @@ def match_transitions(a: list[Element], b: list[Element], mapping: dict) -> Kind
                 s = dice(x.words, y.words)
                 same_ends_a = sum(1 for z in a if mapping.get((z.owner, z.src)) == src and mapping.get((z.owner, z.tgt)) == tgt)
                 same_ends_b = sum(1 for z in b if (z.owner, z.src) == src and (z.owner, z.tgt) == tgt)
+                se = dice(wordset(x.effect), wordset(y.effect))
                 if s > 0:
                     pairs.append((0.5 + s / 2, i, j, "ends+event"))
+                elif se >= 0.4:
+                    pairs.append((0.45 + se / 4, i, j, "ends+effect"))
                 elif same_ends_a == 1 and same_ends_b == 1:
-                    pairs.append((0.5, i, j, "ends"))
+                    pairs.append((0.4, i, j, "ends"))
     ua, ub = set(), set()
     for i, j, rule, s in greedy(pairs, ua, ub):
         x, y = a[i], b[j]

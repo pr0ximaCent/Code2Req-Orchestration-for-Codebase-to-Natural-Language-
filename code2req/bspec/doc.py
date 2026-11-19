@@ -1,216 +1,169 @@
-"""The system document: the checked spec in plain words, for SysModeler and the engineers who read it.
-
-What the code does, module by module: purpose, the state it keeps, settings, the checks shared by several
-operations, every operation as numbered steps (branches nested under them) with each way it can end, the reasons
-the code's comments give, and the open issues. No file paths, line numbers or code: those stay in spec/ (the
-evidence the checks hold the spec to). Locking is left out: it is how the code is safe, not what it does. A pure
-function of the spec, like sysml.py."""
+"""The system document: the spec in plain words, written like a system description a person would hand to
+SysModeler (title, what it is for, who uses it, what it contains, settings, how it behaves), so a model built from
+it and one built from the original description differ only in content. Requirements become numbered sentences,
+state machines and activities are said in words, open questions close the document. A pure function of the spec."""
 from __future__ import annotations
 
 import re
 
 from ..design.names import words
-from .notation import Module, Op, Spec, Step
+from .notation import REQ_ID, Node, Spec, System, Transition
 
-CATEGORY_TEXT = {"missing-guard": "missing check", "ignored-result": "result ignored", "unused-input": "input never used",
-                 "duplicated-constant": "value written twice", "mixed-result": "error returned with a result",
-                 "unresolved": "depends on code not read", "boundary": "depends on code not read",
-                 "unnamed-check": "check not named", "encoding": "text encoding", "inconsistency": "inconsistency",
-                 "security": "security", "off-by-one": "off by one", "error-handling": "error handling",
-                 "dead-code": "unused code", "race": "concurrent callers", "stale-fallback": "stale value used",
-                 "other": "other"}
-# what a result of a type is, in words; a type the reader needs no word for gives nothing
-TYPE_WORDS = {"int": "a number", "int64": "a number", "int32": "a number", "float64": "an amount", "float32": "an amount",
-              "number": "a number", "bool": "yes or no", "boolean": "yes or no", "string": "text", "str": "text",
-              "error": "an error, or nothing when it passes", "err": "an error, or nothing when it passes"}
-SKIP_INPUTS = {"ctx", "context", "w", "r", "req", "self", "this"}
-LOCKING = re.compile(r"(?i)\b(lock|unlock|locked|mutex)\b")
-CAMEL = re.compile(r"\b[a-z]+(?:[A-Z][a-z0-9]*)+\b|\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b|\b[A-Z]{2,}[a-z]\w*\b")
+OPS = [(r"\s*>=\s*", " is at least "), (r"\s*<=\s*", " is at most "), (r"\s*!=\s*", " is not "), (r"\s*==\s*", " is "),
+       (r"\s*>\s*", " is more than "), (r"\s*<\s*", " is less than "), (r"\s*&&\s*", " and "), (r"\s*\|\|\s*", " or ")]
+CAMEL = re.compile(r"\b[a-z]+(?:[A-Z][a-z0-9]*)+\b|\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b")
 
 
 def human(name: str) -> str:
-    """createUser, create_user, CreateUser -> create user; keeps a phrase as it is."""
-    if " " in name.strip():
-        return plain(name)
-    return " ".join(words(name)) or name
+    """insertCoin -> insert coin; OutOfService -> out of service; LITE stays LITE."""
+    if name.isupper():
+        return name
+    return " ".join(words(name))
 
 
 def plain(text: str) -> str:
-    """Code words in a phrase made words: messageID -> message id, ErrCreditExhausted -> credit exhausted, nil ->
-    nothing; `x = y` -> x is y."""
-    text = re.sub(r"\bErr([A-Z]\w*)", lambda m: " ".join(words(m.group(1))), text)
-    text = CAMEL.sub(lambda m: " ".join(words(m.group(0))), text)
-    text = re.sub(r"\bnil\b", "nothing", text)
-    text = re.sub(r"\s+=\s+", " is ", text)
-    return text
-
-
-def title(name: str) -> str:
-    t = human(name)
-    return t[:1].upper() + t[1:]
+    """Domain shorthand in words: camelCase split, operators said, `x += y` as adding y to x."""
+    t = text.strip()
+    t = re.sub(r"\b([\w ]+?)\s*\+=\s*([\w ()]+)", lambda m: f"add {m.group(2).strip()} to {m.group(1).strip()}", t)
+    t = re.sub(r"\b([\w ]+?)\s*-=\s*([\w ()]+)", lambda m: f"reduce {m.group(1).strip()} by {m.group(2).strip()}", t)
+    for pat, rep in OPS:
+        t = re.sub(pat, rep, t)
+    t = re.sub(r"(\d+)\.\.(\d+)", r"\1 to \2", t)
+    t = CAMEL.sub(lambda m: human(m.group()), t)
+    return " ".join(t.split())
 
 
 def sentence(text: str) -> str:
-    text = plain(text).strip()
-    if not text:
+    t = plain(text)
+    if not t:
         return ""
-    return text[:1].upper() + text[1:] + ("" if text.endswith((".", ":", "?")) else ".")
+    t = t[0].upper() + t[1:]
+    return t if t.endswith((".", "?", "!")) else t + "."
 
 
-def actions_text(actions: list[str]) -> str:
-    """Exit actions as a plain clause: fail, answer 400, return 0, log an error."""
-    out = []
-    for a in actions:
-        a = a.strip()
-        if re.fullmatch(r"\d{3}", a):
-            out.append(f"answer {a}")
-        elif a.startswith("log."):
-            out.append(f"log a{'n' if a[4:5] in 'aeiou' else ''} {a[4:]}")
-        elif a.startswith("return"):
-            rest = a[6:].strip().strip('"')
-            out.append(plain("return " + rest) if rest else "return")
+def listing(xs: list[str]) -> str:
+    xs = [x for x in xs if x]
+    if len(xs) <= 1:
+        return "".join(xs)
+    return ", ".join(xs[:-1]) + " and " + xs[-1]
+
+
+def article(phrase: str) -> str:
+    if phrase.endswith("s") and not phrase.endswith("ss"):  # shelves, sensors
+        return phrase
+    return ("an " if phrase[:1].lower() in "aeiou" else "a ") + phrase
+
+
+def cfg_value(value: str, unit: str) -> str:
+    v = value.strip()
+    if v.startswith("{") and v.endswith("}"):
+        inner = [x.strip() for x in v[1:-1].split(",")]
+        v = listing(inner) if all(re.fullmatch(r"-?\d+(\.\d+)?", x) for x in inner) else ", ".join(plain(x) for x in inner)
+    v = re.sub(r"(\d+)\.\.(\d+)", r"\1 to \2", v)
+    return f"{v} {plain(unit)}".strip() if unit else v
+
+
+def transition_text(t: Transition, num: dict[str, int] | None = None) -> str:
+    when = plain(t.event) if t.event else "its condition"
+    when = when if re.match(r"(?i)(after|when|while|every|once)\b", when) else "on " + when
+    gtext = re.sub(REQ_ID, lambda m: f"behaviour {num[m.group()]}" if num and m.group() in num else m.group(), t.guard)
+    gtext = re.sub(r"\s*,\s*", ", ", gtext)
+    guard = f" (if {plain(gtext)})" if t.guard else ""
+    src = "In any state" if t.src == "*" else f"In {human(t.src)}"
+    move = f"stay in {human(t.tgt)}" if t.src == t.tgt else f"go to {human(t.tgt)}"
+    then = f"{plain(t.effect)}, then {move}" if t.effect else move
+    only = " (not shown in the code)" if t.doc_only else ""
+    return f"{src}, {when}{guard}: {then}.{only}"
+
+
+def chain_text(nodes: list[Node]) -> list[str]:
+    out: list[str] = []
+    for nd in nodes:
+        if nd.cond:
+            then = "; ".join(plain(x.text) for x in nd.then) or "nothing more"
+            out.append(f"If {plain(nd.cond)}: {then}.")
+            rest = chain_text(nd.other)
+            if rest:
+                out.append("Otherwise: " + " ".join(r[0].lower() + r[1:] for r in rest[:1]) + (" " + " ".join(rest[1:]) if rest[1:] else ""))
         else:
-            out.append(plain(human(a)))
-    return ", ".join(out)
+            out.append(sentence(nd.text))
+    return out
 
 
-def gives(o: Op) -> str:
-    """What an operation gives back, in words; nothing when the name already says it."""
-    out = o.out.strip("()")
-    if not out or out == o.name or human(out) == human(o.name):
-        return ""
-    parts = [p.strip() for p in out.split(",") if p.strip()]
-    said = [TYPE_WORDS.get(p.lower(), human(p.split(".")[-1])) for p in parts]
-    return " and ".join(dict.fromkeys(said))
-
-
-def locking(o: Op) -> bool:
-    """An operation that only takes or releases a lock: mechanics, not behaviour."""
-    texts = [human(o.name)] + [x.text for x in o.steps]
-    return bool(o.steps) and all(LOCKING.search(t) or not t for t in texts[1:]) and bool(LOCKING.search(" ".join(texts)))
-
-
-class Writer:
-    def __init__(self, spec: Spec, m: Module):
-        self.spec, self.m = spec, m
-        self.rules = {r.name: r for r in m.rules}
-        self.hidden = {o.name for o in m.ops if locking(o)}
-        self.ops = {o.name for o in m.ops}
-
-    def shown(self, steps: list[Step]) -> list[Step]:
-        return [x for x in steps if x.ref not in self.hidden and not (LOCKING.search(x.text) and not x.exit)
-                and not x.text.lower().startswith("defer")]
-
-    def exit_text(self, s: Step) -> str:
-        if s.exit is not None and s.exit.kind == "guard":
-            return f" If {plain(s.exit.cond)}: {actions_text(s.exit.actions)}; the operation ends."
-        if s.exit is not None:
-            return f" On failure: {actions_text(s.exit.actions)}; the operation ends."
-        if s.ref in self.rules and (self.rules[s.ref].exit or self.m.default):
-            ex = self.rules[s.ref].exit or self.m.default
-            return f" If the check fails: {actions_text(ex.actions)}; the operation ends."
-        return ""
-
-    def block(self, steps: list[Step], depth: int) -> list[str]:
-        out, n = [], 0
-        for s in self.shown(steps):
-            n += 1
-            out += self.step(s, depth, n)
-        return out
-
-    def step(self, s: Step, depth: int, n: int) -> list[str]:
-        pad = "   " * depth
-        if s.loop:
-            return [f"{pad}{n}. For each {plain(human(s.loop.replace('!in', 'not in')))}:"] + self.block(s.children, depth + 1)
-        if s.cond:
-            return [f"{pad}{n}. If {plain(s.cond)}:"] + self.block(s.children, depth + 1)
-        if s.otherwise:
-            return [f"{pad}{n}. Otherwise:"] + self.block(s.children, depth + 1)
-        if s.fallback:
-            what = human(s.assign) if s.assign else "the value"
-            return [f"{pad}{n}. Take {what} from the first that holds: " + "; then ".join(plain(human(a)) for a in s.fallback) + "."]
-        if s.exit is not None and s.exit.kind == "guard" and not s.text:
-            line = f"If {plain(s.exit.cond)}: {actions_text(s.exit.actions)}; the operation ends."
-        else:
-            if s.ref in self.rules:
-                r = self.rules[s.ref]
-                text = f"check {human(r.name)}" + (f" ({', '.join(plain(a) for a in s.args)})" if s.args else "")
-            elif s.ref in self.ops:
-                text = human(s.ref) + (f" ({', '.join(plain(a) for a in s.args)})" if s.args else "")
-            else:
-                text = s.text
-            if s.assign:
-                text = f"{text}, giving {human(s.assign)}" if text else human(s.assign)
-            if s.returns:
-                text = f"return {text}".strip() if text else "return"
-            line = sentence(text) + self.exit_text(s)
-        if s.rationale:
-            line += f" ({sentence(s.rationale)[:-1]})"
-        return [f"{pad}{n}. {line}"]
-
-    def op(self, o: Op, i: int) -> list[str]:
-        if o.kind == "endpoint":
-            head = f"### B{i}. {o.method} {o.path}"
-            intro = (f"Receives {', '.join(human(f) for f in o.fields)}. " if o.fields else "") + f"Answers {o.status} on success."
-        else:
-            head = f"### B{i}. {title(o.name)}"
-            ins = [human(p.split()[0]) for p in o.params if p and p.split()[0].lower() not in SKIP_INPUTS]
-            out = gives(o)
-            intro = ("Takes " + ", ".join(ins) if ins else "Takes nothing") + (f"; gives {out}." if out else ".")
-        out = [head, ""] + [sentence(r) for r in o.rationale] + [intro, ""]
-        out += self.block(o.steps, 0)
-        mine = [x for x in self.m.issues if x.on == f"op:{o.name}"]
-        if mine:
-            out += [""] + [f"Open issue ({CATEGORY_TEXT.get(x.category or 'other', x.category)}): {sentence(x.text)}" for x in mine]
-        return out + [""]
-
-    def heading(self) -> str:
-        base = (self.m.base or self.m.at.file).rstrip("/").rsplit("/", 1)[-1]
-        return title(base) if base else title(self.m.name)
-
-    def text(self) -> str:
-        m = self.m
-        out = [f"## {self.heading()}", ""]
-        if m.when:
-            out += [f"Purpose: {sentence('; '.join(m.when))}"]
-        out += [sentence(r) for r in m.rationale]
-        if m.def_name:
-            args = ", ".join(human(k) if v == "true" else f"{human(k)} {v.strip(chr(34))}" for k, v in m.def_args)
-            out.append(f"Kind: {m.def_name}" + (f" ({args})." if args else "."))
+def system_text(s: System) -> str:
+    title = human(s.name)
+    out = [f"# {title[0].upper() + title[1:]}", ""]
+    if s.doc:
+        out += [sentence(s.doc), ""]
+    if s.actors:
+        out += ["## People who use it", ""]
+        for a in s.actors:
+            ucs = [u for u in s.usecases if u.actor == a.name]
+            goals = []
+            for u in ucs:
+                steps = "; ".join(plain(x.text).replace("+", " (one or more times)") +
+                                  (" (not shown in the code)" if x.doc_only else "") for x in u.steps)
+                goals.append(f"to {human(u.name).lower()}: {steps}.")
+            text = " ".join(g[0].upper() + g[1:] for g in goals) or "Uses the system."
+            out.append(f"- **{human(a.name)[0].upper() + human(a.name)[1:]}:** {text}")
         out.append("")
-        if m.state:
-            out += ["State it keeps between calls:"] + [f"- {human(n)}: {plain(t)}" for n, t in m.state] + [""]
-        if m.cfg:
-            out += ["Settings:"] + [f"- {human(c.key)}: {c.value}" + (f" {c.unit}" if c.unit else "") for c in m.cfg] + [""]
-        if m.default:
-            out += [f"When a step fails and nothing else is said: {actions_text(m.default.actions)}; the operation ends.", ""]
-        if m.rules:
-            out += ["Checks used by several operations:"]
-            for i, r in enumerate(m.rules, 1):
-                ex = r.exit or m.default
-                out.append(f"- C{i}. {title(r.name)}" + (f" ({', '.join(human(p) for p in r.params)})" if r.params else "")
-                           + f": {plain(r.predicate)}." + (f" If not met: {actions_text(ex.actions)}." if ex else ""))
-                out += [f"  Open issue ({CATEGORY_TEXT.get(x.category or 'other', x.category)}): {sentence(x.text)}"
-                        for x in m.issues if x.on == f"rule:{r.name}"]
+    if s.parts or s.items:
+        out += ["## What it contains", ""]
+        if s.parts:
+            out.append("It is made of " + listing([article(human(p.name).lower()) for p in s.parts]) + ".")
+        for it in s.items:
+            fields = f" ({', '.join(plain(f) for f in it.fields)})" if it.fields else ""
+            out.append(f"It handles {human(it.name).lower()}s{fields}.")
+        out.append("")
+    if s.cfg:
+        out += ["## Settings", ""]
+        out += [f"- {human(c.key)[0].upper() + human(c.key)[1:]}: {cfg_value(c.value, c.unit)}." for c in s.cfg]
+        out.append("")
+    if s.reqs:
+        out += ["## How it behaves", ""]
+        for i, r in enumerate(s.reqs, 1):
+            line = f"{i}. {sentence(r.text)}"
+            for c in r.constraints:
+                line += f" That is: {plain(c)}."
+            if r.doc_only:
+                line += " (Not shown in the code.)"
+            out.append(line)
+        out.append("")
+    for m in s.machines:
+        states = m.states
+        out += [f"## States of the {human(m.owner).lower()}", ""]
+        first = next((t.src for t in m.transitions if t.src != "*"), states[0] if states else "")
+        out.append(f"The {human(m.owner).lower()} is always in one of these states: "
+                   f"{listing([human(x) for x in states])}. It starts in {human(first)}.")
+        out.append("")
+        num = {r.id: i for i, r in enumerate(s.reqs, 1)}
+        out += [f"- {transition_text(t, num)}" for t in m.transitions]
+        out.append("")
+    if s.activities:
+        out += ["## Step by step", ""]
+        for a in s.activities:
+            steps = chain_text(a.nodes)
+            out.append(f"**{human(a.name)[0].upper() + human(a.name)[1:]}:**")
+            out += [f"{i}. {x}" for i, x in enumerate(steps, 1)]
             out.append("")
-        out += ["Behaviour:", ""]
-        for i, o in enumerate([o for o in m.ops if o.name not in self.hidden], 1):
-            out += self.op(o, i)
-        rest = [x for x in m.issues if not x.on]
-        if rest:
-            out += ["Open issues:"] + [f"- {CATEGORY_TEXT.get(x.category or 'other', x.category)}: {sentence(x.text)}"
-                                       + (f" Depends on {x.boundary.rstrip('/')}." if x.boundary else "") for x in rest] + [""]
-        return "\n".join(out)
-
-
-def system_doc(spec: Spec, title_text: str = "System") -> str:
-    mods = sorted((m for m in spec.modules if not m.name.startswith("_")), key=lambda m: m.name)
-    out = [f"# {title_text}: system document", "",
-           "What the code does, read from it and checked against it: each module's purpose, the state it keeps, its "
-           "settings and shared checks, and every operation as numbered steps with each way it can end. Open issues "
-           "are possible problems the code shows.", ""]
-    for d in sorted(spec.defs.values(), key=lambda d: d.name):
-        out += [f"Shared kind {d.name}: every {d.name.lower()} sets {', '.join(human(f) for f in d.fields)}.", ""]
-    for m in mods:
-        out.append(Writer(spec, m).text())
+    if s.satisfies:
+        out += ["## Who does what", ""]
+        for sat in s.satisfies:
+            nums = [str(i) for i, r in enumerate(s.reqs, 1) if r.id in sat.ids]
+            out.append(f"- The {human(sat.by).lower()} carries out behaviour {listing(nums)}.")
+        out.append("")
+    questions = [(r.id, q) for r in s.reqs for q in r.issues] + [(u.name, q) for u in s.usecases for q in u.issues] + \
+        [("", q) for q in s.issues]
+    if questions:
+        out += ["## Open questions", ""]
+        num = {r.id: i for i, r in enumerate(s.reqs, 1)}
+        for on, q in questions:
+            about = f" (behaviour {num[on]})" if on in num else f" ({human(on).lower()})" if on else ""
+            more = f" The code in {q.boundary} would answer it." if q.boundary else ""
+            out.append(f"- {sentence(q.text)}{about}{more}")
+        out.append("")
     return "\n".join(out).rstrip() + "\n"
+
+
+def system_doc(spec: Spec) -> str:
+    return "\n".join(system_text(s) for s in spec.systems)

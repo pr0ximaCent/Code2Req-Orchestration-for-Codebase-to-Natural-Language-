@@ -1,0 +1,49 @@
+system VendingMachine
+  doc Lets customers buy snacks from a refrigerated vending machine using coins.
+  actor Customer, Operator, TemperatureSensor
+  part Machine, Shelves, SlotMotor, EventLog
+  item Coin {value: 5 | 10 | 25 cents}
+  item Slot {code, name, price, stock}
+  item Sale {slot, price, change}
+  item Refund {reason, amount}
+  cfg coinValues = (5, 10, 25) cents  @vending/config.py:3
+  cfg tempLow = 2.0 C, tempHigh = 8.0 C  @:4-5
+  cfg motorTries = 3  @:6
+  cfg motorPause = 0.05 s  @:7
+  cfg slots = {A1: chips 75¢ stock 6, A2: pretzels 60¢ stock 4, B1: chocolate bar 90¢ stock 5, B2: cookies 110¢ stock 3}  @:9-14
+  req VM-1 accept only coins of value 5, 10 or 25 cents; return others  @vending/machine.py:30-32
+  req VM-2 reject coins when the machine is dispensing or in fault  @:28-29
+  req VM-3 add the coin value to credit and enter credited mode  @:33-34
+  req VM-4 select a slot only when credit is enough, the slot exists, and it is in stock; otherwise refuse  @:38-46
+  req VM-5 if the motor jams after all tries, refund the credit and log the event  @:48-52
+  req VM-6 on a successful dispense, deduct the price from credit, return change, and return to idle  @:54-59
+  req VM-7 cancel returns all credit and returns to idle  @:61-66
+  req VM-8 when temperature goes outside [tempLow, tempHigh], enter fault mode and refund any credit  @:70-76
+  req VM-9 when temperature returns to range while in fault, return to idle  @:77-79
+  req VM-10 restock a slot only when the machine is idle with no credit, or in fault, and the slot code is known  @:84-89
+  req VM-11 reject restock of an unknown slot code or a non-positive amount  @:86-87
+  req VM-12 record every sale, refund, and temperature-related refund in a file that persists across restarts  @vending/eventlog.py:16-21
+  state Machine:  @vending/machine.py:11-21
+    Idle -(coin[VM-1, VM-2] / add credit)-> Credited
+    Credited -(coin[VM-1, VM-2] / add credit)-> Credited
+    Credited -(select[VM-4] / dispense)-> Dispensing
+    Dispensing -(motor succeeds / deduct price, return change)-> Idle
+    Dispensing -(motor jams / refund)-> Idle
+    Credited -(cancel / refund)-> Idle
+    Idle -(temperature out of range / refund)-> Fault
+    Credited -(temperature out of range / refund)-> Fault
+    Dispensing -(temperature out of range / refund)-> Fault
+    Fault -(temperature in range)-> Idle
+  usecase Buy: Customer -> insert coin(s), select slot, collect item and change  @main.py:28-31
+  usecase Cancel: Customer -> cancel, collect refund  @:32-33
+  usecase Restock: Operator -> fill slot with amount  @:36-37
+  usecase TemperatureMonitor: TemperatureSensor -> report temperature  @vending/machine.py:70
+  usecase Quit: Customer -> quit the console  @main.py:38
+  activity Dispense: select slot -> check credit, stock -> motor push -> [success] take one, return change | [jam] refund  @vending/machine.py:48-59
+  Machine satisfies VM-1, VM-2, VM-3, VM-4, VM-5, VM-6, VM-7, VM-8, VM-9, VM-10, VM-11, VM-12
+  omit dollars, pad: formatting
+  omit logging: logging
+  omit EVENT_LOG_PATH: wiring
+  omit motorPause: implementation
+  omit random in motor: implementation
+  omit _pay_back: implementation

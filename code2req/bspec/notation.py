@@ -1,55 +1,46 @@
-"""The compact behaviour spec (.c2s): its parser, the objects it reads into, and the canonical printer.
+"""The system spec (.c2s): the model a codebase was built to implement, in domain terms (actors, parts, settings,
+requirements, state machines, use cases, activities), as a systems engineer would write it before the code. Its
+parser, the objects it reads into, and the canonical printer.
 
-One line per distinct behaviour; indentation (2 spaces) is nesting. LEGEND is the notation as the repo's
-LEGEND.md states it. parse() reads a whole spec (any number of files) and raises SpecError naming the file
-and line of the first line it cannot read or the first reference it cannot resolve (a rule, an operation,
-a def). Nothing here reads code: checks against the source are in check.py."""
+One system per file. A line is one model element; indentation (2 spaces) is nesting. `@file:lines` traces an
+element to the code that shows it (`@:lines` is the file of the last trace), `? text [-> package/]` is an open
+question. LEGEND states the notation as the prompt and LEGEND.md show it. parse() reads a spec (any number of
+files) and raises SpecError naming the file and line of the first thing it cannot read; format_system() prints a
+system back in one canonical form, so the same spec always gives the same text."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 
-METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
-# what an open issue may be tagged with: what kind of problem the code shows
-CATEGORIES = ("missing-guard", "ignored-result", "unused-input", "duplicated-constant", "mixed-result", "unresolved",
-              "boundary", "unnamed-check", "encoding", "inconsistency", "security", "off-by-one", "error-handling",
-              "dead-code", "race", "stale-fallback", "other")
-# calls a step may make without the spec defining them
-BUILTINS = {"len", "trim", "lower", "upper", "join", "split", "min", "max", "int", "str", "names", "sort",
-            "count", "now", "hash", "uuid", "format", "parse", "fail", "return"}
-UNITS = {"B": "bytes", "KB": "kilobytes", "MB": "megabytes", "ms": "milliseconds", "s": "seconds",
-         "m": "minutes", "h": "hours", "d": "days", "%": "percent"}
+# why a fact of the code may be left out of the model: these and no others
+OMIT_REASONS = ("implementation", "logging", "wiring", "serialization", "formatting")
+DOC_ONLY = "[doc-only]"  # something the code cannot show (a physical step, a plan): never counted against the code
+REQ_ID = r"[A-Za-z][A-Za-z0-9]*-\d+[a-z]?"
 
-LEGEND = """# Behaviour spec notation (.c2s)
+LEGEND = """# System spec notation (.c2s)
 
-One line per distinct behaviour. Indentation (2 spaces) is nesting. `@` traces a line to the code.
+The model a codebase was built to implement, in domain terms: what a systems engineer would write before the code.
+One line per model element. Indentation (2 spaces) is nesting. "shall" is implied in every requirement.
 
-| Line | Meaning |
-|---|---|
-| `def Name {a, b, c}  @file:lines` | Shared contract (a struct several modules fill in or register) |
-| `name [: Def(k=v, flag)]  @path` | Module; optionally fills in a shared def |
-| `when <text>` | When the module applies |
-| `cfg k=v, k=v` | Configuration; units as suffix (`4000B` bytes, `30s` seconds) |
-| `rule name[(params)]  <predicate>  [!err -> actions]  ~callee` | Shared rule, defined once; `~` names the code it stands for; `-> actions` is what failing it does |
-| `fn(ins) -> out  @trace` + indented steps | Operation |
-| `name[(params)] = <steps>; <value>` | Calculated value (a small helper) |
-| `METHOD /path {fields} -> status  a; b; c  @trace` | Endpoint, steps inline |
-| `x = call(...)`, `a; b`, successive lines | Ordered steps |
-| `cond -> actions` | Guarded exit |
-| `step  !err -> actions` | Error exit of that step |
-| `!err -> actions` (module line) | Default handling of an error exit |
-| `step!` | The step can fail, handled by the module default |
-| `ruleName`, `ruleName(arg)` | Applies a shared rule |
-| `each v !in X, filter:` + indented steps | Loop |
-| `if <cond>:` + indented steps, then `else:` + indented steps | Branch that goes on (no exit) |
-| `state name  <what it holds>` | State the module keeps between calls |
-| `a ?? b ?? c` | Fallback chain: the first that holds |
-| `return x` | Normal exit with a value |
-| `@file:lines`, `@:lines` | Trace (`@:` = the file of the last trace) |
-| `? [category] @:line <issue> [-> pkg/]` | Open issue; `-> pkg/` names the code that would settle it |
-| `# <text>` | Rationale a code comment states |
-
-Categories: """ + ", ".join(CATEGORIES) + ".\n"
+- `system Name  @path/`: the system (a folder of the code)
+- `doc <text>`: what the system is for, in one sentence
+- `actor A, B`: who or what outside the system uses it or is used by it
+- `part P, Q`: the system's components
+- `item I {field, field: a | b}`: a thing exchanged or stored
+- `cfg name = value unit, ...`: settings and constants that change behaviour, with units
+- `req ID statement  @trace`: a requirement, one observable behaviour or constraint
+- `  constraint expr`: the requirement's checkable form (indented under it)
+- `state Owner:`: a state machine of a part, its transitions indented below
+- `  A -(event[guard] / effect)-> B`: a transition; `*` as A means from every other state
+- `usecase Name: Actor -> step, step, step`: an actor's goal and its main steps; `step+` repeats
+- `activity Name: a -> b -> [cond] c | d -> e`: ordered steps; `[cond] x | y` decides, and the chain goes on after y
+- `P satisfies ID, ID` or `ID by P`: which part meets a requirement
+- `omit name, name: reason`: facts of the code left out, for a reason in: implementation, logging, wiring,
+  serialization, formatting
+- `@file:lines`, `@:lines`: where the code shows it (`@:` = the file of the last trace)
+- `? text [-> package/]`: an open question, behaviour that depends on code not read
+- `[doc-only] ...`: something the code cannot show (a physical step)
+"""
 
 
 class SpecError(ValueError):
@@ -60,7 +51,7 @@ class SpecError(ValueError):
 
 @dataclass
 class Trace:
-    file: str  # repo-relative; a folder for a module header
+    file: str  # repo-relative; a folder for the system line
     start: int = 0  # 0: the whole file or folder
     end: int = 0
 
@@ -73,117 +64,190 @@ class Trace:
         lines = "" if not self.start else f":{self.start}" if self.end == self.start else f":{self.start}-{self.end}"
         return "@" + f + lines
 
+    def covers(self, rel: str, line: int) -> bool:
+        if rel != self.file and not (self.file and rel.startswith(self.file.rstrip("/") + "/")):
+            return False
+        return not self.start or self.start <= line <= self.end
+
 
 @dataclass
 class Issue:
     text: str
-    category: str = ""
     at: Trace | None = None
-    boundary: str = ""  # the package that would settle it
-    line_no: int = 0
-    on: str = ""  # the line it was written on ("rule:guard", "op:POST /x"); "" for a line of its own
-    more: list = field(default_factory=list, repr=False)  # further issues written on the same line
-
-
-@dataclass
-class Exit:
-    kind: str  # "err" (the step failed) or "guard" (a condition holds)
-    cond: str
-    actions: list[str]
-    default: bool = False  # `step!`: the module's default handling
-
-
-@dataclass
-class Step:
-    text: str = ""  # the action, without its assignment and exit
-    assign: str = ""  # x in `x = call(...)`
-    ref: str = ""  # the rule or operation the step applies
-    args: list[str] = field(default_factory=list)
-    exit: Exit | None = None
-    loop: str = ""  # an each step: its header
-    cond: str = ""  # an `if cond:` block: its condition (children are the steps it runs)
-    otherwise: bool = False  # an `else:` block, after an `if` block
-    children: list[Step] = field(default_factory=list)
-    fallback: list[str] = field(default_factory=list)
-    returns: bool = False
-    rationale: str = ""
-    at: Trace | None = None
+    boundary: str = ""  # the package whose code would answer it
     line_no: int = 0
 
 
 @dataclass
-class Rule:
+class Named:
     name: str
-    params: list[str]
-    predicate: str
-    callee: str = ""
-    exit: Exit | None = None
     at: Trace | None = None
-    line_no: int = 0
+    doc_only: bool = False
 
 
 @dataclass
-class Op:
-    kind: str  # "op", "endpoint" or "calc"
-    name: str  # an endpoint's is "METHOD /path"
-    params: list[str] = field(default_factory=list)
-    out: str = ""
-    method: str = ""
-    path: str = ""
+class Item:
+    name: str
     fields: list[str] = field(default_factory=list)
-    status: str = ""
-    steps: list[Step] = field(default_factory=list)
     at: Trace | None = None
-    rationale: list[str] = field(default_factory=list)
-    line_no: int = 0
+    doc_only: bool = False
 
 
 @dataclass
 class Cfg:
     key: str
-    raw: str
     value: str
     unit: str = ""
-    type: str = "String"
+    at: Trace | None = None
 
 
 @dataclass
-class Def:
-    name: str
-    fields: list[str]
+class Req:
+    id: str
+    text: str
     at: Trace | None = None
+    constraints: list[str] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
+    doc_only: bool = False
     line_no: int = 0
 
 
 @dataclass
-class Module:
+class Transition:
+    src: str  # a state, or "*": every other state
+    tgt: str
+    event: str = ""
+    guard: str = ""
+    effect: str = ""
+    at: Trace | None = None
+    doc_only: bool = False
+    line_no: int = 0
+
+    def label(self) -> str:
+        return (self.event + (f"[{self.guard}]" if self.guard else "") + (f" / {self.effect}" if self.effect else "")).strip()
+
+
+@dataclass
+class Machine:
+    owner: str
+    transitions: list[Transition] = field(default_factory=list)
+    at: Trace | None = None
+
+    @property
+    def states(self) -> list[str]:
+        """Every state the transitions name, in the order they first appear."""
+        out: list[str] = []
+        for t in self.transitions:
+            for s in (t.src, t.tgt):
+                if s != "*" and s not in out:
+                    out.append(s)
+        return out
+
+    def expanded(self) -> list[Transition]:
+        """The transitions with `*` written out: one from each other state."""
+        out = []
+        for t in self.transitions:
+            if t.src != "*":
+                out.append(t)
+                continue
+            for s in self.states:
+                if s != t.tgt:
+                    out.append(Transition(s, t.tgt, t.event, t.guard, t.effect, t.at, t.doc_only, t.line_no))
+        return out
+
+
+@dataclass
+class UStep:
+    text: str
+    doc_only: bool = False
+
+
+@dataclass
+class UseCase:
+    name: str
+    actor: str
+    steps: list[UStep] = field(default_factory=list)
+    at: Trace | None = None
+    issues: list[Issue] = field(default_factory=list)
+    doc_only: bool = False
+
+
+@dataclass
+class Node:
+    text: str = ""  # a step; or, with cond, a decision
+    cond: str = ""
+    then: list[Node] = field(default_factory=list)
+    other: list[Node] = field(default_factory=list)  # the chain after a decision goes on here
+
+
+@dataclass
+class Activity:
+    name: str
+    nodes: list[Node] = field(default_factory=list)
+    at: Trace | None = None
+    src: str = ""  # the chain as written, joined across continuation lines
+
+
+@dataclass
+class Satisfy:
+    by: str
+    ids: list[str]
+    at: Trace | None = None
+
+
+@dataclass
+class Omit:
+    names: list[str]
+    reason: str
+    line_no: int = 0
+
+
+@dataclass
+class System:
     name: str
     at: Trace
-    base: str = ""  # the folder its relative traces start from
-    def_name: str = ""
-    def_args: list[tuple[str, str]] = field(default_factory=list)  # (attribute, value); a flag's value is "true"
-    when: list[str] = field(default_factory=list)
-    default: Exit | None = None  # the module's `!err -> actions` line
-    state: list[tuple[str, str]] = field(default_factory=list)  # (name, what it holds)
+    doc: str = ""
+    actors: list[Named] = field(default_factory=list)
+    parts: list[Named] = field(default_factory=list)
+    items: list[Item] = field(default_factory=list)
     cfg: list[Cfg] = field(default_factory=list)
-    rules: list[Rule] = field(default_factory=list)
-    ops: list[Op] = field(default_factory=list)
+    reqs: list[Req] = field(default_factory=list)
+    machines: list[Machine] = field(default_factory=list)
+    usecases: list[UseCase] = field(default_factory=list)
+    activities: list[Activity] = field(default_factory=list)
+    satisfies: list[Satisfy] = field(default_factory=list)
+    omits: list[Omit] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
-    rationale: list[str] = field(default_factory=list)
-    source: str = ""  # the spec file it was read from
-    line_no: int = 0
 
-    def op_id(self, op: Op) -> str:
-        return f"{self.name}.{op.name}"
+    @property
+    def base(self) -> str:
+        return self.at.file.rstrip("/")
+
+    def req(self, rid: str) -> Req | None:
+        return next((r for r in self.reqs if r.id == rid), None)
+
+    def traces(self) -> list[tuple[str, Trace]]:
+        """(element label, its trace) for every traced element."""
+        out: list[tuple[str, Trace]] = []
+        for kind, xs in (("actor", self.actors), ("part", self.parts), ("item", self.items)):
+            out += [(f"{kind} {x.name}", x.at) for x in xs if x.at]
+        out += [(f"cfg {c.key}", c.at) for c in self.cfg if c.at]
+        out += [(f"req {r.id}", r.at) for r in self.reqs if r.at]
+        for m in self.machines:
+            out += [(f"state {m.owner}", m.at)] if m.at else []
+            out += [(f"transition {t.src} -> {t.tgt}", t.at) for t in m.transitions if t.at]
+        out += [(f"usecase {u.name}", u.at) for u in self.usecases if u.at]
+        out += [(f"activity {a.name}", a.at) for a in self.activities if a.at]
+        out += [(f"{s.by} satisfies", s.at) for s in self.satisfies if s.at]
+        return out
 
 
 @dataclass
 class Spec:
-    defs: dict[str, Def] = field(default_factory=dict)
-    modules: list[Module] = field(default_factory=list)
+    systems: list[System] = field(default_factory=list)
 
-    def module(self, name: str) -> Module | None:
-        return next((m for m in self.modules if m.name == name), None)
+    def system(self, name: str) -> System | None:
+        return next((s for s in self.systems if s.name == name), None)
 
 
 # ---------------------------------------------------------------------------------------------- lexing
@@ -194,12 +258,9 @@ def split_top(text: str, sep: str) -> list[str]:
         ch = text[i]
         if quote:
             cur.append(ch)
-            if ch == "\\" and i + 1 < len(text):
-                cur.append(text[i + 1])
-                i += 1
-            elif ch == quote:
+            if ch == quote:
                 quote = ""
-        elif ch in "\"'`":
+        elif ch in "\"`":
             quote = ch
             cur.append(ch)
         elif ch in "([{":
@@ -220,52 +281,34 @@ def split_top(text: str, sep: str) -> list[str]:
     return out
 
 
-def find_top(text: str, pattern: str) -> re.Match | None:
-    """The first match of pattern outside quotes and brackets."""
-    depth, quote = 0, ""
-    for i, ch in enumerate(text):
-        if quote:
-            if ch == quote:
-                quote = ""
-            continue
-        if ch in "\"'`":
-            quote = ch
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif depth == 0:
-            m = re.compile(pattern).match(text, i)
-            if m:
-                return m
-    return None
-
-
-ISSUE = r"(?<!\S)\?(?=\s)"
+ISSUE = re.compile(r"(?<!\S)\?(?=\s)")
 TRACE = re.compile(r"(?<!\S)@(\S*)")
-RATIONALE = r"(?<!\S)#\s"
+TRANSITION = re.compile(r"^(\*|[A-Za-z_]\w*)\s*-\((.*)\)->\s*([A-Za-z_]\w*)$")
 
 
-def cut(text: str, pattern: str) -> tuple[str, str]:
-    """text before the first top-level match of pattern, and the rest from it."""
-    m = find_top(text, pattern)
-    return (text, "") if m is None else (text[:m.start()].rstrip(), text[m.start():])
+def doc_only(text: str) -> tuple[str, bool]:
+    t = text.strip()
+    if t.startswith(DOC_ONLY):
+        return t[len(DOC_ONLY):].strip(), True
+    return t, False
 
 
 # ---------------------------------------------------------------------------------------------- parser
 class Parser:
-    def __init__(self, known: set[str] | None = None):
-        self.known = known or set()  # names steps may call that the spec does not define (helpers folded into a step)
+    def __init__(self):
         self.spec = Spec()
         self.where = ""
-        self.module: Module | None = None
+        self.system: System | None = None
         self.last_file = ""
 
     def err(self, line: int, msg: str) -> SpecError:
         return SpecError(self.where, line, msg)
 
-    # -- traces
     def trace(self, raw: str, line: int, header: bool = False) -> Trace:
+        spans = re.fullmatch(r"([^:]*):([\d,\s-]+)", raw)
+        if spans and "," in spans.group(2):  # @file:11-15,20-21: the lines from the first to the last
+            nums = [int(x) for x in re.findall(r"\d+", spans.group(2))]
+            raw = f"{spans.group(1)}:{min(nums)}-{max(nums)}"
         m = re.fullmatch(r"([^:]*)(?::(\d+)(?:-(\d+))?)?", raw)
         if m is None or (not m.group(1) and not m.group(2)):
             raise self.err(line, f"bad trace @{raw}")
@@ -276,39 +319,29 @@ class Parser:
             if not self.last_file:
                 raise self.err(line, f"@{raw}: no earlier file to refer to")
             path = self.last_file
-        elif not header and self.module is not None and self.module.base and not path.startswith(self.module.base + "/"):
-            path = f"{self.module.base}/{path}"
-        path = path.strip("/").replace("\\", "/")
-        if not header or a:
+        elif not header and self.system is not None and self.system.base and not path.startswith(self.system.base + "/"):
+            path = f"{self.system.base}/{path}"
+        path = path.replace("\\", "/")
+        if not header:
+            path = re.sub(r"^(\./)+", "", path).strip("/")
+        if not header:
             self.last_file = path
         return Trace(path, a, b)
 
-    def split_meta(self, text: str, line: int) -> tuple[str, Trace | None, Issue | None, str]:
-        """A line's body, its trace, its inline issue and its rationale."""
-        body, rationale = cut(text, RATIONALE)
-        rationale = rationale[1:].strip() if rationale else ""
-        body, issue_text = cut(body, ISSUE)
+    def split_meta(self, text: str, line: int) -> tuple[str, Trace | None, list[Issue]]:
+        """A line's body, its trace and its open questions (`? ...` at the end)."""
+        m = ISSUE.search(text)
+        body, issue_text = (text, "") if m is None else (text[:m.start()], text[m.start():])
         at = None
         traces = list(TRACE.finditer(body))
         if traces:
             at = self.trace(traces[-1].group(1), line)
-            body = (body[:traces[-1].start()] + body[traces[-1].end():]).rstrip()
-        issue = None
-        if issue_text:  # one or more `? ...` at the end of the line
-            parts = [p for p in re.split(ISSUE, issue_text) if p.strip()]
-            found = [self.issue(p.strip(), line, at) for p in parts]
-            issue, issue.more = found[0], found[1:]
-        return body.strip(), at, issue, rationale
+            body = body[:traces[-1].start()] + body[traces[-1].end():]
+        issues = [self.issue(p.strip(), line, at) for p in ISSUE.split(issue_text) if p.strip()]
+        return " ".join(body.split()), at, issues
 
     def issue(self, text: str, line: int, default_at: Trace | None) -> Issue:
-        cat = ""
-        m = re.match(r"\[([\w-]+)\]\s*", text)
-        if m:
-            cat = m.group(1)
-            if cat not in CATEGORIES:
-                raise self.err(line, f"unknown issue category [{cat}] (one of {', '.join(CATEGORIES)})")
-            text = text[m.end():]
-        at = default_at and Trace(default_at.file, default_at.start, default_at.start)
+        at = default_at
         m = re.match(r"@(\S+)\s*", text)
         if m:
             at = self.trace(m.group(1), line)
@@ -318,404 +351,283 @@ class Parser:
         if m:
             boundary, text = m.group(1), text[:m.start()]
         if not text.strip():
-            raise self.err(line, "an issue needs text")
-        return Issue(text.strip(), cat, at, boundary, line)
-
-    # -- steps
-    def step(self, text: str, line: int, at: Trace | None = None, rationale: str = "") -> Step:
-        s = Step(at=at, rationale=rationale, line_no=line)
-        text = text.strip()
-        if not text:
-            raise self.err(line, "empty step")
-        if text == "else:":
-            s.otherwise = True
-            return s
-        m = re.match(r"if\s+(.+?):$", text)
-        if m:
-            s.cond = m.group(1).strip()
-            return s
-        m = re.match(r"each\s+(.+?):\s*(.*)$", text)
-        if m:
-            s.loop = m.group(1).strip()
-            if m.group(2):
-                s.children = [self.step(t, line) for t in split_top(m.group(2), ";")]
-            return s
-        head, tail = cut(text, r"->")
-        if tail:
-            actions = [a.strip() for a in split_top(tail[2:], ",") if a.strip()]
-            if not actions:
-                raise self.err(line, f"exit with no action: {text!r}")
-            err = find_top(head, r"!err\b")
-            if err is not None:
-                s.exit = Exit("err", "err", actions)
-                head = head[:err.start()].strip()
-            else:
-                cond = ""
-                m = re.match(r"(\w+)\s*=(?!=)\s*(.*)$", head)
-                if m:
-                    parts = re.split(r"\s{2,}", m.group(2).strip(), maxsplit=1)
-                    if len(parts) < 2:
-                        raise self.err(line, f"an assignment with an exit needs its condition after two spaces: {text!r}")
-                    head, cond = f"{m.group(1)} = {parts[0]}", parts[1]
-                else:
-                    parts = re.split(r"\s{2,}", head.strip(), maxsplit=1)
-                    head, cond = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
-                s.exit = Exit("guard", cond.strip(), actions)
-        head = head.strip()
-        if head.endswith("!") and s.exit is None:  # `create user!`: fails as the module default says
-            s.exit, head = Exit("err", "err", [], default=True), head[:-1].rstrip()
-        m = re.match(r"(\w+)\s*=(?!=)\s*(.+)$", head)
-        if m:
-            s.assign, head = m.group(1), m.group(2).strip()
-        if re.match(r"return\b", head):
-            s.returns, head = True, head[6:].strip()
-        alts = [a.strip() for a in split_top(head, "??")]
-        if len(alts) > 1:
-            if any(not a for a in alts):
-                raise self.err(line, f"empty alternative in {head!r}")
-            s.fallback = alts
-        s.text = head
-        m = re.fullmatch(r"([A-Za-z_]\w*)(?:\((.*)\))?", head)
-        if m and not s.fallback:
-            s.ref = m.group(1)
-            s.args = [a.strip() for a in split_top(m.group(2), ",") if a.strip()] if m.group(2) else []
-        return s
-
-    def steps(self, text: str, line: int, at: Trace | None, rationale: str) -> list[Step]:
-        parts = [p for p in split_top(text, ";") if p.strip()]
-        out = [self.step(p, line) for p in parts]
-        if out:
-            out[-1].rationale = rationale
-        return out
-
-    # -- module members
-    def member(self, body: str, line: int, at: Trace | None, issue: Issue | None, rationale: str) -> Op | None:
-        m = self.module
-        if issue is not None:
-            m.issues += [issue] + issue.more
-        if not body:
-            if rationale:
-                m.rationale.append(rationale)
-            elif issue is None:
-                raise self.err(line, "empty line")
-            return None
-        d = re.fullmatch(r"!err\s*->\s*(.+)", body)
-        if d:
-            if m.default is not None:
-                raise self.err(line, "a second default `!err -> ...` line")
-            m.default = Exit("err", "err", [a.strip() for a in split_top(d.group(1), ",") if a.strip()])
-            return None
-        word, _, rest = body.partition(" ")
-        rest = rest.strip()
-        if word == "when":
-            m.when.append(rest)
-            return None
-        if word == "state":
-            st = re.match(r"([A-Za-z_]\w*)\s+(.+)$", rest)
-            if st is None:
-                raise self.err(line, f"state wants a name and what it holds: {body!r}")
-            m.state.append((st.group(1), st.group(2).strip()))
-            return None
-        if word == "cfg":
-            for kv in split_top(rest, ","):
-                k, eq, v = kv.strip().partition("=")
-                if not eq or not re.fullmatch(r"[A-Za-z_]\w*", k.strip()) or not v.strip():
-                    raise self.err(line, f"cfg wants key=value, got {kv.strip()!r}")
-                m.cfg.append(cfg_value(k.strip(), v.strip()))
-            return None
-        if word == "rule":
-            r = re.match(r"([A-Za-z_]\w*)(?:\(([^)]*)\))?\s+(.+)$", rest)
-            if r is None:
-                raise self.err(line, f"rule wants a name and a predicate: {body!r}")
-            pred, callee = r.group(3), ""
-            cm = re.search(r"(?<!\S)~(\S+)\s*$", pred)
-            if cm:
-                callee, pred = cm.group(1), pred[:cm.start()].strip()
-            exit_ = None
-            head, tail = cut(pred, r"->")
-            if tail:
-                err = find_top(head, r"!\w+")
-                actions = [a.strip() for a in split_top(tail[2:], ",") if a.strip()]
-                if err is None or not actions:
-                    raise self.err(line, f"a rule's exit is `!err -> actions` or `!cond -> actions`: {body!r}")
-                exit_ = Exit("err", err.group(0)[1:], actions)
-                pred = head[:err.start()].strip()
-            params = [p.strip() for p in (r.group(2) or "").split(",") if p.strip()]
-            if any(x.name == r.group(1) for x in m.rules):
-                raise self.err(line, f"rule {r.group(1)} defined twice")
-            m.rules.append(Rule(r.group(1), params, pred, callee, exit_, at, line))
-            if issue is not None:
-                for x in [issue] + issue.more:
-                    x.on = f"rule:{r.group(1)}"
-            return None
-        e = re.match(r"(" + "|".join(METHODS) + r")\s+(/\S*)\s*(\{[^}]*\})?\s*->\s*(\d{3})\s*(.*)$", body)
-        if e:
-            fields = [f.strip() for f in (e.group(3) or "{}")[1:-1].split(",") if f.strip()]
-            op = Op("endpoint", f"{e.group(1)} {e.group(2)}", method=e.group(1), path=e.group(2), fields=fields,
-                    status=e.group(4), at=at, line_no=line)
-            op.steps = self.steps(e.group(5), line, at, rationale) if e.group(5).strip() else []
-            m.ops.append(op)
-            if issue is not None:
-                for x in [issue] + issue.more:
-                    x.on = f"op:{op.name}"
-            return op
-        c = re.match(r"([A-Za-z_]\w*)(?:\(([^)]*)\))?\s*=(?!=)\s*(.+)$", body)
-        if c:
-            op = Op("calc", c.group(1), params=[p.strip() for p in (c.group(2) or "").split(",") if p.strip()],
-                    out=c.group(1), at=at, line_no=line)
-            op.steps = self.steps(c.group(3), line, at, rationale)
-            m.ops.append(op)
-            if issue is not None:
-                for x in [issue] + issue.more:
-                    x.on = f"op:{op.name}"
-            return op
-        o = re.fullmatch(r"([A-Za-z_]\w*)\(([^)]*)\)\s*(?:->\s*([\w.\[\]*]+|\([\w\s,.\[\]*]+\)))?", body)
-        if o:
-            op = Op("op", o.group(1), params=[p.strip() for p in o.group(2).split(",") if p.strip()],
-                    out=o.group(3) or "", at=at, line_no=line, rationale=[rationale] if rationale else [])
-            m.ops.append(op)
-            if issue is not None:
-                for x in [issue] + issue.more:
-                    x.on = f"op:{op.name}"
-            return op
-        raise self.err(line, f"cannot read {body!r}: a module member is `when`, `cfg`, `rule`, an endpoint "
-                             f"`METHOD /path {{fields}} -> 201  steps  @trace`, an operation `name(ins) -> out  @trace` "
-                             f"with its steps indented below, a value `name(ins) = steps  @trace`, or a `?` issue")
+            raise self.err(line, "an open question needs text")
+        return Issue(text.strip(), at, boundary, line)
 
     def parse_file(self, text: str, where: str) -> None:
-        self.where, self.module, self.last_file = where, None, ""
-        stack: list[tuple[int, object]] = []  # (indent, Op or Step) the next deeper lines belong to
+        self.where, self.system, self.last_file = where, None, ""
+        open_block: tuple[str, object] | None = None  # (kind, element) taking indented lines
         for n, raw in enumerate(text.splitlines(), 1):
-            if not raw.strip():
+            if not raw.strip() or raw.lstrip().startswith("//"):
                 continue
             indent = len(raw) - len(raw.lstrip(" "))
-            if "\t" in raw[:indent + 1] or indent % 2:
-                raise self.err(n, "indent with 2 spaces")
-            depth = indent // 2
-            body, at, issue, rationale = self.split_meta(raw.strip(), n) if not raw.strip().startswith("?") \
-                else ("", None, self.issue(raw.strip()[1:].strip(), n, None), "")
-            if depth == 0:
-                stack = []
-                if not body and rationale:  # a comment at the top of a file
-                    continue
-                if body.startswith("def "):
-                    d = re.fullmatch(r"def\s+([A-Z]\w*)\s*\{([^}]*)\}", body)
-                    if d is None:
-                        raise self.err(n, f"def wants `def Name {{a, b}}`: {body!r}")
-                    if d.group(1) in self.spec.defs:
-                        raise self.err(n, f"def {d.group(1)} defined twice")
-                    self.spec.defs[d.group(1)] = Def(d.group(1), [f.strip() for f in d.group(2).split(",") if f.strip()], at, n)
-                    self.module = None
-                    continue
-                h = re.fullmatch(r"([a-z_][\w-]*)(?:\s*:\s*([A-Z]\w*)(?:\((.*)\))?)?", body)
-                if h is None or at is None:
-                    raise self.err(n, f"a module line is `name [: Def(args)]  @path`: {raw.strip()!r}")
-                if self.spec.module(h.group(1)):
-                    raise self.err(n, f"module {h.group(1)} defined twice")
-                at = self.trace(at.text()[1:], n, header=True)
-                base = at.file if not re.search(r"\.\w+$", at.file) else at.file.rsplit("/", 1)[0] if "/" in at.file else ""
-                mod = Module(h.group(1), at, base, h.group(2) or "", source=where, line_no=n)
-                for a in split_top(h.group(3) or "", ","):
-                    k, eq, v = a.strip().partition("=")
-                    if k.strip():
-                        mod.def_args.append((k.strip(), v.strip() if eq else "true"))
-                self.module = mod
-                self.last_file = at.file if at.start or re.search(r"\.\w+$", at.file) else ""
-                self.spec.modules.append(mod)
-                if issue is not None:
-                    mod.issues += [issue] + issue.more
+            if "\t" in raw[:indent + 1]:
+                raise self.err(n, "indent with spaces, not tabs")
+            line = raw.strip()
+            if indent == 0:
+                if not line.startswith("system "):
+                    raise self.err(n, f"a spec starts with `system Name  @path/`, not {line[:40]!r}")
+                body, at, issues = self.split_meta(line[len("system "):], n)
+                if not re.fullmatch(r"[A-Za-z_]\w*", body):
+                    raise self.err(n, f"a system name is one word: {body!r}")
+                base = re.sub(r"^\./?", "", at.file.rstrip("/")) if at else ""  # `@./`: the repo itself
+                self.system = System(body, Trace(base), issues=issues)
+                self.spec.systems.append(self.system)
+                open_block = None
                 continue
-            if self.module is None:
-                raise self.err(n, "an indented line outside a module")
-            while stack and stack[-1][0] >= depth:
-                stack.pop()
-            if depth == 1:
-                op = self.member(body, n, at, issue, rationale)
-                if op is not None:
-                    stack = [(1, op)]
+            if self.system is None:
+                raise self.err(n, "an indented line before any `system` line")
+            if indent == 2:
+                open_block = self.member(line, n)
+            elif indent >= 4 and open_block is not None:
+                self.nested(open_block, line, n)
+            else:
+                raise self.err(n, f"unexpected indentation ({indent} spaces) for {line[:40]!r}")
+
+    # -- system members
+    def member(self, line: str, n: int) -> tuple[str, object] | None:
+        s = self.system
+        word, _, rest = line.partition(" ")
+        if line.startswith("?"):
+            _, at, issues = self.split_meta(line, n)
+            s.issues += issues
+            return None
+        if word == "doc":
+            s.doc = rest.strip()
+            return None
+        if word in ("actor", "part"):
+            body, at, issues = self.split_meta(rest, n)
+            s.issues += issues
+            for name in split_top(body, ","):
+                name, only = doc_only(name)
+                if not re.fullmatch(r"[A-Za-z_]\w*", name):
+                    raise self.err(n, f"{word} names are single words: {name!r}")
+                (s.actors if word == "actor" else s.parts).append(Named(name, at, only))
+            return None
+        if word == "item":
+            body, at, issues = self.split_meta(rest, n)
+            s.issues += issues
+            for one in split_top(body, ","):  # item A {x}, B {y}
+                one, only = doc_only(one)
+                m = re.fullmatch(r"([A-Za-z_]\w*)\s*(?:\{(.*)\})?", one.strip())
+                if m is None:
+                    raise self.err(n, f"item wants `item Name {{field, field}}`: {one.strip()!r}")
+                fields = [f.strip() for f in split_top(m.group(2) or "", ",") if f.strip()]
+                s.items.append(Item(m.group(1), fields, at, only))
+            return None
+        if word == "cfg":
+            body, at, issues = self.split_meta(rest, n)
+            s.issues += issues
+            for kv in split_top(body, ","):
+                k, eq, v = kv.strip().partition("=")
+                if not eq or not re.fullmatch(r"[A-Za-z_][\w.]*", k.strip()) or not v.strip():
+                    raise self.err(n, f"cfg wants `name = value unit`: {kv.strip()!r}")
+                s.cfg.append(cfg_value(k.strip(), v.strip(), at))
+            return None
+        if word == "req":
+            body, at, issues = self.split_meta(rest, n)
+            body, only = doc_only(body)
+            m = re.fullmatch(rf"({REQ_ID})\s+(.+)", body)
+            if m is None:
+                raise self.err(n, f"req wants `req ID statement` with an ID like VM-1: {body!r}")
+            if s.req(m.group(1)):
+                raise self.err(n, f"requirement {m.group(1)} is written twice")
+            r = Req(m.group(1), m.group(2).strip(), at, issues=issues, doc_only=only, line_no=n)
+            s.reqs.append(r)
+            return ("req", r)
+        if word == "state":
+            body, at, issues = self.split_meta(rest, n)
+            s.issues += issues
+            m = re.fullmatch(r"([A-Za-z_]\w*)\s*:", body)
+            if m is None:
+                raise self.err(n, f"a state machine is `state Owner:` with its transitions indented below: {body!r}")
+            mach = Machine(m.group(1), at=at)
+            s.machines.append(mach)
+            return ("state", mach)
+        if word in ("usecase", "activity"):
+            body, at, issues = self.split_meta(rest, n)
+            name, colon, steps = body.partition(":")
+            if not colon or not re.fullmatch(r"[A-Za-z_]\w*", name.strip()):
+                raise self.err(n, f"{word} wants `{word} Name: ...`: {body!r}")
+            if word == "usecase":
+                u = UseCase(name.strip(), "", at=at, issues=issues)
+                s.usecases.append(u)
+                if steps.strip():
+                    self.usecase_steps(u, steps, n)
+                return ("usecase", u)
+            s.issues += issues
+            a = Activity(name.strip(), at=at, src=steps.strip())  # indented lines may continue it
+            s.activities.append(a)
+            if steps.strip():
+                a.nodes = self.chain(steps, n)
+            return ("activity", a)
+        if word == "omit":
+            names, colon, reason = rest.rpartition(":")
+            reason = reason.strip()
+            if not colon or not names.strip():  # a reason outside OMIT_REASONS is check.py's to report
+                raise self.err(n, f"omit wants `omit name, name: reason` with a reason in {', '.join(OMIT_REASONS)}")
+            s.omits.append(Omit([x.strip() for x in names.split(",") if x.strip()], reason, n))
+            return None
+        body, at, issues = self.split_meta(line, n)
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s+satisfies\s+(.+)", body)
+        if m:
+            s.satisfies.append(Satisfy(m.group(1), [x.strip() for x in m.group(2).split(",") if x.strip()], at))
+            return None
+        m = re.fullmatch(rf"({REQ_ID})\s+by\s+([A-Za-z_]\w*)", body)
+        if m:
+            s.satisfies.append(Satisfy(m.group(2), [m.group(1)], at))
+            return None
+        raise self.err(n, f"unknown line {line[:50]!r} (see LEGEND)")
+
+    def nested(self, block: tuple[str, object], line: str, n: int) -> None:
+        kind, el = block
+        if kind == "req":
+            word, _, rest = line.partition(" ")
+            if word == "constraint":
+                el.constraints.append(rest.strip())
+            elif line.startswith("?"):
+                el.issues += self.split_meta(line, n)[2]
+            else:
+                raise self.err(n, f"under a req: `constraint expr` or `? question`, not {line[:40]!r}")
+        elif kind == "state":
+            body, at, issues = self.split_meta(line, n)
+            self.system.issues += issues
+            body, only = doc_only(body)
+            m = TRANSITION.match(body)
+            if m is None:
+                raise self.err(n, f"a transition is `A -(event[guard] / effect)-> B`: {body!r}")
+            t = Transition(m.group(1), m.group(3), at=at, doc_only=only, line_no=n)
+            label = m.group(2).strip()
+            parts = split_top(label, " / ")
+            if len(parts) > 1:
+                label, t.effect = parts[0].strip(), " / ".join(parts[1:]).strip()
+            g = re.fullmatch(r"(.*?)\s*\[(.*)\]\s*", label)
+            if g:
+                t.event, t.guard = g.group(1).strip(), g.group(2).strip()
+            else:
+                t.event = label
+            el.transitions.append(t)
+        elif kind == "usecase":
+            self.usecase_steps(el, line, n, more=bool(el.actor))
+        elif kind == "activity":
+            body, at, issues = self.split_meta(line, n)
+            self.system.issues += issues
+            el.src = (el.src + " -> " if el.src else "") + body
+            el.nodes = self.chain(el.src, n)
+        else:
+            raise self.err(n, f"nothing takes indented lines here: {line[:40]!r}")
+
+    def usecase_steps(self, u: UseCase, text: str, n: int, more: bool = False) -> None:
+        body, at, issues = self.split_meta(text, n)
+        u.issues += issues
+        parts = [p.strip() for p in split_top(body, "->")]
+        if not more:
+            if len(parts) < 2 or not re.fullmatch(r"[A-Za-z_]\w*(\s*,\s*[A-Za-z_]\w*)*", parts[0]):
+                raise self.err(n, f"a use case is `usecase Name: Actor -> step, step`: {body!r}")
+            u.actor, parts = " ".join(parts[0].replace(",", " ").split()).replace(" ", ", "), parts[1:]
+        for p in parts:
+            for st in split_top(p, ","):
+                st, only = doc_only(st)
+                if st:
+                    u.steps.append(UStep(st, only))
+
+    def chain(self, text: str, n: int) -> list[Node]:
+        segs = [p.strip() for p in split_top(text, "->") if p.strip()]
+        out: list[Node] = []
+        for i, seg in enumerate(segs):
+            m = re.match(r"\[(.+?)\]\s*(.*)$", seg)
+            if m is None:
+                out.append(Node(seg))
                 continue
-            if not stack:
-                if body.startswith("#") or (not body and (issue or rationale)):
-                    if issue:
-                        self.module.issues += [issue] + issue.more
-                    continue
-                raise self.err(n, "a step outside an operation")
-            if issue is not None:
-                self.module.issues += [issue] + issue.more
-            if not body:
-                if rationale:
-                    owner = stack[0][1]
-                    owner.rationale.append(rationale)
-                continue
-            parent = stack[-1][1]
-            c = re.match(r"([A-Za-z_]\w*)\(([^)]*)\)\s*=(?!=)\s*(.+)$", body)
-            if c:  # a helper defined inside an operation
-                op = Op("calc", c.group(1), params=[p.strip() for p in c.group(2).split(",") if p.strip()],
-                        out=c.group(1), at=at, line_no=n)
-                op.steps = self.steps(c.group(3), n, at, rationale)
-                self.module.ops.append(op)
-                continue
-            new = self.steps(body, n, at, rationale)
-            for s in new:
-                s.at = s.at or at
-            (parent.steps if isinstance(parent, Op) else parent.children).extend(new)
-            if len(new) == 1 and (new[0].loop or new[0].cond or new[0].otherwise):
-                stack.append((depth, new[0]))
-
-    def resolve(self) -> None:
-        for m in self.spec.modules:
-            if m.def_name and m.def_name not in self.spec.defs:
-                raise SpecError(m.source, m.line_no, f"undefined def {m.def_name}")
-        shared = {r.name: r for m in self.spec.modules if m.name.startswith("_") for r in m.rules}
-        for m in self.spec.modules:
-            rules = {**shared, **{r.name: r for r in m.rules}}
-            ops = {o.name: o for o in m.ops if o.kind != "endpoint"}
-            known_vars = {p.split()[0] for o in m.ops for p in o.params if p} | {c.key for c in m.cfg}
-            for o in m.ops:
-                for s in walk(o.steps):
-                    if s.assign:
-                        known_vars.add(s.assign)
-            for o in m.ops:
-                for s in walk(o.steps):
-                    c = re.fullmatch(r"([A-Za-z_]\w*)(?:\((.*)\))?", s.exit.cond) if s.exit and not s.text else None
-                    if c and c.group(1) in rules:  # `guard(login) -> 403`: the rule, failing with these actions
-                        s.text, s.ref = s.exit.cond, c.group(1)
-                        s.args = [a.strip() for a in split_top(c.group(2), ",") if a.strip()] if c.group(2) else []
-                        s.exit = Exit("err", "err", s.exit.actions)
-            for o in m.ops:
-                for s in walk(o.steps):
-                    if s.exit is not None and s.exit.default:
-                        if m.default is None:
-                            raise SpecError(m.source, s.line_no, f"`{s.text}!` needs the module's default `!err -> ...` line")
-                        s.exit.actions = list(m.default.actions)
-            for o in m.ops:
-                for s in walk(o.steps):
-                    if not s.ref:
-                        continue
-                    if s.ref in rules:
-                        r = rules[s.ref]
-                        if len(s.args) != len(r.params):
-                            raise SpecError(m.source, s.line_no, f"rule {r.name} takes {len(r.params)} argument(s), got {len(s.args)}")
-                        continue
-                    if s.ref in ops or s.ref in known_vars or s.ref in BUILTINS or s.ref in self.known or s.ref[0].isupper():
-                        s.ref = s.ref if s.ref in ops else ""
-                        continue
-                    if s.args or re.search(r"\(", s.text):  # called by name but defined nowhere
-                        raise SpecError(m.source, s.line_no, f"undefined rule or operation {s.ref!r}")
-                    s.ref = ""  # a one-word step (validate, authenticate): an action, not a reference
+            branches = split_top(m.group(2), "|")
+            then = branches[0].strip()
+            other = "|".join(branches[1:]).strip()
+            rest = " -> ".join(([other] if other else []) + segs[i + 1:])
+            out.append(Node(cond=m.group(1).strip(), then=[Node(then)] if then else [],
+                            other=self.chain(rest, n) if rest else []))
+            break
+        return out
 
 
-def cfg_value(key: str, raw: str) -> Cfg:
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)([A-Za-z%]+)?", raw)
-    if m:
-        unit = UNITS.get(m.group(2) or "", m.group(2) or "")
-        return Cfg(key, raw, m.group(1), unit, "Real" if "." in m.group(1) else "Integer")
-    if raw in ("true", "false"):
-        return Cfg(key, raw, raw, "", "Boolean")
-    return Cfg(key, raw, raw.strip('"'), "", "String")
+def cfg_value(key: str, raw: str, at: Trace | None = None) -> Cfg:
+    """`{5,10,25} cents` -> value {5,10,25}, unit cents; `2..8 °C`; `3`; `{price cents, stock} per slot`."""
+    m = re.match(r"(\{.*\}|\"[^\"]*\"|\S+)\s*(.*)$", raw)
+    value, unit = (m.group(1), m.group(2).strip()) if m else (raw, "")
+    return Cfg(key, value, unit, at)
 
 
-def walk(steps: list[Step]):
-    for s in steps:
-        yield s
-        yield from walk(s.children)
-
-
-class _Any(set):
-    def __contains__(self, item) -> bool:
-        return True
-
-
-ANY = _Any()  # known= for a spec read without its code: every call counts as defined
-
-
-def parse(files: dict[str, str], known: set[str] | None = None) -> Spec:
-    """files: {name: text}, read in name order (a shared file starting with _ first). Raises SpecError."""
-    p = Parser(known)
-    for where in sorted(files, key=lambda w: (not w.rsplit("/", 1)[-1].startswith("_"), w)):
+def parse(files: dict[str, str]) -> Spec:
+    p = Parser()
+    for where in sorted(files):
         p.parse_file(files[where], where)
-    p.resolve()
     return p.spec
 
 
-# ---------------------------------------------------------------------------------------------- printer
-def step_text(s: Step) -> str:
-    if s.loop:
-        return f"each {s.loop}:"
-    if s.cond:
-        return f"if {s.cond}:"
-    if s.otherwise:
-        return "else:"
-    out = (f"{s.assign} = " if s.assign else "") + ("return " if s.returns else "") + s.text
-    out = out.strip()
-    if s.exit and s.exit.default:
-        return out + "!"
-    if s.exit:
-        if s.exit.kind == "err":
-            out = f"{out} !err -> " if out else "!err -> "
+# ---------------------------------------------------------------------------------------------- printing
+def chain_text(nodes: list[Node]) -> str:
+    out = []
+    for nd in nodes:
+        if nd.cond:
+            then = chain_text(nd.then)
+            other = chain_text(nd.other)
+            out.append(f"[{nd.cond}] {then}" + (f" | {other}" if other else ""))
         else:
-            out = f"{out}  {s.exit.cond} -> " if out else f"{s.exit.cond} -> "
-        out += ", ".join(s.exit.actions)
-    return out
+            out.append(nd.text)
+    return " -> ".join(out)
 
 
-def format_module(m: Module, defs: dict[str, Def] | None = None) -> str:
-    """The canonical text of one module: fixed order of sections, two spaces between columns."""
-    lines = []
-    if m.name.startswith("_") and defs:
-        for d in sorted(defs.values(), key=lambda d: d.name):
-            lines.append(f"def {d.name} {{{', '.join(d.fields)}}}" + (f"  {d.at.text()}" if d.at else ""))
-    head = m.name + (f" : {m.def_name}" + (f"({', '.join(k if v == 'true' else f'{k}={v}' for k, v in m.def_args)})"
-                                           if m.def_args else "") if m.def_name else "")
-    lines.append(f"{head}  {m.at.text()}")
-    last = [m.at.file if re.search(r'\.\w+$', m.at.file) else ""]
+def format_system(s: System) -> str:
+    last = [""]
 
     def tr(t: Trace | None) -> str:
         if t is None:
             return ""
-        s = t.text(m.base, last[0])
+        txt = t.text(s.base, last[0])
         last[0] = t.file
-        return "  " + s
+        return "  " + txt
 
-    def issue(i: Issue) -> str:
-        return "? " + (f"[{i.category}] " if i.category else "") + (tr(i.at).strip() + " " if i.at else "") \
-            + i.text + (f" -> {i.boundary}" if i.boundary else "")
+    def qs(issues: list[Issue]) -> str:
+        return "".join(f"  ? {i.text}" + (f" -> {i.boundary}" if i.boundary else "") for i in issues)
 
-    def inline(key: str) -> str:
-        return "".join("  " + issue(i) for i in m.issues if i.on == key)
+    def dl(only: bool) -> str:
+        return f"{DOC_ONLY} " if only else ""
 
-    lines += [f"  # {r}" for r in m.rationale]
-    lines += [f"  when  {w}" for w in m.when]
-    if m.cfg:
-        lines.append("  cfg   " + ", ".join(f"{c.key}={c.raw}" for c in m.cfg))
-    lines += [f"  state {n}  {t}" for n, t in m.state]
-    if m.default:
-        lines.append("  !err -> " + ", ".join(m.default.actions))
-    for r in m.rules:
-        ex = f"  !{r.exit.cond} -> {', '.join(r.exit.actions)}" if r.exit else ""
-        head = (f"  rule {r.name}{'(' + ', '.join(r.params) + ')' if r.params else ''}  {r.predicate}{ex}"
-                + (f"  ~{r.callee}" if r.callee else "") + tr(r.at))
-        lines.append(head + inline(f"rule:{r.name}"))
-    for o in m.ops:
-        if o.kind == "endpoint":
-            body = "{" + ",".join(o.fields) + "} " if o.fields else ""
-            head = f"  {o.method} {o.path} {body}-> {o.status}  " + "; ".join(step_text(s) for s in o.steps) + tr(o.at)
-            lines.append(head + inline(f"op:{o.name}"))
-        elif o.kind == "calc":
-            head = f"  {o.name}{'(' + ', '.join(o.params) + ')' if o.params else ''} = " \
-                + "; ".join(step_text(s) for s in o.steps) + tr(o.at)
-            lines.append(head + inline(f"op:{o.name}"))
-        else:
-            head = f"  {o.name}({', '.join(o.params)})" + (f" -> {o.out}" if o.out else "") + tr(o.at)
-            lines.append(head + inline(f"op:{o.name}"))
-            lines += [f"    # {r}" for r in o.rationale]
-
-            def put(steps, depth):
-                for s in steps:
-                    lines.append("  " * depth + step_text(s) + (f"  # {s.rationale}" if s.rationale else ""))
-                    put(s.children, depth + 1)
-            put(o.steps, 2)
-    for i in sorted((i for i in m.issues if not i.on),
-                    key=lambda i: (i.at.file if i.at else "", i.at.start if i.at else 0, i.category, i.text)):
-        lines.append("  " + issue(i))
-    return "\n".join(lines) + "\n"
+    out = [f"system {s.name}" + (f"  @{s.at.file}/" if s.at.file else "")]
+    if s.doc:
+        out.append(f"  doc {s.doc}")
+    for kind, xs in (("actor", s.actors), ("part", s.parts)):
+        if xs:  # one line for the untraced, one line each for the traced
+            plain = [x for x in xs if x.at is None]
+            if plain:
+                out.append(f"  {kind} " + ", ".join(dl(x.doc_only) + x.name for x in plain))
+            out += [f"  {kind} {dl(x.doc_only)}{x.name}{tr(x.at)}" for x in xs if x.at is not None]
+    for it in s.items:
+        out.append(f"  item {dl(it.doc_only)}{it.name}" + (f" {{{', '.join(it.fields)}}}" if it.fields else "") + tr(it.at))
+    if s.cfg:
+        groups: list[tuple[Trace | None, list[Cfg]]] = []
+        for c in s.cfg:
+            if groups and groups[-1][0] == c.at:
+                groups[-1][1].append(c)
+            else:
+                groups.append((c.at, [c]))
+        for at, cs in groups:
+            out.append("  cfg " + ", ".join(f"{c.key} = {c.value}" + (f" {c.unit}" if c.unit else "") for c in cs) + tr(at))
+    for r in s.reqs:
+        out.append(f"  req {dl(r.doc_only)}{r.id} {r.text}{tr(r.at)}{qs(r.issues)}")
+        out += [f"    constraint {c}" for c in r.constraints]
+    for m in s.machines:
+        out.append(f"  state {m.owner}:{tr(m.at)}")
+        for t in m.transitions:
+            out.append(f"    {dl(t.doc_only)}{t.src} -({t.label()})-> {t.tgt}{tr(t.at)}")
+    for u in s.usecases:
+        steps = ", ".join(dl(x.doc_only) + x.text for x in u.steps)
+        out.append(f"  usecase {u.name}: {u.actor} -> {steps}{tr(u.at)}{qs(u.issues)}")
+    for a in s.activities:
+        out.append(f"  activity {a.name}: {chain_text(a.nodes)}{tr(a.at)}")
+    for sat in s.satisfies:
+        out.append(f"  {sat.by} satisfies {', '.join(sat.ids)}{tr(sat.at)}")
+    for o in s.omits:
+        out.append(f"  omit {', '.join(o.names)}: {o.reason}")
+    for i in s.issues:
+        out.append(f"  ? {i.text}" + (f" -> {i.boundary}" if i.boundary else ""))
+    return "\n".join(out) + "\n"

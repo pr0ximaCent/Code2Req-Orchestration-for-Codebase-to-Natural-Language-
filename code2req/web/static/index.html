@@ -223,10 +223,10 @@ textarea.field { height: auto; min-height: 64px; padding: 7px 9px; resize: verti
 <div class="options" id="options" hidden>
   <label for="mode">What to make
     <select class="field" id="mode">
-      <option value="bspec">Compact system document (bspec)</option>
+      <option value="bspec">System document for SysModeler (bspec)</option>
       <option value="sysml">Requirements + system design</option>
     </select></label>
-  <label class="grow" for="modules">Folders inside the repo (comma-separated; bspec only, empty = every folder)
+  <label class="grow" for="modules">Folders inside the repo (comma-separated; bspec: one system made of these folders, empty = the whole repo)
     <input class="field" id="modules" placeholder="app/services/credits, app/api/auth"></label>
   <label class="grow" for="exclude">Exclude files (comma-separated globs)
     <input class="field" id="exclude" placeholder="*_test.go, migrations/*"></label>
@@ -428,7 +428,7 @@ async function refresh() {
     if (!S.doc) {
       const r = await fetch(`/api/runs/${id}/bspec/system_doc.md`);
       S.doc = r.ok ? await r.text() : "(no system document)";
-      const v = await fetch(`/api/runs/${id}/bspec/review.md`);
+      const v = await fetch(`/api/runs/${id}/bspec/coverage.md`);
       S.review = v.ok ? await v.text() : "";
       loadRuns();
     }
@@ -490,12 +490,12 @@ function renderDoc() {
   const warn = s.not_extracted?.length ? ` · <span class="err">not extracted: ${esc(s.not_extracted.join(", "))}</span>` : "";
   const tab = (k, label) => `<button class="btn ${S.docTab === k ? "primary" : ""}" type="button" data-tab="${k}">${label}</button>`;
   $("#body").innerHTML = `<section class="run" style="overflow:auto">
-    <div>${s.modules} module(s) · ${s.lines} spec lines · ${s.rules} rules · ${s.issues} open issues ·
-      <b>${s.uncovered_exits}</b> uncovered exits · <b>${s.lint_hits}</b> lint hits${cost}${warn}</div>
+    <div>${esc((s.systems || []).join(", "))} · ${s.requirements} requirements · ${s.transitions} transitions ·
+      ${s.usecases} use cases · ${s.lines} spec lines · <b>${s.dropped}</b> dropped facts · <b>${s.lint_hits}</b> lint hits${cost}${warn}</div>
     <div style="display:flex; gap:.5em; flex-wrap:wrap; margin:.6em 0">
-      ${tab("doc", "System document")} ${tab("review", "Review")}
+      ${tab("doc", "System document")} ${tab("review", "Coverage")}
       <a class="btn" href="/api/runs/${id}/bspec/system_doc.md" download="system_doc-${id}.md">Download system_doc.md</a>
-      <a class="btn" href="/api/runs/${id}/bspec/spec_and_sysml.zip">Download spec + SysML (.zip)</a>
+      <a class="btn" href="/api/runs/${id}/bspec/spec.zip">Download spec + reports (.zip)</a>
     </div>
     <article class="doc" style="max-width:60em; line-height:1.5">${md(S.docTab === "review" ? S.review : S.doc)}</article>
   </section>`;

@@ -51,7 +51,7 @@ class RunRequest(BaseModel):
     workers: int = Field(default=4, ge=1, le=16)
     max_module_chars: int = Field(default=DEFAULT_MODULE_CHARS, ge=5_000, le=400_000)
     profile: str = Field(default="sysml", pattern="^(sysml|exhaustive|bspec)$")  # bspec: the compact system document
-    modules: list[str] = Field(default_factory=list)  # bspec: folders inside the repo to read (default every folder)
+    modules: list[str] = Field(default_factory=list)  # bspec: the folders of one system (default the whole repo)
     followup: bool = True  # exhaustive profile only
     entries: list[str] = Field(default_factory=list)  # extra entry-point globs for dead-code detection
     assets: bool = True  # include prompts, templates, reference files and CI/CD
@@ -232,12 +232,13 @@ class RunManager:
             if req.profile == "bspec":  # the compact behaviour spec and its system document, instead of requirements
                 from ..bspec import run as run_bspec
                 progress("bspec", 0, 0)
-                got = run_bspec(repo, out_dir, llm, label, [m for m in req.modules if m.strip()] or None,
-                                workers=req.workers)
+                folders = [m.strip() for m in req.modules if m.strip()]
+                got = run_bspec(repo, out_dir, llm, label, [folders] if folders else None, workers=req.workers)
                 size = got["size"]
-                meta["summary"] = {"bspec": True, "modules": len(got["modules"]), "lines": size["lines"],
-                                   "chars": size["chars"], "rules": size["rules"], "issues": size["issues"],
-                                   "uncovered_exits": size["uncovered_exits"], "lint_hits": size["lint_hits"],
+                meta["summary"] = {"bspec": True, "systems": got["systems"], "lines": size["lines"], "chars": size["chars"],
+                                   "requirements": size["requirements"], "transitions": size["transitions"],
+                                   "usecases": size["usecases"], "behaviours": size["behaviours"],
+                                   "dropped": size["dropped"], "lint_hits": size["lint_hits"],
                                    "not_extracted": got["not_extracted"],
                                    "cost_usd": (got.get("usage") or {}).get("cost_usd")}
                 progress("done", 0, 0)
@@ -519,23 +520,23 @@ def create_app(runs_dir: str, llm_factory: Callable[[], tuple[LLM, str]],
 
     @app.get("/api/runs/{run_id}/bspec/{name}")
     def bspec_file(run_id: str, name: str) -> Response:
-        """A bspec run's outputs: the system document, the review and size reports, or spec_and_sysml.zip."""
+        """A bspec run's outputs: the system document, the coverage, review and size reports, or spec.zip."""
         out = mgr._dir(run_id)
-        if name == "spec_and_sysml.zip":
+        if name == "spec.zip":
             import io
             import zipfile
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-                for sub in ("spec", "sysml"):
-                    for f in sorted(os.listdir(os.path.join(out, sub))) if os.path.isdir(os.path.join(out, sub)) else []:
-                        z.write(os.path.join(out, sub, f), f"{sub}/{f}")
-                for f in ("system_doc.md", "review.md", "size_report.md", "LEGEND.md"):
+                spec_dir = os.path.join(out, "spec")
+                for f in sorted(os.listdir(spec_dir)) if os.path.isdir(spec_dir) else []:
+                    z.write(os.path.join(spec_dir, f), f"spec/{f}")
+                for f in ("system_doc.md", "coverage.md", "review.md", "size_report.md", "LEGEND.md"):
                     if os.path.isfile(os.path.join(out, f)):
                         z.write(os.path.join(out, f), f)
             return Response(buf.getvalue(), media_type="application/zip",
                             headers={"Content-Disposition": f'attachment; filename="bspec-{run_id}.zip"'})
-        if name not in ("system_doc.md", "review.md", "size_report.md"):
-            raise HTTPException(404, "system_doc.md, review.md, size_report.md or spec_and_sysml.zip")
+        if name not in ("system_doc.md", "coverage.md", "review.md", "size_report.md"):
+            raise HTTPException(404, "system_doc.md, coverage.md, review.md, size_report.md or spec.zip")
         path = os.path.join(out, name)
         if not os.path.isfile(path):
             raise HTTPException(404, "this run has no " + name)

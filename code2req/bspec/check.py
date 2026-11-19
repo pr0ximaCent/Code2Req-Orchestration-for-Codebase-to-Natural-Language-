@@ -1,331 +1,337 @@
-"""A module's spec held to its code (facts.py): traces, rules, duplication and exit coverage. No model call.
+"""A system's spec held to its code (sysfacts.py): coverage of every fact, and lint. No model call.
 
-problems() is what the extraction loop sends back to the model; a module is done when it is empty. Coverage
-counts exits, not line ranges: every early or error return of the module's code must be an explicit exit of
-the operation whose trace holds it (a `!err ->` or `cond ->` step, an alternative of a `??` chain), or follow
-the call of a rule whose definition has an exit. A trace spanning a whole function covers none of its exits."""
+Coverage: each fact must be in the model or left out by an `omit` line, and nothing is dropped silently.
+A fact is in the model when an element of the kinds that can show it names it (most of its words are in the
+element's name or text, or a value of it is the element's value) or traces to its line:
+  entry      -> a use case or its step, a transition's event, a requirement, an activity
+  state      -> a state machine (its states are the values the code sets), a transition, a requirement
+  constant   -> a cfg entry, a requirement or its constraint, a transition's guard
+  interface  -> an actor, a part, an item, a requirement, a use case step
+State and behavioural constants cannot be omitted; every other fact may be, for one of the reasons in OMIT_REASONS.
+Lint: names in domain terms (not handleCoinV2 or formatHistory), requirements without code (no dotted names or
+CONSTANT_NAMES), as-built only (no plans), every reference resolves, every trace is on lines the code has."""
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass, field
 
-from .facts import ExitFact, ModuleFacts, RepoFacts
-from .notation import Module, Op, Rule, Spec, Step, walk
+from ..design.names import words
+from .compare import alike, stem, wordset
+from .notation import OMIT_REASONS, REQ_ID, System, Trace, chain_text
+from .sysfacts import Fact, SystemFacts
 
-PROSE = re.compile(r"(?i)\b(shall|must|returns? an error|or an error|the system)\b")
-# a step that copies code instead of naming the behaviour: receiver/request chains, standard library, response writes
-# code in a step, condition or action: the document is read by engineers, not compiled. Dotted names, operators,
-# brackets, call syntax, locking.
-CODE_COPY = re.compile(r"\w\.\w|==|!=|<=|>=|&&|\|\||[\[\]{}*&]|\w\(|\b(nil|null|defer|ERR)\b|(?i:\b(mutex|lock|unlock|locked)\b)")
-MAX_STEP = 60  # characters of one step's action
-MAX_EXIT = 32  # characters of one exit's actions
+IMPL_WORDS = {"handle", "handler", "format", "formatter", "helper", "util", "utils", "impl", "wrapper", "parse", "parser",
+              "serialize", "serializer", "encode", "decode", "internal", "tmp", "func", "fn", "callback", "dto", "json",
+              "manager", "process", "processor", "do"}
+CODE_IN_TEXT = re.compile(r"\b[a-z_]\w*\.[a-z_]\w*\(|\bself\.|\bthis\.|\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b|\b\w+_\w+\(|==|!=|&&|\|\|")
+PLANS = re.compile(r"(?i)\b(todo|fixme|will be|planned|in the future|later version|not yet implemented)\b")
+GENERIC = {"self", "this", "get", "set", "the", "on", "cmd", "command", "event", "route", "calls", "call", "registered",
+           "by", "value", "values", "main", "s", "c"}
+TRACE_SPAN = 60  # a trace this long or shorter is precise enough to show a fact on its lines
+FRAGMENTED = 4  # this many requirements in one function follow its branches, not behaviours seen from outside
 
 
 @dataclass
 class Coverage:
-    covered: list[tuple[ExitFact, str]] = field(default_factory=list)  # (exit, what covers it)
-    uncovered: list[ExitFact] = field(default_factory=list)
-    explained: list[tuple[ExitFact, str]] = field(default_factory=list)  # uncovered, with the issue that says why
-    extra: list[str] = field(default_factory=list)  # spec exits matching no code exit
-    notes: list[str] = field(default_factory=list)  # exits stated in the wrong form (default, pass-up)
+    mapped: list[tuple[Fact, str]] = field(default_factory=list)  # (fact, the element that shows it)
+    omitted: list[tuple[Fact, str]] = field(default_factory=list)  # (fact, reason)
+    dropped: list[Fact] = field(default_factory=list)  # in neither: a silent drop
+    bad_omits: list[tuple[Fact, str]] = field(default_factory=list)  # state or a behavioural constant left out
+
+    def counts(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for name, xs in (("mapped", self.mapped), ("omitted", self.omitted), ("dropped", [(f, "") for f in self.dropped]),
+                         ("bad_omits", self.bad_omits)):
+            for f, _ in xs:
+                out.setdefault(f.kind, {"mapped": 0, "omitted": 0, "dropped": 0, "bad_omits": 0})[name] += 1
+        return out
 
 
 @dataclass
 class Result:
-    errors: list[str] = field(default_factory=list)  # must be fixed: bad traces, missing rules, uncovered exits
-    lint: list[str] = field(default_factory=list)  # duplication and restated prose
-    coverage: Coverage = field(default_factory=Coverage)
+    coverage: Coverage
+    errors: list[str] = field(default_factory=list)
+    lint: list[str] = field(default_factory=list)
 
     def problems(self) -> list[str]:
-        return self.errors + self.lint + [f"exit at {e.file}:{e.line} (in {e.fn}) is in no explicit exit"
-                                          for e in self.coverage.uncovered]
+        out = list(self.errors)
+        for f in self.coverage.dropped:
+            out.append(f"not in the model: {f.kind} {f.name} ({f.where()}{'; ' + f.detail[:70] if f.detail else ''}). "
+                       + HOW[f.kind] + ("" if not f.omittable else f", or `omit {short(f)}: <reason>` if it is only "
+                                        f"{'/'.join(OMIT_REASONS)}"))
+        for f, reason in self.coverage.bad_omits:
+            out.append(f"`omit {short(f)}: {reason}` leaves out {f.kind} {f.name} ({f.where()}), which drives behaviour: "
+                       + HOW[f.kind])
+        return out + self.lint
 
 
-def callee_matches(rule_callee: str, key: str) -> bool:
-    """~userSvc.IsActionAllowed or ~IsActionAllowed or ~h.userSvc.IsActionAllowed matches userSvc.IsActionAllowed."""
-    a, b = rule_callee.split("."), key.split(".")
-    n = min(len(a), len(b))
-    return bool(n) and a[-n:] == b[-n:]
+HOW = {"entry": "Put it in a use case (as a step), a transition's event, a requirement or an activity",
+       "state": "Model it: a `state Owner:` machine whose states are the values it takes, or the transitions and "
+                "requirements that read it",
+       "constant": "Add it as `cfg name = value unit` (and use the name in the requirements that depend on it)",
+       "interface": "Name it as an actor, a part or an item, or in the requirement that uses it (a file the system "
+                    "writes holds records someone reads: say what it records)"}
 
 
-def rules_of(spec: Spec, m: Module) -> dict[str, Rule]:
-    shared = {r.name: r for x in spec.modules if x.name.startswith("_") for r in x.rules}
-    return {**shared, **{r.name: r for r in m.rules}}
+def short(f: Fact) -> str:
+    """The name an omit line would give a fact: quit, EVENT_LOG_PATH, console, POST /orders."""
+    if f.name.startswith("route "):
+        return f.name[len("route "):]
+    return re.sub(r"^(command|event|registered by) ", "", f.name.split(".")[-1])
 
 
-def check(spec: Spec, m: Module, facts: ModuleFacts, repo: RepoFacts) -> Result:
-    res = Result()
-    rules = rules_of(spec, m)
-    # traces: a file of the repo, lines inside it
-    for where, at in [(f"module {m.name}", m.at)] + [(f"rule {r.name}", r.at) for r in m.rules] + \
-                     [(f"{o.name}", o.at) for o in m.ops] + [(f"issue {i.text[:30]!r}", i.at) for i in m.issues]:
-        if at is None:
-            if where.startswith("issue") or where.startswith("rule"):
-                continue
-            res.errors.append(f"{where}: no trace (@file:lines)")
-            continue
-        f = repo.outline.files.get(at.file)
-        if f is None:
-            if at.start or at.file not in repo.dirs and not any(d.startswith(at.file + "/") for d in repo.dirs):
-                res.errors.append(f"{where}: @{at.file} is no source file of the repo")
-            continue
-        if at.start and not (1 <= at.start <= at.end <= len(f.lines)):
-            res.errors.append(f"{where}: lines {at.start}-{at.end} outside {at.file} (1-{len(f.lines)})")
-    for o in m.ops:
-        if o.at is not None and not o.at.start:
-            res.errors.append(f"{o.name}: trace needs lines (@file:a-b)")
-    # rules: each callee the code calls from 2+ operations is one rule, named by its callee
-    for rf in facts.rules:
-        named = [r for r in rules.values() if r.callee and callee_matches(r.callee, rf.callee)]
-        if not named:
-            res.lint.append(f"duplication: {rf.callee} is called by {len(rf.callers)} operations "
-                            f"({', '.join(rf.callers)}): define it once as `rule name(...) ... ~{rf.callee}` and apply it by name")
-        elif len(named) > 1:
-            res.lint.append(f"duplication: rules {', '.join(r.name for r in named)} all stand for {rf.callee}")
-    calls = {c for fn in facts.fns for c, _ in fn.calls}
-    for r in m.rules:
-        if r.callee and not any(callee_matches(r.callee, repo.callee_key(c, "")) or c.endswith(r.callee) for c in calls):
-            res.errors.append(f"rule {r.name}: ~{r.callee} is called nowhere in {facts.dir}")
-        elif not r.callee or not any(callee_matches(r.callee, rf.callee) for rf in facts.rules):
-            res.lint.append(f"rule {r.name}: only the listed RULES (callees of 2+ operations) are rules; "
-                            f"write this behaviour as a step where it happens")
-        if not any(s.ref == r.name for o in m.ops for s in walk(o.steps)):
-            res.lint.append(f"rule {r.name} is applied by no operation")
-    # duplication: the same step written inline twice
-    seen: dict[str, str] = {}
-    for o in m.ops:
-        for s in walk(o.steps):
-            if s.ref or s.loop or not s.text or len(s.text) < 4:
-                continue
-            key = re.sub(r"\s+", " ", s.text.lower())
-            if key in seen and seen[key] != o.name:
-                res.lint.append(f"duplication: step {s.text!r} is inline in {seen[key]} and {o.name}: define it once "
-                             f"as a value line `name(args) = ...` and use its name (a rule is only for a listed callee)")
-            seen.setdefault(key, o.name)
-    # prose the notation already says, and code copied instead of named
-    for o in m.ops:
-        for s in walk(o.steps):
-            if PROSE.search(s.text) or (m.name and re.search(r"\b" + re.escape(m.name) + r"\b", s.text)):
-                res.lint.append(f"{o.name}: {s.text!r} restates what the notation says (no 'shall', module name, 'or an error')")
-            acts = ", ".join(s.exit.actions) if s.exit else ""
-            cond = s.exit.cond if s.exit and s.exit.kind == "guard" else ""
-            said = "" if s.ref else s.text  # a rule applied by name is not code
-            bad = next((x for x in (said, cond, acts) if x and CODE_COPY.search(x)), "")
-            if bad:
-                res.lint.append(f"{o.name}: {bad[:60]!r} is code; write it in plain words a systems engineer reads "
-                                f"(`sign in`, `the cached balance is missing or expired -> unavailable`), no dotted "
-                                f"names, operators, brackets, calls or locking")
-            elif len(s.text) > MAX_STEP and not s.fallback:
-                res.lint.append(f"{o.name}: step {s.text[:40]!r}... is {len(s.text)} chars; at most {MAX_STEP}")
-            elif len(acts) > MAX_EXIT:
-                res.lint.append(f"{o.name}: exit {acts[:30]!r}... is {len(acts)} chars; at most {MAX_EXIT}")
-    if m.default and CODE_COPY.search(", ".join(m.default.actions)):
-        res.lint.append(f"default `!err -> {', '.join(m.default.actions)}` is code; write it as `!err -> fail`")
-    for c in m.cfg:
-        pass
-    for w in m.when:
-        if len(w) > 80:
-            res.lint.append(f"when: {len(w)} chars; say when the module applies in at most 80")
-    for o in m.ops:
-        refs = [s.ref for s in walk(o.steps) if s.ref in rules]
-        for r in sorted({x for x in refs if refs.count(x) > 1}):
-            res.lint.append(f"{o.name}: rule {r} applied {refs.count(r)} times; once covers every exit after its call")
-    for k, v in m.def_args:
-        if len(v) > 30 or " " in v.strip('"'):
-            res.lint.append(f"module line: {k}= is prose; keep only short values and flags in the def's arguments")
-    for cat, rel, line, why in facts.suspects:
-        if not any(i.at and i.at.file == rel and abs(i.at.start - line) <= 2 for i in m.issues):
-            res.lint.append(f"missing issue: `? [{cat}] @{rel.rsplit('/', 1)[-1]}:{line} ...` ({why})")
-    if m.default:
-        for r in m.rules:
-            if r.exit and r.exit.actions == m.default.actions:
-                res.lint.append(f"rule {r.name}: `!{r.exit.cond} -> {', '.join(r.exit.actions)}` restates the module "
-                                f"default; drop it")
-        for o in m.ops:
-            for s in walk(o.steps):
-                if s.ref in rules and s.exit is not None and s.exit.default:
-                    res.lint.append(f"{o.name}: `{s.text}!` marks a rule, whose failing the default already covers; "
-                                    f"drop the `!`")
-    # state the module keeps: one `state` line each
-    named = {n for n, _ in m.state}
-    for var, rel, line, what in facts.state:
-        if var not in named:
-            res.lint.append(f"missing `state {var}  <what it holds>` ({os.path.basename(rel)}:{line} keeps {what[:40]})")
-    # the reason a code comment gives: a `#` on the operation that traces that function
-    for fn_name, rel, line in facts.commented:
-        if any(h == fn_name for h, _ in facts.folds):
-            continue
-        ops = [o for o in m.ops if o.at and o.at.file == rel and o.at.start <= line + 1 <= o.at.end + 1]
-        if ops and not any(o.rationale or any(x.rationale for x in walk(o.steps)) for o in ops):
-            res.lint.append(f"{ops[0].name}: the comment above {fn_name} ({os.path.basename(rel)}:{line - 1}) says why; "
-                            f"keep it as `# <reason>` on the operation or its step")
-    # not too small: what a function does (state it writes, functions it calls) must be in its operation's steps
-    for fn_name, rel, line, kind, target in facts.effects:
-        ops = [o for o in m.ops if o.at and o.at.file == rel and o.at.start <= line <= o.at.end]
-        if not ops:
-            continue
-        said = " ".join(x.text + " " + x.ref + " " + x.cond + " " + (x.exit.cond if x.exit else "") + " " + x.loop
-                        for o in ops for x in walk(o.steps)).lower()
-        said_words = set(re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", said)))
-        state_said = {n.lower() for n, _ in m.state if n.lower() in said.replace(" ", "")}
-        keys = [w for w in re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", target.split(".")[-1]).lower())
-                if len(w) > 2 and w not in ("get", "set", "the", "for", "and", "locked")]
-        hit = target.split(".")[-1].lower() in said.replace(" ", "") or target.lower() in state_said or \
-            (keys and sum(k in said_words or k.rstrip("s") in said_words for k in keys) * 2 >= len(keys))
-        if not hit:
-            what = f"writes {target}" if kind == "write" else f"calls {target}"
-            res.lint.append(f"{ops[0].name}: a step is missing: {fn_name} {what} ({os.path.basename(rel)}:{line}); "
-                            f"say it in a few plain words")
-    # a folded helper's behaviour must be said in its caller
-    by_name = {o.name: o for o in m.ops}
-    for helper, into in facts.folds:
-        caller = by_name.get(into) or by_name.get(into.split(".")[-1])
-        if caller is None:
-            continue
-        said = " ".join(x.text + " " + (x.exit.cond if x.exit else "") + " " + x.cond for x in walk(caller.steps)).lower()
-        keys = [w for w in re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", helper).lower())
-                if w not in ("locked", "get", "set", "do", "make", "the", "of", "to", "from")]
-        if keys and not any(k in said for k in keys):
-            res.lint.append(f"{caller.name}: {helper} is folded into it; say what it does in a step "
-                            f"({' '.join(keys)})")
-    # a branch that goes on is `if X:` with indented steps, not a dangling `X:` or a bare condition
-    for o in m.ops:
-        for x in walk(o.steps):
-            if x.text and not x.loop and (x.text.endswith(":") or re.fullmatch(r"[\w ]{1,30}\.", x.text)) and not x.exit:
-                res.lint.append(f"{o.name}: {x.text!r} is a branch: write `if <condition>:` and indent its steps")
-            if x.text and re.search(r"\s=\s", x.text):
-                res.lint.append(f"{o.name}: {x.text!r} assigns inside a step; write `name = what` as the step, or plain words")
-            if x.cond and CODE_COPY.search(x.cond):
-                res.lint.append(f"{o.name}: `if {x.cond}:` is code; write the condition in plain words")
-    fns = {RepoFacts.fn_name(f): f for f in facts.fns}
-    for helper, into in facts.folds:
-        f = fns.get(helper)
-        for o in m.ops:
-            if f is not None and o.at and o.at.file == f.file and o.at.start and f.line - 1 <= o.at.start and o.at.end <= f.end + 1:
-                res.lint.append(f"{o.name}: {helper} folds into {into} (one caller, no exits, no effects); "
-                                f"say what it does in {into}'s step, not on a line of its own")
-    res.coverage = coverage(m, facts, rules)
-    res.lint += res.coverage.notes
-    res.lint += [f"{x}: `->` ends the operation; a conditional step that goes on is `<step> if <cond>`"
-                 for x in res.coverage.extra]
-    return res
+def fact_words(f: Fact) -> list[frozenset[str]]:
+    """The word sets that name a fact: its own name, and for an entry the operation it leads to."""
+    name = f.name.split(".")[-1] if f.kind in ("state", "entry") else f.name
+    name = re.sub(r"^(command|event|route|registered by)\s+", "", name)
+    out = [frozenset(w for w in wordset(name) if w not in GENERIC)]
+    m = re.match(r"calls (\S+)", f.detail)
+    if m:
+        out.append(frozenset(w for w in wordset(m.group(1).split(".")[-1]) if w not in GENERIC))
+    return [x for x in out if x]
 
 
-@dataclass
-class Stated:
-    line: int  # the line it cites, 0 for none
-    text: str
-    marked: bool = False  # `step!`
-    actions: tuple[str, ...] = ()
-    kind: str = ""
+def contained(fw: frozenset[str], ew: frozenset[str]) -> bool:
+    if not fw:
+        return False
+    hit = sum(1 for w in fw if any(alike(w, e) for e in ew))
+    return hit / len(fw) >= 0.6
 
 
-def explicit_exits(op: Op, rules: dict[str, Rule] | None = None) -> list[Stated]:
-    """The exits an operation states, in order. An exit written on a rule's application restates the rule's
-    own exit (or the default) and is not counted again."""
+def numbers(text: str) -> set[float]:
+    text = (text or "").replace("..", " ")  # a range: 2..8
+    return {float(n) for n in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", text)}
+
+
+def elements(s: System) -> list[tuple[str, str, str, Trace | None]]:
+    """(kind, label, text to match, trace) for every element a fact may map to."""
     out = []
-    inside = {id(c) for b in walk(op.steps) if b.cond or b.otherwise for c in walk(b.children)}
-    for s in walk(op.steps):
-        if s.returns and s.exit is None and id(s) in inside:  # a return in an `if` block ends the operation early
-            out.append(Stated(s.at.start if s.at else 0, f"return {s.text}".strip(), False, (), "guard"))
-        if s.exit is not None and not (rules and s.ref in rules):
-            out.append(Stated(s.at.start if s.at else 0, f"{s.text}!" if s.exit.default else
-                              f"{s.exit.cond} -> {', '.join(s.exit.actions)}", s.exit.default, tuple(s.exit.actions),
-                              s.exit.kind))
-        if s.fallback:
-            out += [Stated(0, f"?? {a}") for a in s.fallback[:-1]]
+    for u in s.usecases:
+        out.append(("usecase", f"usecase {u.name}", u.name + " " + " ".join(x.text for x in u.steps), u.at))
+    for m in s.machines:
+        out.append(("state", f"state {m.owner}", m.owner + " " + " ".join(m.states), m.at))
+        for t in m.transitions:
+            out.append(("transition", f"{m.owner}: {t.src} -({t.label()})-> {t.tgt}",
+                        f"{t.event} {t.guard} {t.effect}", t.at))
+    for r in s.reqs:
+        out.append(("req", f"req {r.id}", r.text + " " + " ".join(r.constraints), r.at))
+    for a in s.activities:
+        out.append(("activity", f"activity {a.name}", a.name + " " + chain_text(a.nodes), a.at))
+    for c in s.cfg:
+        out.append(("cfg", f"cfg {c.key}", c.key + " " + c.value + " " + c.unit, c.at))
+    for kind, xs in (("actor", s.actors), ("part", s.parts), ("item", s.items)):
+        for x in xs:
+            out.append((kind, f"{kind} {x.name}", x.name + " " + " ".join(getattr(x, "fields", [])), x.at))
     return out
 
 
-def coverage(m: Module, facts: ModuleFacts, rules: dict[str, Rule]) -> Coverage:
-    cov = Coverage()
-    left = list(facts.exits)
-    default = tuple(m.default.actions) if m.default else None
-    for o in m.ops:
-        if o.at is None or not o.at.start:
+# the elements that can show each kind of fact, the most fitting first
+SHOWS = {"entry": ("usecase", "transition", "activity", "req"),
+         "state": ("state", "transition", "req"),
+         "constant": ("cfg", "req", "transition"),
+         "interface": ("actor", "part", "item", "req", "usecase")}
+
+
+def maps_to(f: Fact, s: System, els: list[tuple[str, str, str, Trace | None]], enums: dict[str, list[str]]) -> str:
+    fws = fact_words(f)
+    for kind, label, txt, _ in sorted(els, key=lambda e: SHOWS[f.kind].index(e[0]) if e[0] in SHOWS[f.kind] else 99):
+        if kind not in SHOWS[f.kind]:
             continue
-        mine = [e for e in left if e.file == o.at.file and o.at.start <= e.line <= o.at.end]
-        # exits after the call of an applied rule that has an exit, its own or the module default
-        applied = [rules[s.ref] for s in walk(o.steps)
-                   if s.ref in rules and (rules[s.ref].exit or default) and rules[s.ref].callee]
-        for e in list(mine):
-            r = next((r for r in applied if e.owner and callee_matches(r.callee, e.owner)), None)
-            if r is not None:
-                cov.covered.append((e, f"rule {r.name}"))
-                mine.remove(e)
-                left.remove(e)
-        stated, matched = explicit_exits(o, rules), []
-        for x in [x for x in stated if x.line]:
-            e = next((e for e in mine if abs(e.line - x.line) <= 1), None)
-            if e is not None:
-                matched.append((x, e))
-                mine.remove(e)
-        for x, e in zip([x for x in stated if not x.line], list(mine)):
-            matched.append((x, e))
-            mine.remove(e)
-        for x, e in matched:
-            cov.covered.append((e, f"{o.name}: {x.text}"))
-            left.remove(e)
-            if x.marked and facts.default_handling and e.handling and e.handling != facts.default_handling:
-                cov.notes.append(f"{o.name}: `{x.text}` marks the exit at {e.file}:{e.line} as the default, but it is "
-                                 f"handled differently; give it its own `!err -> ...`")
-            elif (not x.marked and default and x.kind == "err" and x.actions == default and e.err
-                  and e.handling == facts.default_handling):
-                cov.notes.append(f"{o.name}: `!err -> {', '.join(default)}` restates the module default; "
-                                 f"mark the step with `!` instead")
-        extra = len(stated) - len(matched)
-        if extra > 0:
-            ups = [f"{os.path.basename(f)}:{n}" for f, n, _ in facts.passups
-                   if f == o.at.file and o.at.start <= n <= o.at.end]
-            if ups:
-                said = [x.text for x in stated if x.kind == "err"]
-                cov.notes.append(f"{o.name}: the final return at {', '.join(ups)} only passes the error up; it is "
-                                 f"implicit: delete `!err -> ...` from the step" + (f" ({said[-1]})" if said else ""))
-            else:
-                cov.extra.append(f"{o.name}: {extra} stated exit(s) match no early return in its lines")
-    for e in left:
-        issue = next((i for i in m.issues if i.at and i.at.file == e.file and e.line - 3 <= i.at.start <= e.line + 1), None)
-        if issue is not None:
-            cov.explained.append((e, issue.text))
+        ew = wordset(txt)
+        if any(contained(fw, ew) for fw in fws):
+            return label
+        if f.kind == "constant" and kind == "cfg":  # the same value under another name: TEMP_LOW_C = 2.0 in tempRange = 2..8
+            fv = numbers(f.detail.split(";")[0])
+            if fv and fv <= numbers(txt.split(" ", 1)[-1]):
+                return label
+    if f.kind == "state":  # a machine whose states are the values the code sets
+        m = re.search(r"values: ([^;]+)", f.detail)
+        vals = [v.strip() for v in m.group(1).split(",")] if m else []
+        for mach in s.machines:
+            got = sum(1 for v in vals if state_for(v, mach))
+            if vals and got * 2 >= len(vals):
+                return f"state {mach.owner}"
+    spots = [(f.file, f.line)] + list(f.lines[:12]) + [(t[0], t[1]) for t in f.targets]
+    for kind, label, _, at in els:
+        if kind not in SHOWS[f.kind] or at is None or not at.start:
+            if not (at is not None and f.kind == "interface" and kind in ("part", "actor", "item")):
+                continue
+        if any(at.covers(rel, ln) for rel, ln in spots) and (f.kind == "interface" or not at.start
+                                                              or at.end - at.start <= TRACE_SPAN):
+            return label + " (by its trace)"
+    return ""
+
+
+def state_for(value: str, mach) -> str:
+    """The state of a machine that an enum value names: CREDITED -> Credited, OUT_OF_SERVICE -> OutOfService."""
+    vw = [stem(w) for w in words(value)]
+    for st in mach.states:
+        sw = [stem(w) for w in words(st)]
+        if len(vw) == len(sw) and all(alike(a, b) for a, b in zip(vw, sw)):
+            return st
+    return ""
+
+
+def state_problems(s: System, sf: SystemFacts) -> list[str]:
+    """Every value a state takes is a state of its machine, and every change the code makes is a transition: into
+    its target, and, when the checks before it were read, from each value they allow."""
+    out = []
+    for f in sf.of("state"):
+        m = re.search(r"set to (\w+) values: ([^;]+)", f.detail)
+        if m is None:
+            continue
+        vals = [v.strip() for v in m.group(2).split(",")]
+        mach = max(s.machines, key=lambda mc: sum(1 for v in vals if state_for(v, mc)), default=None)
+        if mach is None or not any(state_for(v, mach) for v in vals):
+            continue  # coverage reports a value with no machine at all
+        for v in vals:
+            if not state_for(v, mach):
+                out.append(f"state {mach.owner}: {f.name} takes the value {v} ({m.group(1)}), which is no state of it; "
+                           f"add the state (in PascalCase domain words) and its transitions")
+        trans = mach.expanded()
+        for ch in (c for c in sf.changes if c.state == f.name):
+            tgt = state_for(ch.tgt, mach)
+            if not tgt:
+                continue
+            into = [t for t in trans if t.tgt == tgt]
+            where = f"{os.path.basename(ch.file)}:{ch.line} in {ch.fn}"
+            if not into:
+                out.append(f"state {mach.owner}: the code sets {ch.tgt} ({where}) but no transition goes to {tgt}")
+                continue
+            for src in ch.srcs or []:
+                st = state_for(src, mach)
+                if st and not any(t.src == st for t in into):
+                    out.append(f"state {mach.owner}: {ch.fn} can set {ch.tgt} while the value is {src} ({where}); "
+                               f"add {st} -(event)-> {tgt}" + (" (a transition back to the same state)" if st == tgt else ""))
+    return out
+
+
+def coverage(s: System, sf: SystemFacts) -> Coverage:
+    cov = Coverage()
+    els = elements(s)
+    omits = [(o, frozenset(w for n in o.names for w in wordset(n))) for o in s.omits if o.reason in OMIT_REASONS]
+    for f in sf.facts:
+        hit = maps_to(f, s, els, sf.enums)
+        if hit:
+            cov.mapped.append((f, hit))
+            continue
+        fws = fact_words(f)
+        omit = next((o for o, ow in omits if any(contained(fw, ow) for fw in fws)
+                     or short(f).lower() in {n.lower() for n in o.names}), None)
+        if omit is None:
+            cov.dropped.append(f)
+        elif f.omittable:
+            cov.omitted.append((f, omit.reason))
         else:
-            cov.uncovered.append(e)
+            cov.bad_omits.append((f, omit.reason))
     return cov
 
 
-def module_lines(m: Module) -> list[str]:
-    from .notation import format_module
-    return format_module(m).splitlines()
-
-
-def check_all(spec: Spec, repo: RepoFacts, facts: dict[str, ModuleFacts]) -> dict[str, Result]:
-    return {m.name: check(spec, m, facts[m.name], repo) for m in spec.modules if m.name in facts}
-
-
-__all__ = ["check", "check_all", "coverage", "Result", "Coverage", "callee_matches", "Step"]
-
-
-def compare(golden: Spec, cand: Spec, name: str, facts: ModuleFacts) -> dict[str, list[str]]:
-    """How a spec differs from a golden one, by what matters to the model rather than wording: the rules (by
-    callee), the endpoints (method, path, status), the code functions the operations trace, and the open
-    issues (category and location, two lines either way). Empty lists everywhere: equivalent."""
-    g, c = golden.module(name), cand.module(name)
-    out: dict[str, list[str]] = {"rules": [], "endpoints": [], "functions": [], "issues": []}
-    gr = sorted(r.callee for r in g.rules if r.callee)
-    cr = [r.callee for r in c.rules if r.callee]
-    out["rules"] = [f"missing rule ~{x}" for x in gr if not any(callee_matches(x, y) or callee_matches(y, x) for y in cr)] + \
-                   [f"extra rule ~{y}" for y in cr if not any(callee_matches(x, y) or callee_matches(y, x) for x in gr)]
-    ge = {(o.method, o.path, o.status) for o in g.ops if o.kind == "endpoint"}
-    ce = {(o.method, o.path, o.status) for o in c.ops if o.kind == "endpoint"}
-    out["endpoints"] = [f"missing {' '.join(e)}" for e in sorted(ge - ce)] + [f"extra {' '.join(e)}" for e in sorted(ce - ge)]
-
-    def traced(m: Module) -> set[str]:
-        return {f"{f.file}:{f.name}" for f in facts.fns for o in m.ops
-                if o.at and o.at.start and o.at.file == f.file and o.at.start <= f.end and f.line <= o.at.end}
-    gt, ct = traced(g), traced(c)
-    out["functions"] = [f"untraced {x}" for x in sorted(gt - ct)] + [f"extra {x}" for x in sorted(ct - gt)]
-    for i in g.issues:
-        if i.at and not any(j.at and j.at.file == i.at.file and abs(j.at.start - i.at.start) <= 2
-                            and (j.category or "other") == (i.category or "other") for j in c.issues):
-            out["issues"].append(f"missing ? [{i.category}] {i.at.file}:{i.at.start} {i.text}")
-    return out
+def check(s: System, sf: SystemFacts, repo: str) -> Result:
+    res = Result(coverage(s, sf))
+    res.errors += state_problems(s, sf)
+    lines_of: dict[str, int] = {}
+    for label, at in s.traces():
+        if at.file not in lines_of:
+            path = os.path.join(repo, at.file)
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    lines_of[at.file] = len(fh.read().splitlines())
+            else:
+                lines_of[at.file] = -1 if not os.path.isdir(path) else 0
+        n = lines_of[at.file]
+        if n < 0:
+            res.errors.append(f"{label}: @{at.file} is not a file of the code")
+        elif at.start and at.end > n:
+            res.errors.append(f"{label}: @{at.file}:{at.start}-{at.end} is past the end of the file ({n} lines)")
+    parts = {p.name for p in s.parts}
+    actors = {a.name for a in s.actors}
+    ids = {r.id for r in s.reqs}
+    names = [("part", p.name) for p in s.parts] + [("actor", a.name) for a in s.actors] + \
+        [("usecase", u.name) for u in s.usecases] + [("activity", a.name) for a in s.activities] + \
+        [("state", st) for m in s.machines for st in m.states] + [("cfg", c.key) for c in s.cfg] + \
+        [("item", i.name) for i in s.items]
+    for kind, nm in names:
+        ws = set(words(nm))
+        if ws & IMPL_WORDS or re.search(r"[a-z]V\d+$|_", nm):
+            res.lint.append(f"{kind} {nm}: an implementation name; use the domain name the code's routes, enums, "
+                            f"identifiers, comments or messages give it")
+        elif kind in ("state", "part", "actor", "usecase") and nm.isupper() and len(nm) > 2:
+            res.lint.append(f"{kind} {nm}: write it in PascalCase domain words ({nm.title()}), not as the code's constant")
+        elif kind in ("state", "part", "actor", "usecase", "item") and nm[:1].islower():
+            res.lint.append(f"{kind} {nm}: a code name; write it in PascalCase domain words")
+    steps = [(f"usecase {u.name}", x.text) for u in s.usecases for x in u.steps] +         [(f"activity {a.name}", chain_text(a.nodes)) for a in s.activities] +         [(f"transition {t.src} -> {t.tgt}", t.label()) for m in s.machines for t in m.transitions]
+    for where, txt in steps:
+        code = [w for w in re.findall(r"[A-Za-z_][\w.]*\(?", txt)
+                if "_" in w.strip("_(") or re.fullmatch(r"[a-z]\w*\.[A-Za-z]\w*\(?", w)
+                or (w.rstrip("(") in sf.functions and len(w) > 3 and not w.islower())]
+        if code:
+            res.lint.append(f"{where}: {', '.join(sorted(set(code)))} is code; name the action in domain words")
+        if re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\s+/|\w\.(go|py|ts|js|java|cs)\b", txt):
+            res.lint.append(f"{where}: no routes or file references in steps; say the action, trace it with @")
+    for it in s.items:
+        if re.search(r"(Request|Response|Dto|DTO|Payload|Body|Params)$", it.name):
+            res.lint.append(f"item {it.name}: a request or response body is serialization; an item is a domain thing "
+                            f"exchanged or stored")
+    for r in s.reqs:
+        if re.search(r"\w\.(go|py|ts|tsx|js|java|cs)\b", r.text):
+            res.lint.append(f"req {r.id}: no file references in the statement; trace it with @")
+        restated = next((u for u in s.usecases if contained(
+            frozenset(w for w in wordset(r.text) if w not in GENERIC),
+            wordset(u.name + " " + " ".join(x.text for x in u.steps)))), None)
+        if restated is not None and len(wordset(r.text)) >= 3:
+            res.lint.append(f"req {r.id}: restates use case {restated.name}; keep the use case and write as requirements "
+                            f"only the rules it obeys (limits, conditions, what happens otherwise)")
+        if CODE_IN_TEXT.search(r.text):
+            res.lint.append(f"req {r.id}: {r.text[:60]!r} reads as code; say it in domain terms with the cfg and "
+                            f"state names")
+        if PLANS.search(r.text):
+            res.lint.append(f"req {r.id}: a plan or TODO is not a requirement: as-built only")
+    by_fn: dict[tuple[str, str], list[str]] = {}
+    for r in s.reqs:  # requirements that follow one function's branches
+        if r.at and r.at.start:
+            fn = sf.function_at(r.at.file, r.at.start)
+            if fn:
+                by_fn.setdefault(fn, []).append(r.id)
+    for (rel, fn), ids_in in sorted(by_fn.items()):
+        if len(ids_in) >= FRAGMENTED:
+            res.lint.append(f"{', '.join(ids_in)} all trace into {fn} ({os.path.basename(rel)}): requirements follow "
+                            f"behaviours seen from outside, not one function's branches; merge refusals that end the "
+                            f"same way into the rule they protect, and leave the order of steps to an activity")
+    if s.machines and not sf.of("state"):
+        res.lint.append(f"state {', '.join(m.owner for m in s.machines)}: the code keeps no value that changes over time "
+                        f"and drives behaviour, so there is no state machine; write the order of steps as an activity")
+    for m in s.machines:
+        if m.owner not in parts:
+            res.lint.append(f"state {m.owner}: its owner must be a `part`")
+        for t in m.transitions:
+            for rid in re.findall(REQ_ID, t.guard):
+                if rid not in ids:
+                    res.errors.append(f"transition {t.src} -> {t.tgt}: guard names {rid}, which no req has")
+    for u in s.usecases:
+        if "," in u.actor:
+            res.lint.append(f"usecase {u.name}: one actor per use case (a use case is one actor's goal), not {u.actor}")
+        elif u.actor not in actors:
+            res.lint.append(f"usecase {u.name}: actor {u.actor} is not declared with `actor`")
+        if not u.steps:
+            res.lint.append(f"usecase {u.name}: no steps")
+    for sat in s.satisfies:
+        if sat.by not in parts | {u.name for u in s.usecases}:
+            res.errors.append(f"{sat.by} satisfies ...: {sat.by} is no part or use case")
+        for rid in sat.ids:
+            if rid not in ids:
+                res.errors.append(f"{sat.by} satisfies {rid}: no such requirement" +
+                                  ("; list the IDs one by one" if ".." in rid or "-" in rid.split("-", 1)[-1] else ""))
+    for m in s.machines:
+        for t in m.transitions:
+            if ".." in t.guard:
+                res.errors.append(f"transition {t.src} -> {t.tgt}: guard {t.guard!r} names a range; name the "
+                                  f"requirement or say the condition")
+    for o in s.omits:
+        if o.reason not in OMIT_REASONS:
+            res.errors.append(f"omit {', '.join(o.names)}: {o.reason!r} is not a reason ({', '.join(OMIT_REASONS)}); "
+                              f"a plan or TODO is not in the code's model at all, so drop its line")
+    if not s.reqs:
+        res.lint.append("no requirements: write one `req` per observable behaviour or constraint")
+    return res

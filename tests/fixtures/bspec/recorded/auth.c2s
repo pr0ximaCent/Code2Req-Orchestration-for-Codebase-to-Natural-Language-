@@ -1,23 +1,35 @@
-auth  @app/api/auth
-  when  signup, login, token refresh, password reset, and OTP verification
-  !err -> fail
-  rule body  JSON body decodes  !err -> 400  ~httputil.DecodeJSONBody  ? [unresolved] @credentials.go:19 decoding not read -> app/core/httputil/
-  rule actionAllowed(action, data, ip)  action is allowed for data and ip  ~userSvc.IsActionAllowed  ? [unresolved] @:26 checks not read -> app/domains/user/
-  rule verifyOTP(ip, email, otpID, otp, purpose)  OTP verified  ~userSvc.VerifyOTP  ? [unresolved] @:74 checks not read -> app/domains/user/
-  uniqueData(email) = {"email": lower(trim(email))}  @:24
-  POST /auth/login/credentials {email,password} -> 200  body; ip = clientIP; uniqueData(email); actionAllowed(login, uniqueData, ip); sign in!  @:17-44
-  POST /auth/login/google {access_token} -> 200  body; oauth google login!  @:47-58  ? [missing-guard] @:47 no actionAllowed, which 4 siblings call
-  POST /auth/signup {email,name,password,otp_id,otp} -> 201  body; ip = clientIP; uniqueData(email); actionAllowed(signup, uniqueData, ip); verifyOTP(ip, email, otpID, otp, signup); sign up!  @:61-86  ? [ignored-result] @:70 first result of actionAllowed discarded; 1 other caller(s) check it
-  POST /auth/token/refresh {refresh_token} -> 200  body; refresh token!  @:89-101  ? [missing-guard] @:89 no actionAllowed, which 4 siblings call
-  PUT /auth/password/reset {email,otp_id,otp,new_password,confirm_password} -> 200  body; ip = clientIP; uniqueData(email); actionAllowed(passReset, uniqueData, ip); verifyOTP(ip, email, otpID, otp, passwordReset); set password!; get user by email!; create login response!  @password.go:17-51  ? [unused-input] @:18 ConfirmPassword decoded and never read  ? [ignored-result] @:24 first result of actionAllowed discarded; 1 other caller(s) check it
-  POST /auth/verification-otps/request {email,purpose,user_id} -> 201  body; purpose = trim(purpose); email = trim(email); no email or bad purpose -> 400; ip = clientIP; uniqueData = {"email": lower(email), "purpose": purpose}; actionAllowed(sendOTP, uniqueData, ip); send OTP!  @verification.go:17-56  ? [unused-input] @:18 UserID decoded and never read  ? [ignored-result] @:35 first result of actionAllowed discarded; 1 other caller(s) check it
-  clientIP(r) -> ip  @helpers.go:9-22
-    X-Forwarded-For header present -> return first part
-    X-Real-IP header present -> return it
-    RemoteAddr parsed -> return addr
-    return host
-  BearerToken(r) -> token  @:25-31
-    Authorization header starts with "bearer " -> return rest
-    return ""
-  ? [security] @:10 client-supplied IP header trusted
-  ? [security] @:14 client-supplied IP header trusted
+system Auth  @app/api/auth/
+  doc Handles user signup, login (credentials and Google OAuth), token refresh, password reset, and OTP verification requests.
+  actor User
+  part UserService, BillingService
+  item VerificationOTP {otp_id, otp}
+  item TokenPair {access_token, refresh_token}
+  item Email
+  item Password
+  item Name
+  item GoogleAccessToken
+  item RefreshToken
+  item OTPID
+  item Purpose
+  req AUTH-1 block an action (login, signup, password reset, send OTP) when the user's action rate or other constraints are exceeded  @credentials.go:26-35  ? how IsActionAllowed decides -> app/domains/user/
+  req AUTH-2 verify a one-time password before signup or password reset; reject if invalid  @:74-77  ? how VerifyOTP works -> app/domains/user/
+  usecase SignUp: User -> request verification OTP, verify OTP, provide email/name/password, receive token pair  @:61-85
+  usecase LoginWithCredentials: User -> provide email and password, receive token pair  @:17-43
+  usecase LoginWithGoogle: User -> provide Google access token, receive token pair  @:47-57
+  usecase RefreshToken: User -> provide refresh token, receive new token pair  @:89-100
+  usecase ResetPassword: User -> request verification OTP, verify OTP, provide new password, receive token pair  @password.go:17-50
+  usecase RequestVerificationOTP: User -> provide email and purpose, receive OTP ID  @verification.go:17-55
+  omit clientIP: implementation
+  omit BearerToken: implementation
+  omit DecodeJSONBody: implementation
+  omit response.WriteError, response.JSON, response.Error: implementation
+  omit httputil: implementation
+  omit billingSvc: wiring
+  ? how IsActionAllowed decides -> app/domains/user/
+  ? how VerifyOTP works -> app/domains/user/
+  ? how OAuthGoogleLogin works -> app/domains/user/
+  ? how Refresh works -> app/domains/user/
+  ? how SendOTP works -> app/domains/user/
+  ? how SetPassword works -> app/domains/user/
+  ? how GetUserByEmail works -> app/domains/user/
+  ? how CreateLoginResponse works -> app/domains/user/

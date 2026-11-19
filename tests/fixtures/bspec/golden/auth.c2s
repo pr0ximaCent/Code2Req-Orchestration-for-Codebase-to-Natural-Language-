@@ -1,16 +1,10 @@
-auth  @app/api/auth
-  !err -> fail
-  rule body  JSON body decodes  !err -> 400  ~httputil.DecodeJSONBody  ? [unresolved] @credentials.go:19 decode rules not read -> app/core/httputil/
-  rule guard(action)  action allowed for (email, ip)  ~userSvc.IsActionAllowed  ? [unresolved] @:26 what it checks -> app/domains/user/
-  rule otp(purpose)  otp matches unexpired (email, otpId, purpose)  ~userSvc.VerifyOTP  ? [unresolved] @:74 expiry rules not read -> app/domains/user/
-  POST /auth/login/credentials {email,password} -> 200  body; guard(login); sign in!  @:17-44
-  POST /auth/login/google {access_token} -> 200  body; google login!  @:47-58  ? [missing-guard] @:47 no action guard
-  POST /auth/signup {email,name,password,otp_id,otp} -> 201  body; guard(signup); otp(signup); create user!  @:61-86  ? [ignored-result] @:70 allowed=false not rejected
-  POST /auth/token/refresh {refresh_token} -> 200  body; issue tokens!  @:89-101  ? [missing-guard] @:89 no action guard
-  PUT /auth/password/reset {email,otp_id,otp,new_password,confirm_password} -> 200  body; guard(reset); otp(reset); set password!; user = by email!; login response!  @password.go:17-51  ? [ignored-result] @:24 allowed=false not rejected
-  POST /auth/verification-otps/request {email,purpose,user_id} -> 201  body; no email or bad purpose -> 400; guard(send-otp); otpId = send otp!  @verification.go:17-56  ? [ignored-result] @:35 allowed=false not rejected
-  clientIp = XFF[0] ?? X-Real-IP ?? addr(RemoteAddr) ?? RemoteAddr  @helpers.go:9-22  ? [security] @:10 X-Forwarded-For is client-set, spoofable
-  bearerToken = no "bearer " prefix -> ""; header[7:]  @:25-31
-  ? [security] @helpers.go:14 X-Real-IP is client-set too
-  ? [unused-input] @password.go:18 confirm_password never read
-  ? [unused-input] @verification.go:18 user_id never read
+system Auth  @app/api/auth/
+  actor Client
+  item Otp {email, purpose: signup | reset}
+  req AUTH-1 refuse actions the action limiter blocks (login, signup, reset, request OTP)  ? enforced only on login
+  req AUTH-2 signup and password reset require an unexpired OTP for the same email and purpose
+  req AUTH-3 client IP is taken from X-Forwarded-For, then X-Real-IP, then the connection  ? spoofable without a trusted proxy
+  usecase SignUp: Client -> request OTP(signup), submit details + OTP -> account created
+  usecase LogIn: Client -> email + password | Google token -> logged in
+  usecase ResetPassword: Client -> request OTP(reset), submit new password + OTP -> logged in
+  usecase RefreshSession: Client -> refresh token -> new tokens

@@ -1,15 +1,7 @@
-def Agent {route, summary, whenToUse, examples, run, skipFollowUp, changesProject}  @app/chatbot/agent/registry.go:47-68
-
-historymanager : Agent(route=history-manager, skipFollowUp)  @app/chatbot/agents/historymanager/spec.go
-  when  message depends on earlier turns; never answers the user
-  cfg   depth=5, turnMax=4000B
-  run(request) = h = recoverContext(prompt); return reroute(h), err  @spec.go:26-29  ? [mixed-result] @:28 err still returns reroute=true -> app/chatbot/agent/
-  recoverContext(ctx, msg) -> history  @agent.go:20-49
-    msgs = chat.LoadHistory(user, thread, depth+1) !err -> log.error, fail
-    t = transcript of msgs !in current: user, files, ai, trunc each  t=="" -> log.warn, return ""  # no context, so no LLM call
-    r = llm.LITE(prompt{msg.trim, t}) !err -> fail
-    return trim(r)
-  trunc(s) = len(s)<=turnMax -> s; s[:turnMax] + " …[truncated]"  @:99-104  ? [encoding] @:103 trunc cuts bytes; can split UTF-8
-  ? [off-by-one] @agent.go:21 current unsaved or ID empty -> 6 turns, prompt says 5
-  ? [boundary] @agent.go:21 LoadHistory order unknown -> app/services/chat/
-  ? [duplicated-constant] @prompts.go:6 prompt hardcodes 5, not linked to depth
+system ConversationContext  @app/chatbot/agents/historymanager/
+  actor Router
+  cfg depth = 5 turns, turnLimit = 4000 bytes
+  req HM-1 when a message depends on earlier turns, recover the context it needs from the last depth turns and hand it back to the router; never answer the user
+  req HM-2 with no earlier turns, return no context and do not ask the model
+  req HM-3 each turn carries user text, attachment names, assistant text and file actions, each cut to turnLimit
+  activity RecoverContext: load turns -> build transcript -> [empty] return none | ask LITE model -> return context
